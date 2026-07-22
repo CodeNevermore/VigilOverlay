@@ -1,0 +1,8 @@
+"""Application version metadata."""
+
+__version__ = "0.1.0.0"
+CONFIG_SCHEMA_VERSION = 13
+WIDGET_API_VERSION = "1.0"
+COMPONENT_API_VERSION = "1.0"
+PROTOCOL_VERSION = "1.0"
+GAME_PROVIDER_API_VERSION = "1.0"

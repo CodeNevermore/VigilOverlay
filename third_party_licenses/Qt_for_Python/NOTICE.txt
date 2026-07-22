@@ -1,0 +1,19 @@
+Qt for Python / PySide6 / Shiboken6 / Qt 6
+===========================================
+
+Vigil Overlay selects the LGPL-3.0-only option for the community edition of
+Qt for Python. The LGPL-3.0 and incorporated GPL-3.0 license texts are
+included in this directory.
+
+Copyright © The Qt Company Ltd., the Qt Project, and contributors.
+
+Official project:
+https://doc.qt.io/qtforpython-6/
+
+Corresponding source:
+https://code.qt.io/cgit/pyside/pyside-setup.git/
+https://download.qt.io/official_releases/QtForPython/
+
+The exact version used in a compiled Vigil release must be recorded by that
+release's dependency inventory. Vigil uses the Qt libraries as replaceable
+dynamically linked DLLs and does not apply integrity checks to those DLLs.

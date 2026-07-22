@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vigil-overlay"
+version = "0.1.0.0"
+description = "A modular, controller-friendly Windows gaming overlay platform."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "CodeNevermore" }]
+license = { file = "LICENSE" }
+classifiers = [
+  "Environment :: Win32 (MS Windows)",
+  "Operating System :: Microsoft :: Windows :: Windows 10",
+  "Operating System :: Microsoft :: Windows :: Windows 11",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Desktop Environment",
+]
+dependencies = [
+  "PySide6>=6.7,<7",
+  "pycaw==20251023",
+  "psutil>=5.9,<8",
+  "winrt-Windows.Foundation==3.2.1; sys_platform == 'win32'",
+  "winrt-Windows.Foundation.Collections==3.2.1; sys_platform == 'win32'",
+  "winrt-Windows.Networking==3.2.1; sys_platform == 'win32'",
+  "winrt-Windows.Networking.Connectivity==3.2.1; sys_platform == 'win32'",
+  "winrt-Windows.Storage.Streams==3.2.1; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+build = ["Nuitka>=2.6,<3", "ordered-set>=4.1", "zstandard>=0.22"]
+
+[project.scripts]
+vigil-overlay = "vigil_overlay.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+license-files = [
+  "LICENSE",
+  "NOTICE",
+  "THIRD_PARTY_NOTICES.md",
+  "TRADEMARKS.md",
+  "third_party_licenses/*/*.txt",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vigil_overlay = ["resources/**/*"]

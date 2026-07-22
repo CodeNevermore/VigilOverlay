@@ -1,0 +1,1 @@
+"""Public host/widget contracts."""

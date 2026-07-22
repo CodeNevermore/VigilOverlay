@@ -1,0 +1,19 @@
+PresentMon integration notice
+=============================
+
+Vigil Overlay uses the standalone PresentMon console collector as an isolated,
+on-injected frame-presentation telemetry broker on Windows.
+
+Pinned upstream release: PresentMon v2.5.1
+Upstream project: https://github.com/GameTechDev/PresentMon
+Runtime file: PresentMon-2.5.1-x64.exe
+Expected SHA-256: 9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191
+License: MIT (see LICENSE.txt in this directory)
+
+The PresentMon executable is supplied with the Vigil distribution under
+`vigil_overlay/resources/third_party/presentmon/bin`. Vigil verifies the pinned
+SHA-256 before executing the collector. Vigil does not download, replace, or
+update PresentMon at runtime.
+
+The upstream v2.5.1 THIRD_PARTY.txt is included in this directory and must be
+preserved with distributed copies of the collector.
