@@ -25,6 +25,7 @@ _MOD_CONTROL = 0x0002
 _MOD_SHIFT = 0x0004
 _MOD_WIN = 0x0008
 _MOD_NOREPEAT = 0x4000
+_ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,10 +243,25 @@ class Win32HotkeyBackend:
             if not registered:
                 get_last_error = getattr(ctypes, "get_last_error", None)
                 error_code = int(get_last_error()) if callable(get_last_error) else 0
+                if error_code == _ERROR_HOTKEY_ALREADY_REGISTERED:
+                    detail = (
+                        "The hotkey is reserved by Windows or already owned by "
+                        "another application"
+                    )
+                elif error_code:
+                    detail = (
+                        "The Windows hotkey backend rejected the combination "
+                        f"(error {error_code})"
+                    )
+                else:
+                    detail = (
+                        "The Windows hotkey backend rejected the combination "
+                        "without an error code"
+                    )
                 self._registration = HotkeyRegistration(
                     active=False,
                     combination=combination.canonical,
-                    detail=f"Windows rejected the hotkey registration (error {error_code})",
+                    detail=detail,
                 )
                 return
 

@@ -7,7 +7,15 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 from PySide6.QtCore import QEvent, QFileInfo, QObject, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon, QKeyEvent, QPainter, QPainterPath, QPen, QPixmap, QWheelEvent
+from PySide6.QtGui import (
+    QIcon,
+    QKeyEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QFileIconProvider,
     QFrame,
@@ -23,15 +31,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from vigil_overlay.core.controller_shortcuts import ControllerShortcutBinding
 from vigil_overlay.services.telemetry import TelemetrySnapshot
 from vigil_overlay.ui.audio_widget import AudioWidgetView
 from vigil_overlay.ui.display_widget import DisplayWidgetView
 from vigil_overlay.ui.integrations_widget import IntegrationsWidgetView
 from vigil_overlay.ui.performance_widget import PerformanceWidgetView
-from vigil_overlay.ui.scrollbars import VigilVerticalScrollBar, ensure_controller_target_visible
+from vigil_overlay.ui.scrollbars import (
+    VigilVerticalScrollBar,
+    ensure_controller_target_visible,
+)
 from vigil_overlay.ui.settings_widget import SettingsWidgetView
 from vigil_overlay.ui.wifi_widget import WifiWidgetView
-from vigil_overlay.widgets.registry import WidgetDefinition, WidgetItemDefinition, WidgetViewKind
+from vigil_overlay.widgets.registry import (
+    WidgetDefinition,
+    WidgetItemDefinition,
+    WidgetViewKind,
+)
 
 _WIDGET_STRIP_VISIBLE_SLOTS = 6
 _WIDGET_STRIP_BUTTON_SIZE = 62
@@ -40,8 +56,8 @@ _WIDGET_STRIP_SLOT_WIDTH = _WIDGET_STRIP_BUTTON_SIZE + _WIDGET_STRIP_SPACING
 _BRAND_ICON_SIZE = 32
 _BRAND_HEADER_HEIGHT = 40
 _WIDGET_STRIP_HEIGHT = 72
-_WIDGET_STRIP_OVERFLOW_CONTROL_WIDTH = 30
-_WIDGET_STRIP_OVERFLOW_BUTTON_SIZE = 28
+_WIDGET_STRIP_OVERFLOW_SLOT_WIDTH = 46
+_WIDGET_STRIP_OVERFLOW_INDICATOR_WIDTH = 40
 
 
 def _widget_strip_viewport_width(visible_count: int) -> int:
@@ -368,6 +384,7 @@ class NavigationShell(QWidget):
         telemetry_snapshot: TelemetrySnapshot | None = None,
         visible_widget_ids: tuple[str, ...] | None = None,
         guide_button_enabled: bool = True,
+        controller_shortcut_binding: ControllerShortcutBinding | None = None,
         allow_mouse_navigation_while_controller_connected: bool = False,
         hotkey_combination: str = "Ctrl+Alt+Shift+G",
         start_with_windows_enabled: bool = False,
@@ -421,6 +438,9 @@ class NavigationShell(QWidget):
         self._integrations_view: IntegrationsWidgetView | None = None
         self._telemetry_snapshot = telemetry_snapshot or TelemetrySnapshot.unavailable()
         self._guide_button_enabled = guide_button_enabled
+        self._controller_shortcut_binding = (
+            controller_shortcut_binding or ControllerShortcutBinding()
+        )
         self._allow_mouse_navigation_while_controller_connected = (
             allow_mouse_navigation_while_controller_connected
         )
@@ -928,38 +948,36 @@ class NavigationShell(QWidget):
 
         self._left_overflow_slot = QWidget(self._widget_strip_row)
         self._left_overflow_slot.setObjectName("widgetStripLeftOverflowSlot")
-        self._left_overflow_slot.setFixedWidth(_WIDGET_STRIP_OVERFLOW_CONTROL_WIDTH)
+        self._left_overflow_slot.setFixedWidth(_WIDGET_STRIP_OVERFLOW_SLOT_WIDTH)
         left_overflow_layout = QHBoxLayout(self._left_overflow_slot)
-        left_overflow_layout.setContentsMargins(0, 0, 2, 0)
+        left_overflow_layout.setContentsMargins(0, 0, 6, 0)
         left_overflow_layout.setSpacing(0)
-        self._left_overflow_button = self._build_strip_overflow_button(
-            "widgetStripLeftOverflowButton",
-            "\u2039",
-            "Show previous widget tab",
-            -1,
+        self._left_overflow_indicator = self._build_strip_overflow_indicator(
+            "widgetStripLeftOverflowIndicator",
+            "\u276e",
+            "More widget tabs to the left",
             self._left_overflow_slot,
         )
         left_overflow_layout.addWidget(
-            self._left_overflow_button,
+            self._left_overflow_indicator,
             0,
             Qt.AlignmentFlag.AlignCenter,
         )
 
         self._right_overflow_slot = QWidget(self._widget_strip_row)
         self._right_overflow_slot.setObjectName("widgetStripRightOverflowSlot")
-        self._right_overflow_slot.setFixedWidth(_WIDGET_STRIP_OVERFLOW_CONTROL_WIDTH)
+        self._right_overflow_slot.setFixedWidth(_WIDGET_STRIP_OVERFLOW_SLOT_WIDTH)
         right_overflow_layout = QHBoxLayout(self._right_overflow_slot)
-        right_overflow_layout.setContentsMargins(2, 0, 0, 0)
+        right_overflow_layout.setContentsMargins(6, 0, 0, 0)
         right_overflow_layout.setSpacing(0)
-        self._right_overflow_button = self._build_strip_overflow_button(
-            "widgetStripRightOverflowButton",
-            "\u203a",
-            "Show next widget tab",
-            1,
+        self._right_overflow_indicator = self._build_strip_overflow_indicator(
+            "widgetStripRightOverflowIndicator",
+            "\u276f",
+            "More widget tabs to the right",
             self._right_overflow_slot,
         )
         right_overflow_layout.addWidget(
-            self._right_overflow_button,
+            self._right_overflow_indicator,
             0,
             Qt.AlignmentFlag.AlignCenter,
         )
@@ -1023,40 +1041,35 @@ class NavigationShell(QWidget):
         )
         QTimer.singleShot(0, self._update_strip_overflow_indicators)
 
-    def _build_strip_overflow_button(
+    def _build_strip_overflow_indicator(
         self,
         object_name: str,
         label: str,
         accessible_name: str,
-        slot_delta: int,
         parent: QWidget,
-    ) -> QPushButton:
-        button = QPushButton(label, parent)
-        button.setObjectName(object_name)
-        button.setProperty("widgetStripOverflowButton", True)
-        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        button.setFixedSize(
-            _WIDGET_STRIP_OVERFLOW_BUTTON_SIZE,
-            _WIDGET_STRIP_OVERFLOW_BUTTON_SIZE,
+    ) -> QLabel:
+        indicator = QLabel(label, parent)
+        indicator.setObjectName(object_name)
+        indicator.setProperty("widgetStripOverflowIndicator", True)
+        indicator.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        indicator.setFixedSize(
+            _WIDGET_STRIP_OVERFLOW_INDICATOR_WIDTH,
+            _WIDGET_STRIP_BUTTON_SIZE,
         )
-        button.setToolTip(accessible_name)
-        button.setAccessibleName(accessible_name)
-        button.clicked.connect(
-            lambda checked=False, delta=slot_delta: self._strip_scroller.scroll_widget_slots(
-                delta
-            )
-        )
-        return button
+        indicator.setAccessibleName(accessible_name)
+        return indicator
 
     def _update_strip_overflow_indicators(self, *_args: int) -> None:
         bar = self._strip_scroller.horizontalScrollBar()
         has_overflow = bar.maximum() > bar.minimum()
         self._left_overflow_slot.setVisible(has_overflow)
         self._right_overflow_slot.setVisible(has_overflow)
-        self._left_overflow_button.setVisible(
+        self._left_overflow_indicator.setVisible(
             has_overflow and bar.value() > bar.minimum()
         )
-        self._right_overflow_button.setVisible(
+        self._right_overflow_indicator.setVisible(
             has_overflow and bar.value() < bar.maximum()
         )
 
@@ -1174,6 +1187,7 @@ class NavigationShell(QWidget):
                 definition,
                 self._stack,
                 guide_button_enabled=self._guide_button_enabled,
+                controller_shortcut_binding=self._controller_shortcut_binding,
                 allow_mouse_navigation_while_controller_connected=(
                     self._allow_mouse_navigation_while_controller_connected
                 ),
@@ -1213,6 +1227,8 @@ class NavigationShell(QWidget):
 
         buttons: list[QPushButton] = []
         for index, item in enumerate(definition.items):
+            if definition.widget_id == "home" and item.item_id == "power":
+                layout.addStretch(1)
             button = QPushButton(item.label, page)
             button.setObjectName("compactListItem")
             button.setProperty("itemId", item.item_id)
@@ -1270,18 +1286,20 @@ class NavigationShell(QWidget):
                 self._secondary_action_buttons[definition.widget_id][
                     index
                 ] = action_button
-                action_button.clicked.connect(
-                    lambda checked=False,
-                    widget_id=definition.widget_id,
-                    item_id=item.item_id,
-                    action_id=item.secondary_action_id: (
-                        self.item_secondary_activated.emit(
-                            widget_id,
-                            item_id,
-                            action_id or "",
-                        )
+
+                def emit_secondary_action(
+                    checked: bool = False,
+                    *,
+                    widget_id: str = definition.widget_id,
+                    item_id: str = item.item_id,
+                    action_id: str | None = item.secondary_action_id,
+                ) -> None:
+                    del checked
+                    self.item_secondary_activated.emit(
+                        widget_id, item_id, action_id or ""
                     )
-                )
+
+                action_button.clicked.connect(emit_secondary_action)
                 row_layout.addWidget(action_button)
                 layout.addWidget(row)
 
@@ -1295,7 +1313,11 @@ class NavigationShell(QWidget):
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(empty)
 
-        layout.addStretch(1)
+        if not (
+            definition.widget_id == "home"
+            and any(item.item_id == "power" for item in definition.items)
+        ):
+            layout.addStretch(1)
         return page, buttons
 
     def _widget_clicked(self, widget_id: str) -> None:

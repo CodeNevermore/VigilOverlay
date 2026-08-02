@@ -81,13 +81,13 @@ QWidget#widgetStripRightOverflowSlot {
     background-color: transparent;
     border: none;
 }
-QPushButton[widgetStripOverflowButton="true"] {
+QLabel[widgetStripOverflowIndicator="true"] {
     background-color: transparent;
-    border: 1px solid transparent;
-    border-radius: 8px;
+    border: none;
     padding: 0;
-    font-size: 24px;
-    font-weight: 700;
+    font-family: "Segoe UI Symbol";
+    font-size: 28px;
+    font-weight: 600;
 }
 QWidget[compactPage="true"] {
     background-color: transparent;
@@ -360,7 +360,7 @@ QLabel#toggleRowTitle {
     font-size: 14px;
     font-weight: 700;
 }
-QDialog#hotkeyEditorDialog {
+QDialog#hotkeyEditorDialog, QDialog#hotkeyFailureDialog, QDialog#updateAvailableDialog {
     border-width: 2px;
     border-style: solid;
     border-radius: 10px;
@@ -493,14 +493,8 @@ QPushButton#compactWidgetButton[activeWidget="true"] {
 QPushButton#compactWidgetButton[navigationFocus="true"] {
     border-color: #ffffff;
 }
-QPushButton[widgetStripOverflowButton="true"] {
+QLabel[widgetStripOverflowIndicator="true"] {
     color: #cdd2d9;
-}
-QPushButton[widgetStripOverflowButton="true"]:hover,
-QPushButton[widgetStripOverflowButton="true"]:pressed {
-    color: #ffffff;
-    background-color: rgba(66, 71, 80, 220);
-    border-color: #69717d;
 }
 QScrollArea#widgetPageScroller {
     background-color: rgba(41, 44, 50, 248);
@@ -705,7 +699,7 @@ QPushButton#settingsRowButton:disabled, QPushButton#integrationRowButton:disable
 QPushButton#settingsRowButton:disabled QLabel, QPushButton#integrationRowButton:disabled QLabel {
     color: #767d87;
 }
-QDialog#hotkeyEditorDialog {
+QDialog#hotkeyEditorDialog, QDialog#hotkeyFailureDialog, QDialog#updateAvailableDialog {
     color: #f4f5f7;
     background-color: #252b35;
     border-color: #697383;
@@ -802,14 +796,8 @@ QPushButton#compactWidgetButton[activeWidget="true"] {
 QPushButton#compactWidgetButton[navigationFocus="true"] {
     border-color: #ffffff;
 }
-QPushButton[widgetStripOverflowButton="true"] {
+QLabel[widgetStripOverflowIndicator="true"] {
     color: #4f5864;
-}
-QPushButton[widgetStripOverflowButton="true"]:hover,
-QPushButton[widgetStripOverflowButton="true"]:pressed {
-    color: #171a1f;
-    background-color: rgba(229, 232, 236, 240);
-    border-color: #aeb4bd;
 }
 QScrollArea#widgetPageScroller {
     background-color: rgba(224, 227, 232, 248);
@@ -1010,7 +998,7 @@ QPushButton#settingsRowButton:disabled, QPushButton#integrationRowButton:disable
 QPushButton#settingsRowButton:disabled QLabel, QPushButton#integrationRowButton:disabled QLabel {
     color: #838a94;
 }
-QDialog#hotkeyEditorDialog {
+QDialog#hotkeyEditorDialog, QDialog#hotkeyFailureDialog, QDialog#updateAvailableDialog {
     color: #171a1f;
     background-color: #f4f6f9;
     border-color: #aab0b8;

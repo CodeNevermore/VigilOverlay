@@ -11,9 +11,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, TextIO
@@ -40,6 +41,51 @@ _DEFAULT_TARGET_RETRY_DELAY_SECONDS: Final[float] = 1.5
 _DEFAULT_REJECTED_RESCAN_DELAY_SECONDS: Final[float] = 5.0
 _DEFAULT_MAX_STALL_RESTARTS: Final[int] = 3
 _MAX_DISCOVERED_TARGETS: Final[int] = 8
+_STDERR_TAIL_LINES: Final[int] = 32
+_STDERR_LINE_LIMIT: Final[int] = 1_000
+
+
+@dataclass(frozen=True, slots=True)
+class PresentMonCaptureDiagnostics:
+    """Bounded evidence explaining why a PresentMon target did not yield FPS."""
+
+    target: FpsTarget
+    lines_seen: int
+    header_columns: tuple[str, ...]
+    data_rows_seen: int
+    accepted_frames: int
+    rejection_counts: tuple[tuple[str, int], ...]
+    exit_code: int | None
+    stderr_tail: tuple[str, ...]
+
+    @property
+    def no_frame_status(self) -> str:
+        rejection_counts = dict(self.rejection_counts)
+        if not self.header_columns and self.lines_seen:
+            return "PRESENTMON OUTPUT UNSUPPORTED"
+        if rejection_counts.get("other_process", 0):
+            return "FPS ROWS BELONG TO ANOTHER PROCESS"
+        rejected_rows = sum(
+            count
+            for reason, count in self.rejection_counts
+            if reason not in {"blank", "before_header"}
+        )
+        if self.data_rows_seen and rejected_rows:
+            return "PRESENTMON ROWS REJECTED"
+        return "TARGET PRODUCED NO DISPLAYED FRAMES"
+
+    @property
+    def summary(self) -> str:
+        columns = ",".join(self.header_columns) if self.header_columns else "<none>"
+        rejections = ",".join(
+            f"{reason}:{count}" for reason, count in self.rejection_counts
+        )
+        stderr = " | ".join(self.stderr_tail) if self.stderr_tail else "<empty>"
+        return (
+            f"lines={self.lines_seen} header={columns} rows={self.data_rows_seen} "
+            f"accepted={self.accepted_frames} rejected={rejections or '<none>'} "
+            f"exit={self.exit_code!r} stderr={stderr}"
+        )
 
 
 class PresentMonCsvParser:
@@ -52,51 +98,86 @@ class PresentMonCsvParser:
             raise ValueError("target_pid must be positive")
         self._target_pid = target_pid
         self._header: tuple[str, ...] = ()
+        self._lines_seen = 0
+        self._data_rows_seen = 0
+        self._accepted_frames = 0
+        self._rejections: Counter[str] = Counter()
 
     def parse_line(self, line: str) -> PresentMonFrame | None:
         stripped = line.strip().lstrip("\ufeff")
         if not stripped:
+            self._rejections["blank"] += 1
             return None
+        self._lines_seen += 1
         try:
             fields = next(csv.reader([stripped]))
         except csv.Error:
+            self._rejections["invalid_csv"] += 1
             return None
         if not self._header:
             if self.REQUIRED_COLUMNS.issubset(fields):
                 self._header = tuple(fields)
+            else:
+                self._rejections["before_header"] += 1
             return None
+        self._data_rows_seen += 1
         if len(fields) != len(self._header):
+            self._rejections["column_count"] += 1
             return None
         row = dict(zip(self._header, fields, strict=True))
         try:
             process_id = int(row["ProcessID"])
         except (KeyError, ValueError):
+            self._rejections["process_id"] += 1
             return None
         if process_id != self._target_pid:
+            self._rejections["other_process"] += 1
             return None
         application = row.get("Application", "").strip()
         displayed_raw = row.get("DisplayedTime", "").strip()
-        if (
-            not application
-            or not displayed_raw
-            or displayed_raw.casefold() in {"na", "n/a"}
-        ):
+        if not application:
+            self._rejections["application"] += 1
+            return None
+        if not displayed_raw or displayed_raw.casefold() in {"na", "n/a"}:
+            self._rejections["displayed_time_missing"] += 1
             return None
         try:
             displayed_time_ms = float(displayed_raw)
         except ValueError:
+            self._rejections["displayed_time_invalid"] += 1
             return None
         if (
             not math.isfinite(displayed_time_ms)
             or not 0.01 <= displayed_time_ms <= 10_000.0
         ):
+            self._rejections["displayed_time_range"] += 1
             return None
-        return PresentMonFrame(
+        frame = PresentMonFrame(
             process_id=process_id,
             application=application,
             displayed_time_ms=displayed_time_ms,
             swap_chain=row.get("SwapChainAddress", "").strip() or "default",
             frame_type=row.get("FrameType", "").strip(),
+        )
+        self._accepted_frames += 1
+        return frame
+
+    def diagnostics(
+        self,
+        target: FpsTarget,
+        *,
+        exit_code: int | None,
+        stderr_tail: tuple[str, ...],
+    ) -> PresentMonCaptureDiagnostics:
+        return PresentMonCaptureDiagnostics(
+            target=target,
+            lines_seen=self._lines_seen,
+            header_columns=self._header,
+            data_rows_seen=self._data_rows_seen,
+            accepted_frames=self._accepted_frames,
+            rejection_counts=tuple(sorted(self._rejections.items())),
+            exit_code=exit_code,
+            stderr_tail=stderr_tail,
         )
 
 
@@ -280,6 +361,7 @@ class PresentMonFpsService(QObject):
         self._capture_stop: threading.Event | None = None
         self._process: subprocess.Popen[str] | None = None
         self._target_has_frames = False
+        self._last_capture_diagnostics: PresentMonCaptureDiagnostics | None = None
         self._stream_identity: tuple[int, int | str] | None = None
         self._stream_selector = FpsStreamSelector()
         self._overlay_visible = True
@@ -298,6 +380,11 @@ class PresentMonFpsService(QObject):
     def target(self) -> FpsTarget | None:
         with self._lock:
             return self._target
+
+    @property
+    def last_capture_diagnostics(self) -> PresentMonCaptureDiagnostics | None:
+        with self._lock:
+            return self._last_capture_diagnostics
 
     def start(self) -> None:
         if self._closed or self._started:
@@ -378,6 +465,7 @@ class PresentMonFpsService(QObject):
             self._process = None
             self._target = target
             self._target_has_frames = False
+            self._last_capture_diagnostics = None
             if (
                 target is None
                 or previous_target is None
@@ -549,6 +637,14 @@ class PresentMonFpsService(QObject):
                 if outcome is _CaptureOutcome.CANCELLED:
                     return
                 if outcome is _CaptureOutcome.COLLECTOR_FAILED:
+                    diagnostics = self.last_capture_diagnostics
+                    if diagnostics is not None:
+                        _LOGGER.error(
+                            "PresentMon collector failed for %s (pid=%d): %s",
+                            candidate.executable_name,
+                            candidate.process_id,
+                            diagnostics.summary,
+                        )
                     self._complete_capture(
                         generation,
                         candidate,
@@ -596,16 +692,22 @@ class PresentMonFpsService(QObject):
                     continue
 
                 rejected_identities.add(candidate.identity_key)
+                diagnostics = self.last_capture_diagnostics
+                status = (
+                    diagnostics.no_frame_status
+                    if diagnostics is not None
+                    else "TARGET PRODUCED NO DISPLAYED FRAMES"
+                )
                 _LOGGER.info(
-                    "FPS candidate produced no usable frames; rejected for this acquisition "
-                    "session: %s (pid=%d, identity=%r)",
+                    "FPS candidate rejected for this acquisition session: "
+                    "%s (pid=%d, identity=%r, reason=%s, diagnostics=%s)",
                     candidate.executable_name,
                     candidate.process_id,
                     candidate.identity_key,
+                    status,
+                    diagnostics.summary if diagnostics is not None else "<unavailable>",
                 )
-                self._publish_status(
-                    generation, candidate, "NO FRAMES - TRYING NEXT GAME"
-                )
+                self._publish_status(generation, candidate, status)
             else:
                 self._publish_status(
                     generation,
@@ -689,6 +791,7 @@ class PresentMonFpsService(QObject):
                 return False
             self._target = target
             self._target_has_frames = False
+            self._last_capture_diagnostics = None
         self.metric_ready.emit(
             FpsMetricUpdate(_unavailable_fps_metric((), "ATTACHING TO GAME"), target)
         )
@@ -764,10 +867,22 @@ class PresentMonFpsService(QObject):
         parser = PresentMonCsvParser(target_pid=target.process_id)
         selector = self._selector_for_target(target)
         started_at = time.monotonic()
+        no_frame_probe_started_at: float | None = None
         last_frame_at: float | None = None
         next_publish = started_at + self._publish_interval_seconds
         saw_usable_frame = False
         outcome = _CaptureOutcome.NO_FRAMES
+        stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
+        stderr_reader: threading.Thread | None = None
+        stderr = getattr(process, "stderr", None)
+        if stderr is not None:
+            stderr_reader = threading.Thread(
+                target=_read_stderr_lines,
+                args=(stderr, stderr_tail, stop_event),
+                name="VigilFpsBrokerStderr",
+                daemon=True,
+            )
+            stderr_reader.start()
         while True:
             if stop_event.is_set():
                 outcome = _CaptureOutcome.CANCELLED
@@ -778,11 +893,13 @@ class PresentMonFpsService(QObject):
             except queue.Empty:
                 line = ""
             if line is None:
-                outcome = (
-                    _CaptureOutcome.COMPLETED_WITH_FRAMES
-                    if saw_usable_frame
-                    else _CaptureOutcome.NO_FRAMES
-                )
+                exit_code = process.poll()
+                if saw_usable_frame:
+                    outcome = _CaptureOutcome.COMPLETED_WITH_FRAMES
+                elif exit_code not in {None, 0}:
+                    outcome = _CaptureOutcome.COLLECTOR_FAILED
+                else:
+                    outcome = _CaptureOutcome.NO_FRAMES
                 break
             if line:
                 frame = parser.parse_line(line)
@@ -793,12 +910,15 @@ class PresentMonFpsService(QObject):
                     last_frame_at = time.monotonic()
                     selector.ingest(frame, observed_at=last_frame_at)
             now = time.monotonic()
-            if (
-                not saw_usable_frame
-                and now - started_at >= self._no_frame_timeout_seconds
-            ):
-                outcome = _CaptureOutcome.NO_FRAMES
-                break
+            overlay_visible = self._overlay_is_visible()
+            if not saw_usable_frame:
+                if overlay_visible:
+                    no_frame_probe_started_at = None
+                elif no_frame_probe_started_at is None:
+                    no_frame_probe_started_at = now
+                elif now - no_frame_probe_started_at >= self._no_frame_timeout_seconds:
+                    outcome = _CaptureOutcome.NO_FRAMES
+                    break
             if (
                 saw_usable_frame
                 and last_frame_at is not None
@@ -810,23 +930,48 @@ class PresentMonFpsService(QObject):
                 metric = selector.metric(now=now)
                 if metric.numeric_value is None:
                     metric = _unavailable_fps_metric(
-                        metric.history, "WAITING FOR FRAMES"
+                        metric.history,
+                        (
+                            "WAITING FOR GAME TO RESUME"
+                            if overlay_visible
+                            else "PROBING GAME FRAMES"
+                        ),
                     )
                 self.metric_ready.emit(FpsMetricUpdate(metric, target))
                 next_publish = now + self._publish_interval_seconds
             if process.poll() is not None and lines.empty():
-                outcome = (
-                    _CaptureOutcome.COMPLETED_WITH_FRAMES
-                    if saw_usable_frame
-                    else _CaptureOutcome.NO_FRAMES
-                )
+                exit_code = process.poll()
+                if saw_usable_frame:
+                    outcome = _CaptureOutcome.COMPLETED_WITH_FRAMES
+                elif exit_code not in {None, 0}:
+                    outcome = _CaptureOutcome.COLLECTOR_FAILED
+                else:
+                    outcome = _CaptureOutcome.NO_FRAMES
                 break
+        exit_code_before_stop = process.poll()
         if outcome is _CaptureOutcome.CANCELLED:
             stop_event.set()
         elif outcome in {_CaptureOutcome.NO_FRAMES, _CaptureOutcome.STALLED}:
             _terminate_process(process)
         reader.join(timeout=1.0)
+        if stderr_reader is not None:
+            stderr_reader.join(timeout=1.0)
+        diagnostics = parser.diagnostics(
+            target,
+            exit_code=exit_code_before_stop,
+            stderr_tail=tuple(stderr_tail),
+        )
+        with self._lock:
+            if (
+                self._target is not None
+                and self._target.identity_key == target.identity_key
+            ):
+                self._last_capture_diagnostics = diagnostics
         return outcome
+
+    def _overlay_is_visible(self) -> bool:
+        with self._lock:
+            return self._overlay_visible
 
 
 class UnavailableFpsService(QObject):
@@ -887,7 +1032,7 @@ def _start_hidden_process(command: Sequence[str]) -> subprocess.Popen[str]:
         list(command),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -913,6 +1058,19 @@ def _read_lines(
     finally:
         with suppress(queue.Full):
             output.put_nowait(None)
+
+
+def _read_stderr_lines(
+    stderr: TextIO,
+    output: deque[str],
+    stop_event: threading.Event,
+) -> None:
+    for line in stderr:
+        if stop_event.is_set():
+            break
+        stripped = line.strip()
+        if stripped:
+            output.append(stripped[:_STDERR_LINE_LIMIT])
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:

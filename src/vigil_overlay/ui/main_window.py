@@ -9,7 +9,16 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Final, cast
 
-from PySide6.QtCore import QByteArray, QEvent, QObject, QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QObject,
+    QPoint,
+    QRect,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QCloseEvent,
     QCursor,
@@ -39,13 +48,16 @@ from PySide6.QtWidgets import (
 from vigil_overlay.contracts.controller import ControllerBatterySnapshot
 from vigil_overlay.contracts.games import GameIdentity, GameRecord
 from vigil_overlay.core.config import AppConfig
+from vigil_overlay.core.controller_shortcuts import ControllerShortcutBinding
 from vigil_overlay.core.errors import VigilOverlayError
 from vigil_overlay.core.input_routing import (
     OverlayInputMode,
     OverlayInputPolicy,
     resolve_overlay_input_policy,
 )
+from vigil_overlay.core.updates import AvailableUpdate
 from vigil_overlay.services.integrations import IntegrationStatus
+from vigil_overlay.services.power_controls import PowerCapabilities
 from vigil_overlay.services.system_status import (
     OverlayStatusBackend,
     OverlayStatusRuntime,
@@ -62,6 +74,8 @@ from vigil_overlay.ui.navigation import (
     NavigationShell,
     navigation_command_for_key,
 )
+from vigil_overlay.ui.power_dialog import PowerActionCallback, PowerMenuDialog
+from vigil_overlay.ui.update_dialog import UpdateAvailableDialog
 from vigil_overlay.ui.windows_windowing import (
     configure_native_overlay_window,
     enforce_native_topmost,
@@ -75,10 +89,15 @@ _LOGGER = logging.getLogger("vigil_overlay")
 PersistConfig = Callable[[AppConfig], None]
 HotkeyChangeCallback = Callable[[str], tuple[bool, str]]
 HotkeyCaptureCallback = Callable[[bool], None]
+ControllerShortcutChangeCallback = Callable[
+    [ControllerShortcutBinding], tuple[bool, str]
+]
+ControllerShortcutCaptureCallback = Callable[[bool], None]
 StartupChangeCallback = Callable[[bool], tuple[bool, str]]
 BackgroundChangeCallback = Callable[[bool], tuple[bool, str]]
 RecoveryActionCallback = Callable[[], tuple[bool, str]]
 ControllerBatteryStatus = Callable[[], ControllerBatterySnapshot]
+PowerCapabilitiesCallback = Callable[[], PowerCapabilities]
 _MIN_COMPACT_PANEL_HEIGHT = 430
 _PANEL_BOTTOM_SAFETY_MARGIN = 28
 _CONTROLLER_DUPLICATE_WINDOW_SECONDS = 0.14
@@ -118,6 +137,14 @@ class OverlayWindow(QWidget):
         telemetry_snapshot: TelemetrySnapshot | None = None,
         hotkey_change_callback: HotkeyChangeCallback | None = None,
         hotkey_capture_callback: HotkeyCaptureCallback | None = None,
+        controller_shortcut_change_callback: (
+            ControllerShortcutChangeCallback | None
+        ) = None,
+        controller_shortcut_capture_callback: (
+            ControllerShortcutCaptureCallback | None
+        ) = None,
+        power_capabilities_callback: PowerCapabilitiesCallback | None = None,
+        power_action_callback: PowerActionCallback | None = None,
         startup_change_callback: StartupChangeCallback | None = None,
         startup_available: bool = False,
         background_change_callback: BackgroundChangeCallback | None = None,
@@ -135,6 +162,15 @@ class OverlayWindow(QWidget):
         self._background_available = background_available
         self._hotkey_change_callback = hotkey_change_callback
         self._hotkey_capture_callback = hotkey_capture_callback
+        self._controller_shortcut_change_callback = controller_shortcut_change_callback
+        self._controller_shortcut_capture_callback = (
+            controller_shortcut_capture_callback
+        )
+        self._power_capabilities_callback = power_capabilities_callback
+        self._power_action_callback = power_action_callback
+        self._power_dialog: PowerMenuDialog | None = None
+        self._update_dialog: UpdateAvailableDialog | None = None
+        self._next_power_input_source = ModalInputSource.UNKNOWN
         self._startup_change_callback = startup_change_callback
         self._startup_available = startup_available
         self._background_change_callback = background_change_callback
@@ -295,6 +331,9 @@ class OverlayWindow(QWidget):
             telemetry_snapshot=telemetry_snapshot,
             visible_widget_ids=tuple(widget.widget_id for widget in visible_widgets),
             guide_button_enabled=self._config.controller.guide_button_enabled,
+            controller_shortcut_binding=ControllerShortcutBinding(
+                tuple(self._config.controller.shortcut_controls)
+            ),
             allow_mouse_navigation_while_controller_connected=(
                 self._config.controller.allow_mouse_navigation_while_controller_connected
             ),
@@ -428,6 +467,11 @@ class OverlayWindow(QWidget):
     def set_hotkey_combination(self, combination: str) -> None:
         self._navigation.set_hotkey_combination(combination)
 
+    def deliver_controller_shortcut(self, binding: ControllerShortcutBinding) -> None:
+        settings_view = self._navigation.settings_view
+        if settings_view is not None:
+            settings_view.deliver_controller_shortcut(binding)
+
     def set_telemetry_snapshot(self, snapshot: TelemetrySnapshot) -> None:
         self._navigation.set_telemetry_snapshot(snapshot)
 
@@ -508,6 +552,14 @@ class OverlayWindow(QWidget):
                     ),
                 )
             )
+        items.append(
+            WidgetItemDefinition(
+                item_id="power",
+                label="Power",
+                description="Sleep, hibernate, restart, or shut down this PC.",
+                icon_key="overlay",
+            )
+        )
         self._home_games_by_item_id = mapping
         self._navigation.replace_widget_items(
             "home",
@@ -559,6 +611,14 @@ class OverlayWindow(QWidget):
                 and not integrations_view.interaction_active
             ):
                 integrations_view.set_next_input_source(ModalInputSource.CONTROLLER)
+            settings_view = self._navigation.settings_view
+            if settings_view is not None and not settings_view.interaction_active:
+                settings_view.set_next_input_source(ModalInputSource.CONTROLLER)
+            if (
+                self._navigation.selected_widget_id == "home"
+                and self._navigation.selected_item_id == "power"
+            ):
+                self._next_power_input_source = ModalInputSource.CONTROLLER
         result = self.handle_navigation_command(command)
         if result.outcome is NavigationOutcome.WIDGET_CHANGED and command in {
             NavigationCommand.MOVE_LEFT,
@@ -582,6 +642,13 @@ class OverlayWindow(QWidget):
         integrations_view = self._navigation.integrations_view
         if integrations_view is not None:
             integrations_view.notify_controller_activation_released()
+        settings_view = self._navigation.settings_view
+        if settings_view is not None:
+            settings_view.notify_controller_activation_released()
+        if self._power_dialog is not None:
+            self._power_dialog.notify_controller_activation_released()
+        if self._update_dialog is not None:
+            self._update_dialog.notify_controller_activation_released()
 
     def handle_navigation_command(self, command: NavigationCommand) -> NavigationResult:
         """Apply one keyboard/controller-neutral navigation command."""
@@ -598,6 +665,19 @@ class OverlayWindow(QWidget):
                 self._close_selected_widget()
             elif command in {NavigationCommand.BACK, NavigationCommand.OPEN_OPTIONS}:
                 self._hide_widget_options()
+            return self._current_navigation_result()
+
+        if self._update_dialog is not None:
+            self._update_dialog.handle_controller_command(command)
+            return self._current_navigation_result()
+
+        if self._power_dialog is not None:
+            self._power_dialog.handle_controller_command(command)
+            return self._current_navigation_result()
+
+        settings_view = self._navigation.settings_view
+        if settings_view is not None and settings_view.interaction_active:
+            settings_view.handle_controller_command(command)
             return self._current_navigation_result()
 
         integrations_view = self._navigation.integrations_view
@@ -701,6 +781,9 @@ class OverlayWindow(QWidget):
         display_view = self._navigation.display_view
         if display_view is not None and display_view.interaction_active:
             display_view.cancel_interaction()
+        settings_view = self._navigation.settings_view
+        if settings_view is not None and settings_view.interaction_active:
+            settings_view.handle_controller_command(NavigationCommand.BACK)
 
     def _cancel_correlated_pending_keyboard_back(
         self,
@@ -834,6 +917,9 @@ class OverlayWindow(QWidget):
         self._last_item_activation = (widget_id, item_id, now)
 
         if widget_id == "home":
+            if item_id == "power":
+                self._open_power_menu()
+                return
             game = self._home_games_by_item_id.get(item_id)
             if game is not None:
                 self.game_launch_requested.emit(game)
@@ -849,6 +935,19 @@ class OverlayWindow(QWidget):
         if widget_id == "settings" and item_id == "guide_button":
             self._toggle_guide_button_setting()
             return
+        if widget_id == "settings" and item_id == "controller_shortcut":
+            settings_view = self._navigation.settings_view
+            if (
+                settings_view is not None
+                and self._controller_shortcut_change_callback is not None
+                and self._controller_shortcut_capture_callback is not None
+            ):
+                settings_view.open_controller_shortcut_editor(
+                    self._controller_shortcut_change_callback,
+                    self._controller_shortcut_capture_callback,
+                )
+                self._navigation.restore_focus()
+            return
         if (
             widget_id == "settings"
             and item_id == "allow_mouse_navigation_while_controller_connected"
@@ -862,6 +961,7 @@ class OverlayWindow(QWidget):
                     self._hotkey_change_callback,
                     capture_callback=self._hotkey_capture_callback,
                 )
+                self._navigation.restore_focus()
             return
         if widget_id == "settings" and item_id == "run_in_background":
             if self._background_change_callback is None:
@@ -947,6 +1047,28 @@ class OverlayWindow(QWidget):
         game = self._home_games_by_item_id.get(item_id)
         if game is not None:
             self.game_close_requested.emit(game)
+
+    def _open_power_menu(self) -> None:
+        if (
+            self._power_capabilities_callback is None
+            or self._power_action_callback is None
+        ):
+            self._action_status.setText("Power controls are unavailable.")
+            return
+        dialog = PowerMenuDialog(
+            self._power_capabilities_callback(),
+            self._power_action_callback,
+            self,
+        )
+        self._power_dialog = dialog
+        source = self._next_power_input_source
+        self._next_power_input_source = ModalInputSource.UNKNOWN
+        dialog.begin_controller_ownership(source)
+        try:
+            dialog.exec()
+        finally:
+            self._power_dialog = None
+            self._navigation.restore_focus()
 
     def _toggle_guide_button_setting(self) -> None:
         previous = self._config.controller.guide_button_enabled
@@ -1308,6 +1430,24 @@ class OverlayWindow(QWidget):
 
     def set_background_available(self, available: bool) -> None:
         self._background_available = available
+
+    def show_available_update(self, update: object) -> None:
+        """Show one host-owned update prompt for a validated release."""
+
+        if not isinstance(update, AvailableUpdate):
+            _LOGGER.warning("Ignored invalid available-update payload: %r", type(update))
+            return
+        if self._update_dialog is not None:
+            return
+
+        dialog = UpdateAvailableDialog(update, self)
+        self._update_dialog = dialog
+        dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
+        try:
+            dialog.exec()
+        finally:
+            self._update_dialog = None
+            self._navigation.restore_focus()
 
     def reset_position(self) -> None:
         target = self._target_screen_geometry(force_primary=True)

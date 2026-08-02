@@ -1,0 +1,6 @@
+Id: 7c04ef12-67ae-4db7-ae4f-3af7fb227809
+Name: Vigil Overlay Bridge
+Author: Vigil Overlay
+Version: 1.2.0
+Module: VigilOverlayBridge.dll
+Type: GenericPlugin

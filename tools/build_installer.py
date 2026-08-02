@@ -164,7 +164,7 @@ def inspect_gameinput_msi(path: Path) -> GameInputMsiIdentity:
 
     if os.name != "nt":
         raise ValueError("GameInput MSI trust verification must run on Windows")
-    powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    powershell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
     if powershell is None:
         raise ValueError(
             "PowerShell is required for GameInput Authenticode verification"
@@ -172,13 +172,38 @@ def inspect_gameinput_msi(path: Path) -> GameInputMsiIdentity:
     environment = os.environ.copy()
     environment["VIGIL_GAMEINPUT_MSI"] = str(path)
     script = (
-        "$signature = Get-AuthenticodeSignature -LiteralPath $env:VIGIL_GAMEINPUT_MSI; "
+        "$ErrorActionPreference = 'Stop'; "
+        "$msiPath = $env:VIGIL_GAMEINPUT_MSI; "
+        "$signature = Get-AuthenticodeSignature -LiteralPath $msiPath; "
+        "if ($null -eq $signature) { throw 'Signature inspection returned no result' }; "
         "$subject = if ($null -eq $signature.SignerCertificate) { '' } else { "
         "$signature.SignerCertificate.Subject }; "
         "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { "
         "$signature.SignerCertificate.Thumbprint }; "
+        "$installer = New-Object -ComObject WindowsInstaller.Installer; "
+        "$database = $installer.GetType().InvokeMember(" 
+        "'OpenDatabase', 'InvokeMethod', $null, $installer, @($msiPath, 0)); "
+        "$properties = [ordered]@{}; "
+        "foreach ($name in @('ProductName','Manufacturer','ProductCode','ProductVersion')) { "
+        "$query = \"SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$name'\"; "
+        "$view = $database.GetType().InvokeMember(" 
+        "'OpenView', 'InvokeMethod', $null, $database, @($query)); "
+        "$view.GetType().InvokeMember(" 
+        "'Execute', 'InvokeMethod', $null, $view, $null) | Out-Null; "
+        "$record = $view.GetType().InvokeMember(" 
+        "'Fetch', 'InvokeMethod', $null, $view, $null); "
+        "if ($null -eq $record) { throw \"MSI property is missing: $name\" }; "
+        "$value = $record.GetType().InvokeMember(" 
+        "'StringData', 'GetProperty', $null, $record, 1); "
+        "if ([string]::IsNullOrWhiteSpace([string]$value)) { "
+        "throw \"MSI property is empty: $name\" }; "
+        "$properties[$name] = [string]$value; "
+        "}; "
         "[PSCustomObject]@{ status = [string]$signature.Status; subject = $subject; "
-        "thumbprint = $thumbprint } | ConvertTo-Json -Compress"
+        "thumbprint = $thumbprint; product_name = $properties['ProductName']; "
+        "manufacturer = $properties['Manufacturer']; "
+        "product_code = $properties['ProductCode']; "
+        "product_version = $properties['ProductVersion'] } | ConvertTo-Json -Compress"
     )
     result = subprocess.run(
         [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
@@ -190,57 +215,34 @@ def inspect_gameinput_msi(path: Path) -> GameInputMsiIdentity:
     )
     if result.returncode != 0:
         raise ValueError(
-            "Could not inspect the GameInput MSI Authenticode signature: "
+            "Could not inspect the GameInput MSI trust and product metadata: "
             + (result.stderr.strip() or f"PowerShell exit code {result.returncode}")
         )
     try:
-        signature = json.loads(result.stdout)
+        inspection: object = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            "GameInput Authenticode inspection returned invalid data"
-        ) from exc
-    if not isinstance(signature, dict):
-        raise ValueError("GameInput Authenticode inspection returned an invalid object")
-
-    try:
-        import msilib  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ValueError("Python's Windows Installer bindings are unavailable") from exc
-    try:
-        database = msilib.OpenDatabase(str(path), msilib.MSIDBOPEN_READONLY)
-        properties = {
-            name: _read_msi_property(database, name)
-            for name in ("ProductName", "Manufacturer", "ProductCode", "ProductVersion")
-        }
-    except Exception as exc:
-        raise ValueError(
-            f"Could not read GameInput MSI product metadata: {exc}"
-        ) from exc
+        raise ValueError("GameInput MSI inspection returned invalid data") from exc
+    if not isinstance(inspection, dict):
+        raise ValueError("GameInput MSI inspection returned an invalid object")
 
     return GameInputMsiIdentity(
         path=path,
-        signature_status=str(signature.get("status", "")),
-        signer_subject=str(signature.get("subject", "")),
-        signer_thumbprint=str(signature.get("thumbprint", "")),
-        product_name=properties["ProductName"],
-        manufacturer=properties["Manufacturer"],
-        product_code=properties["ProductCode"],
-        product_version=properties["ProductVersion"],
+        signature_status=str(inspection.get("status", "")).strip(),
+        signer_subject=str(inspection.get("subject", "")).strip(),
+        signer_thumbprint=str(inspection.get("thumbprint", "")).strip(),
+        product_name=_required_inspection_text(inspection, "product_name"),
+        manufacturer=_required_inspection_text(inspection, "manufacturer"),
+        product_code=_required_inspection_text(inspection, "product_code"),
+        product_version=_required_inspection_text(inspection, "product_version"),
         sha256=sha256_file(path),
     )
 
 
-def _read_msi_property(database: Any, name: str) -> str:
-    view = database.OpenView(
-        f"SELECT `Value` FROM `Property` WHERE `Property`='{name}'"
-    )
-    view.Execute(None)
-    record = view.Fetch()
-    if record is None:
-        raise ValueError(f"MSI property is missing: {name}")
-    value = str(record.GetString(1)).strip()
-    if not value:
-        raise ValueError(f"MSI property is empty: {name}")
+def _required_inspection_text(payload: dict[object, object], name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"GameInput MSI inspection returned an empty field: {name}")
+    value = value.strip()
     return value
 
 

@@ -18,6 +18,10 @@ from typing import Any, Final, Protocol, cast
 from PySide6.QtCore import QObject, Signal
 
 from vigil_overlay.contracts.controller import ControllerBatterySnapshot
+from vigil_overlay.services.controller_shortcuts import (
+    ControllerControlState,
+    ControllerShortcutService,
+)
 from vigil_overlay.ui.navigation import NavigationCommand
 
 _LOGGER = logging.getLogger("vigil_overlay")
@@ -47,10 +51,15 @@ XINPUT_GAMEPAD_DPAD_DOWN: Final[int] = 0x0002
 XINPUT_GAMEPAD_DPAD_LEFT: Final[int] = 0x0004
 XINPUT_GAMEPAD_DPAD_RIGHT: Final[int] = 0x0008
 XINPUT_GAMEPAD_START: Final[int] = 0x0010
+XINPUT_GAMEPAD_BACK: Final[int] = 0x0020
+XINPUT_GAMEPAD_LEFT_THUMB: Final[int] = 0x0040
+XINPUT_GAMEPAD_RIGHT_THUMB: Final[int] = 0x0080
 XINPUT_GAMEPAD_LEFT_SHOULDER: Final[int] = 0x0100
 XINPUT_GAMEPAD_RIGHT_SHOULDER: Final[int] = 0x0200
 XINPUT_GAMEPAD_A: Final[int] = 0x1000
 XINPUT_GAMEPAD_B: Final[int] = 0x2000
+XINPUT_GAMEPAD_X: Final[int] = 0x4000
+XINPUT_GAMEPAD_Y: Final[int] = 0x8000
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +70,10 @@ class ControllerState:
     buttons: int
     left_thumb_x: int
     left_thumb_y: int
+    left_trigger: int = 0
+    right_trigger: int = 0
+    right_thumb_x: int = 0
+    right_thumb_y: int = 0
 
 
 class ControllerBackend(Protocol):
@@ -151,6 +164,10 @@ class XInputControllerBackend:
             buttons=int(gamepad.wButtons),
             left_thumb_x=int(gamepad.sThumbLX),
             left_thumb_y=int(gamepad.sThumbLY),
+            left_trigger=int(gamepad.bLeftTrigger),
+            right_trigger=int(gamepad.bRightTrigger),
+            right_thumb_x=int(gamepad.sThumbRX),
+            right_thumb_y=int(gamepad.sThumbRY),
         )
 
     def read_battery(self, controller_index: int) -> ControllerBatterySnapshot:
@@ -446,6 +463,7 @@ class ControllerInputService(QObject):
         poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
         reconnect_scan_seconds: float = _DEFAULT_RECONNECT_SCAN_SECONDS,
         interpreter: ControllerCommandInterpreter | None = None,
+        shortcut_service: ControllerShortcutService | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -457,6 +475,7 @@ class ControllerInputService(QObject):
         self._poll_interval_seconds = poll_interval_seconds
         self._reconnect_scan_seconds = reconnect_scan_seconds
         self._interpreter = interpreter or ControllerCommandInterpreter()
+        self._shortcut_service = shortcut_service
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
@@ -464,6 +483,7 @@ class ControllerInputService(QObject):
         self._commands_armed = threading.Event()
         self._commands_armed.set()
         self._closed = False
+        self._shortcut_devices: set[str] = set()
 
     @property
     def running(self) -> bool:
@@ -518,6 +538,17 @@ class ControllerInputService(QObject):
         self._interpreter.reset()
         self._commands_armed.clear()
 
+    def set_shortcut_service(
+        self, shortcut_service: ControllerShortcutService | None
+    ) -> None:
+        """Attach the shared shortcut matcher before polling starts."""
+
+        if self.running:
+            raise RuntimeError(
+                "controller shortcut service cannot change while running"
+            )
+        self._shortcut_service = shortcut_service
+
     def suppress_direction_repeat_until_release(
         self, command: NavigationCommand
     ) -> None:
@@ -538,6 +569,11 @@ class ControllerInputService(QObject):
             )
         self._thread = None
         self._set_active_controller(None)
+        shortcut_service = self._shortcut_service
+        if shortcut_service is not None:
+            for device_id in tuple(self._shortcut_devices):
+                shortcut_service.observe_disconnect(device_id)
+        self._shortcut_devices.clear()
         self._interpreter.reset()
         self._commands_armed.set()
         try:
@@ -553,6 +589,9 @@ class ControllerInputService(QObject):
         try:
             while not self._stop_event.is_set():
                 now = time.monotonic()
+                shortcut_states, shortcut_consumed_indexes = (
+                    self._poll_shortcut_states()
+                )
                 if active_index is None:
                     if now >= next_scan_at:
                         active_index, state = self._find_connected_controller()
@@ -566,7 +605,9 @@ class ControllerInputService(QObject):
                         break
                     continue
 
-                state = self._safe_read_state(active_index)
+                state = shortcut_states.get(active_index)
+                if self._shortcut_service is None:
+                    state = self._safe_read_state(active_index)
                 if state is None:
                     disconnected_index = active_index
                     active_index = None
@@ -578,6 +619,8 @@ class ControllerInputService(QObject):
                     if self._stop_event.wait(self._poll_interval_seconds):
                         break
                     continue
+
+                shortcut_consumed = active_index in shortcut_consumed_indexes
 
                 if (
                     previous_buttons & XINPUT_GAMEPAD_A
@@ -591,6 +634,12 @@ class ControllerInputService(QObject):
                     if self._interpreter.is_neutral(state):
                         self._commands_armed.set()
                         self.commands_rearmed.emit()
+                    if self._stop_event.wait(self._poll_interval_seconds):
+                        break
+                    continue
+
+                if shortcut_consumed:
+                    self._interpreter.prime(state, now=now)
                     if self._stop_event.wait(self._poll_interval_seconds):
                         break
                     continue
@@ -612,6 +661,32 @@ class ControllerInputService(QObject):
                 "Controller input worker failed; keyboard navigation remains available"
             )
             self._set_active_controller(None)
+
+    def _poll_shortcut_states(self) -> tuple[dict[int, ControllerState], set[int]]:
+        shortcut_service = self._shortcut_service
+        if shortcut_service is None:
+            return {}, set()
+        states: dict[int, ControllerState] = {}
+        consumed_indexes: set[int] = set()
+        connected: set[str] = set()
+        for controller_index in range(_MAX_CONTROLLERS):
+            state = self._safe_read_state(controller_index)
+            if state is None:
+                continue
+            states[controller_index] = state
+            device_id = f"xinput:{controller_index}"
+            connected.add(device_id)
+            if shortcut_service.observe_state(
+                ControllerControlState(
+                    device_id=device_id,
+                    controls=_xinput_controls(state),
+                )
+            ):
+                consumed_indexes.add(controller_index)
+        for device_id in self._shortcut_devices - connected:
+            shortcut_service.observe_disconnect(device_id)
+        self._shortcut_devices = connected
+        return states, consumed_indexes
 
     def _find_connected_controller(self) -> tuple[int | None, ControllerState | None]:
         for controller_index in range(_MAX_CONTROLLERS):
@@ -650,6 +725,44 @@ def create_platform_controller_service() -> ControllerInputService:
         except OSError:
             _LOGGER.exception("XInput controller initialization failed")
     return ControllerInputService(UnsupportedControllerBackend())
+
+
+def _xinput_controls(state: ControllerState) -> frozenset[str]:
+    controls: set[str] = set()
+    button_controls = {
+        XINPUT_GAMEPAD_DPAD_UP: "xinput:dpad_up",
+        XINPUT_GAMEPAD_DPAD_DOWN: "xinput:dpad_down",
+        XINPUT_GAMEPAD_DPAD_LEFT: "xinput:dpad_left",
+        XINPUT_GAMEPAD_DPAD_RIGHT: "xinput:dpad_right",
+        XINPUT_GAMEPAD_START: "xinput:start",
+        XINPUT_GAMEPAD_BACK: "xinput:back",
+        XINPUT_GAMEPAD_LEFT_THUMB: "xinput:left_thumb",
+        XINPUT_GAMEPAD_RIGHT_THUMB: "xinput:right_thumb",
+        XINPUT_GAMEPAD_LEFT_SHOULDER: "xinput:left_shoulder",
+        XINPUT_GAMEPAD_RIGHT_SHOULDER: "xinput:right_shoulder",
+        XINPUT_GAMEPAD_A: "xinput:a",
+        XINPUT_GAMEPAD_B: "xinput:b",
+        XINPUT_GAMEPAD_X: "xinput:x",
+        XINPUT_GAMEPAD_Y: "xinput:y",
+    }
+    controls.update(
+        control for mask, control in button_controls.items() if state.buttons & mask
+    )
+    if state.left_trigger >= 128:
+        controls.add("xinput:left_trigger")
+    if state.right_trigger >= 128:
+        controls.add("xinput:right_trigger")
+    for axis, negative, positive in (
+        (state.left_thumb_x, "xinput:left_stick_left", "xinput:left_stick_right"),
+        (state.left_thumb_y, "xinput:left_stick_down", "xinput:left_stick_up"),
+        (state.right_thumb_x, "xinput:right_stick_left", "xinput:right_stick_right"),
+        (state.right_thumb_y, "xinput:right_stick_down", "xinput:right_stick_up"),
+    ):
+        if axis <= -_DEFAULT_STICK_ENGAGE:
+            controls.add(negative)
+        elif axis >= _DEFAULT_STICK_ENGAGE:
+            controls.add(positive)
+    return frozenset(controls)
 
 
 def _load_xinput_library() -> tuple[str, Any]:

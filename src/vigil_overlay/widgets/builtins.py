@@ -19,6 +19,14 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
             label="Home",
             description="Your six most recent provider-reported games.",
             icon_key="home",
+            items=(
+                WidgetItemDefinition(
+                    "power",
+                    "Power",
+                    "Sleep, hibernate, restart, or shut down this PC.",
+                    "overlay",
+                ),
+            ),
             empty_message="Recent games will appear here when a game provider is connected.",
             required=True,
             preferred_panel_width=DEFAULT_COMPACT_PANEL_WIDTH,
@@ -200,8 +208,14 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
             items=(
                 WidgetItemDefinition(
                     "guide_button",
-                    "Use Xbox/Guide button to open Vigil",
-                    "Allow the Xbox/Guide button to open or close Vigil Overlay.",
+                    "Use controller Home/Guide button",
+                    "Allow any exposed controller Home/Guide button to open or close Vigil.",
+                    "controls",
+                ),
+                WidgetItemDefinition(
+                    "controller_shortcut",
+                    "Controller shortcut",
+                    "Capture any exposed button or same-controller combination.",
                     "controls",
                 ),
                 WidgetItemDefinition(

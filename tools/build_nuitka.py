@@ -19,6 +19,7 @@ from pathlib import Path
 
 from vigil_overlay.core.file_io import sha256_file
 from vigil_overlay.core.packaging import validate_playnite_bundle
+from vigil_overlay.core.version import __version__
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ENTRY = PROJECT_ROOT / "src" / "vigil_overlay"
@@ -94,6 +95,7 @@ WINRT_PROJECTIONS = (
         "winrt.windows.foundation.collections",
         "winrt-Windows.Foundation.Collections",
     ),
+    WinRTProjection("winrt.windows.gaming.input", "winrt-Windows.Gaming.Input"),
     WinRTProjection("winrt.windows.networking", "winrt-Windows.Networking"),
     WinRTProjection(
         "winrt.windows.networking.connectivity",
@@ -121,6 +123,10 @@ def build_command(profile: str) -> list[str]:
         "--python-flag=-m",
         "--assume-yes-for-downloads",
         "--output-filename=VigilOverlay.exe",
+        "--product-name=Vigil Overlay",
+        f"--file-version={__version__}",
+        f"--product-version={__version__}",
+        "--file-description=Vigil Overlay",
         f"--windows-icon-from-ico={APPLICATION_ICON_RESOURCE}",
         f"--output-dir={OUTPUT_ROOT}",
         f"--report={report_path}",
@@ -146,10 +152,7 @@ def build_command(profile: str) -> list[str]:
             f"--include-data-files={source}={destination}"
             for source, destination in LEGAL_DISTRIBUTION_FILES
         ),
-        (
-            f"--include-data-dir={THIRD_PARTY_LICENSE_ROOT}="
-            "licenses/third_party"
-        ),
+        (f"--include-data-dir={THIRD_PARTY_LICENSE_ROOT}=" "licenses/third_party"),
         "--enable-plugin=pyside6",
     ]
 

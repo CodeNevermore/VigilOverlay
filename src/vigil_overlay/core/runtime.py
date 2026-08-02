@@ -28,11 +28,21 @@ def packaged_executable_path() -> Path | None:
 
     if not _is_windows() or not is_packaged_build():
         return None
-    candidates = (sys.executable, sys.argv[0] if sys.argv else "")
+    candidates = (sys.argv[0] if sys.argv else "", sys.executable)
     for raw_candidate in candidates:
         if not raw_candidate:
             continue
         candidate = Path(raw_candidate).expanduser().resolve()
-        if candidate.suffix.casefold() == ".exe" and candidate.is_file():
+        executable_name = candidate.name.casefold()
+        is_source_interpreter = executable_name in {
+            "py.exe",
+            "python.exe",
+            "pythonw.exe",
+        } or executable_name.startswith(("python3.", "pythonw3."))
+        if (
+            candidate.suffix.casefold() == ".exe"
+            and candidate.is_file()
+            and not is_source_interpreter
+        ):
             return candidate
     return None

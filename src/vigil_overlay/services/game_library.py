@@ -6,7 +6,7 @@ import logging
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import PureWindowsPath
 from threading import Event
@@ -18,6 +18,7 @@ from vigil_overlay.contracts.games import (
     GameLaunchTargetKind,
     GameProvider,
     GameProviderSnapshot,
+    GameRecency,
     GameRecord,
 )
 
@@ -255,13 +256,24 @@ def _aggregate_provider_results(
                 continue
             current = games[duplicate_index]
             current_priority = game_priorities[duplicate_index]
-            if _prefer_game_record(
+            prefer_candidate = _prefer_game_record(
                 current,
                 game,
                 current_priority=current_priority,
                 candidate_priority=priority,
-            ):
-                games[duplicate_index] = game
+            )
+            preferred = game if prefer_candidate else current
+            freshest_recency = _freshest_timestamp_recency(
+                current.recency,
+                game.recency,
+                fallback=preferred.recency,
+            )
+            games[duplicate_index] = (
+                preferred
+                if preferred.recency == freshest_recency
+                else replace(preferred, recency=freshest_recency)
+            )
+            if prefer_candidate:
                 game_priorities[duplicate_index] = priority
             _index_game_aliases(
                 game,
@@ -356,6 +368,27 @@ def _prefer_game_record(
     if candidate.is_installed != current.is_installed:
         return candidate.is_installed
     return candidate_priority < current_priority
+
+
+def _freshest_timestamp_recency(
+    current: GameRecency | None,
+    candidate: GameRecency | None,
+    *,
+    fallback: GameRecency | None,
+) -> GameRecency | None:
+    """Keep the newest comparable provider timestamp on the preferred launch record."""
+
+    timestamped = tuple(
+        recency
+        for recency in (current, candidate)
+        if recency is not None and recency.last_played_utc is not None
+    )
+    if not timestamped:
+        return fallback
+    return max(
+        timestamped,
+        key=lambda recency: recency.last_played_utc or datetime.min,
+    )
 
 
 def select_recent_games(

@@ -7,11 +7,37 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 _CHUNK_SIZE = 1024 * 1024
+_REPLACE_LOCK_COUNT = 64
+_REPLACE_LOCKS = tuple(threading.RLock() for _ in range(_REPLACE_LOCK_COUNT))
+_REPLACE_RETRY_DELAYS_SECONDS = (0.01, 0.025, 0.05, 0.1, 0.2)
+
+
+def _destination_lock(path: Path) -> threading.RLock:
+    """Return a bounded process-local lock shared by equivalent destinations."""
+
+    canonical = os.path.normcase(str(path.resolve(strict=False)))
+    return _REPLACE_LOCKS[hash(canonical) % _REPLACE_LOCK_COUNT]
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    """Serialize a destination replace and retry transient Windows sharing errors."""
+
+    with _destination_lock(destination):
+        for delay in (*_REPLACE_RETRY_DELAYS_SECONDS, None):
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError:
+                if delay is None:
+                    raise
+                time.sleep(delay)
 
 
 def sha256_file(path: Path) -> str:
@@ -41,7 +67,7 @@ def atomic_copy_file(
     temporary = Path(temporary_name)
     try:
         shutil.copy2(source, temporary)
-        os.replace(temporary, destination)
+        _replace_with_retry(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -72,7 +98,7 @@ def atomic_write_text(
                 handle.flush()
                 os.fsync(handle.fileno())
         assert temporary is not None
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

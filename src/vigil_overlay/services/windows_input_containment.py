@@ -77,8 +77,8 @@ class WindowsLowLevelHookContainmentBackend:
 
     def __init__(self, *, diagnostics_enabled: bool | None = None) -> None:
         try:
-            user32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         except (AttributeError, OSError) as exc:
             raise OSError("Windows low-level hook APIs are unavailable") from exc
 

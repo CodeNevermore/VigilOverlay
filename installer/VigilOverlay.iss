@@ -8,7 +8,7 @@
   #error GameInputMsi must point to the official Microsoft GameInputRedist.msi.
 #endif
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0.0"
+  #define MyAppVersion "0.1.2.1"
 #endif
 
 #define MyAppName "Vigil Overlay"

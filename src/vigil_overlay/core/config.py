@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
+from vigil_overlay.core.controller_shortcuts import ControllerShortcutBinding
 from vigil_overlay.core.errors import ConfigError
 from vigil_overlay.core.file_io import atomic_write_text
 from vigil_overlay.core.hotkeys import parse_hotkey_combination
@@ -64,6 +65,7 @@ class ControllerSettings:
 
     guide_button_enabled: bool = True
     allow_mouse_navigation_while_controller_connected: bool = False
+    shortcut_controls: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -186,9 +188,18 @@ class AppConfig:
             {
                 "guide_button_enabled",
                 "allow_mouse_navigation_while_controller_connected",
+                "shortcut_controls",
             },
             "controller",
         )
+        try:
+            shortcut_binding = ControllerShortcutBinding.from_tokens(
+                controller_raw["shortcut_controls"]
+            )
+        except ValueError as exc:
+            raise ConfigError(
+                f"controller.shortcut_controls is invalid: {exc}"
+            ) from exc
         controller = ControllerSettings(
             guide_button_enabled=_require_bool(
                 controller_raw["guide_button_enabled"],
@@ -198,6 +209,7 @@ class AppConfig:
                 controller_raw["allow_mouse_navigation_while_controller_connected"],
                 "controller.allow_mouse_navigation_while_controller_connected",
             ),
+            shortcut_controls=list(shortcut_binding.controls),
         )
 
         widgets_raw = _require_mapping(migrated["widgets"], "widgets")
@@ -443,6 +455,16 @@ def _migrate_v12_to_v13(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _migrate_v13_to_v14(raw: dict[str, Any]) -> dict[str, Any]:
+    controller = raw.get("controller")
+    if not isinstance(controller, dict):
+        controller = {}
+        raw["controller"] = controller
+    controller.setdefault("shortcut_controls", [])
+    raw["schema_version"] = 14
+    return raw
+
+
 _MIGRATIONS: dict[int, Migration] = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
@@ -456,6 +478,7 @@ _MIGRATIONS: dict[int, Migration] = {
     10: _migrate_v10_to_v11,
     11: _migrate_v11_to_v12,
     12: _migrate_v12_to_v13,
+    13: _migrate_v13_to_v14,
 }
 
 

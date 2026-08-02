@@ -60,7 +60,7 @@ def _windows_xbox_games_roots() -> tuple[str, ...]:
         return ()
 
     roots: list[str] = []
-    for drive in buffer[:].split("\x00"):
+    for drive in "".join(buffer[:]).split("\x00"):
         if not drive:
             continue
         drive_type = kernel32.GetDriveTypeW(drive)

@@ -84,6 +84,10 @@ own game-launch history. Hardware and FPS history are bounded in memory and are 
 persisted. PresentMon and GameInput are validated during packaging; Vigil does not
 download or replace either dependency while the application is running.
 
+Shortly after startup, Vigil makes one HTTPS request to GitHub's public latest-release
+endpoint. This check only displays an update notice; Vigil does not download or install
+updates automatically.
+
 Configuration, logs, integration data, and caches are stored under the current user's
 Vigil Overlay application-data directories. Run `VigilOverlay --diagnose` to print the
 resolved non-sensitive paths.

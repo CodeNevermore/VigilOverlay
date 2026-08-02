@@ -19,6 +19,7 @@ from vigil_overlay.core.background import (
     background_residency_available,
 )
 from vigil_overlay.core.config import AppConfig, save_config
+from vigil_overlay.core.controller_shortcuts import ControllerShortcutBinding
 from vigil_overlay.core.errors import VigilOverlayError
 from vigil_overlay.core.hotkeys import parse_hotkey_combination
 from vigil_overlay.core.input_routing import (
@@ -35,6 +36,7 @@ from vigil_overlay.services.controller import (
     ControllerInputService,
     create_platform_controller_service,
 )
+from vigil_overlay.services.controller_shortcuts import ControllerShortcutService
 from vigil_overlay.services.foreground_ownership import (
     ForegroundOwnershipService,
     create_platform_foreground_ownership_service,
@@ -63,13 +65,25 @@ from vigil_overlay.services.guide_button import (
     create_platform_controller_input_ownership_service,
     create_platform_guide_button_service,
 )
-from vigil_overlay.services.hotkeys import GlobalHotkeyService, HotkeyBackend, HotkeyRegistration
+from vigil_overlay.services.hotkeys import (
+    GlobalHotkeyService,
+    HotkeyBackend,
+    HotkeyRegistration,
+)
 from vigil_overlay.services.input_containment import (
     InputContainmentService,
     create_platform_input_containment_service,
 )
 from vigil_overlay.services.integration_runtime import IntegrationStatusService
 from vigil_overlay.services.integrations import IntegrationManager
+from vigil_overlay.services.power_controls import (
+    PowerControlService,
+    create_platform_power_control_service,
+)
+from vigil_overlay.services.raw_controller import (
+    RawControllerInputService,
+    create_platform_raw_controller_service,
+)
 from vigil_overlay.services.recovery import (
     RecoveryProcessLauncher,
     launch_recovery_process,
@@ -83,8 +97,12 @@ from vigil_overlay.services.telemetry_runtime import (
     TelemetryPollingService,
     create_platform_telemetry_service,
 )
+from vigil_overlay.services.update_check import UpdateCheckService
 from vigil_overlay.services.windows_process import capture_foreground_fps_target
-from vigil_overlay.ui.application_icon import application_icon_path, load_application_icon
+from vigil_overlay.ui.application_icon import (
+    application_icon_path,
+    load_application_icon,
+)
 from vigil_overlay.ui.main_window import OverlayWindow
 from vigil_overlay.ui.navigation import NavigationCommand, NavigationOutcome
 from vigil_overlay.ui.theme import apply_host_theme
@@ -93,6 +111,7 @@ _LOGGER = logging.getLogger("vigil_overlay")
 _FOREGROUND_LEASE_POLL_MILLISECONDS = 50
 _FOREGROUND_CLAIM_TIMEOUT_SECONDS = 1.0
 _FOREGROUND_LOSS_CONFIRM_SECONDS = 0.20
+_HOME_REFRESH_COOLDOWN_SECONDS = 5.0
 
 
 class VigilApplication:
@@ -111,6 +130,8 @@ class VigilApplication:
         telemetry_service: TelemetryPollingService | None = None,
         fps_service: PresentMonFpsService | UnavailableFpsService | None = None,
         controller_service: ControllerInputService | None = None,
+        raw_controller_service: RawControllerInputService | None = None,
+        power_control_service: PowerControlService | None = None,
         guide_button_service: GuideButtonInputService | None = None,
         controller_input_ownership_service: (
             ControllerInputOwnershipService | None
@@ -119,6 +140,7 @@ class VigilApplication:
         foreground_ownership_service: ForegroundOwnershipService | None = None,
         foreground_clock: Callable[[], float] = time.monotonic,
         foreground_claim_timeout_seconds: float = _FOREGROUND_CLAIM_TIMEOUT_SECONDS,
+        game_library_refresh_clock: Callable[[], float] = time.monotonic,
         game_provider_registry: GameProviderRegistry | None = None,
         game_library_service: GameLibraryService | None = None,
         game_launch_service: GameLaunchService | None = None,
@@ -126,6 +148,7 @@ class VigilApplication:
         integration_manager: IntegrationManager | None = None,
         integration_status_service: IntegrationStatusService | None = None,
         startup_service: StartupRegistrationService | None = None,
+        update_check_service: UpdateCheckService | None = None,
         safe_mode_restart_launcher: RecoveryProcessLauncher | None = None,
         single_instance_guard: SingleInstanceGuard | None = None,
     ) -> None:
@@ -180,8 +203,23 @@ class VigilApplication:
             telemetry_service or create_platform_telemetry_service()
         )
         self._fps_service = fps_service or create_platform_fps_service()
+        self._controller_shortcut_service = ControllerShortcutService(
+            ControllerShortcutBinding(tuple(config.controller.shortcut_controls))
+        )
         self._controller_service = (
             controller_service or create_platform_controller_service()
+        )
+        attach_shortcuts = getattr(
+            self._controller_service, "set_shortcut_service", None
+        )
+        if callable(attach_shortcuts):
+            attach_shortcuts(self._controller_shortcut_service)
+        self._raw_controller_service = (
+            raw_controller_service
+            or create_platform_raw_controller_service(self._controller_shortcut_service)
+        )
+        self._power_control_service = (
+            power_control_service or create_platform_power_control_service()
         )
         self._guide_button_service = (
             guide_button_service or create_platform_guide_button_service()
@@ -234,6 +272,9 @@ class VigilApplication:
         self._game_close_service = (
             game_close_service or create_platform_game_close_service()
         )
+        self._game_library_refresh_clock = game_library_refresh_clock
+        self._last_game_library_refresh_at: float | None = None
+        self._game_library_started = False
         self._recent_games: tuple[GameRecord, ...] = ()
         self._current_game_library: AggregatedGameLibrary | None = None
         self._integration_manager = integration_manager or IntegrationManager(
@@ -243,6 +284,9 @@ class VigilApplication:
         self._integration_status_service = (
             integration_status_service
             or IntegrationStatusService(self._integration_manager)
+        )
+        self._update_check_service = update_check_service or UpdateCheckService(
+            parent=self.qt_app
         )
         if not self._read_only_config:
             try:
@@ -271,6 +315,12 @@ class VigilApplication:
             controller_battery_status=self._controller_service.battery_snapshot,
             hotkey_change_callback=self._change_global_hotkey,
             hotkey_capture_callback=self._set_hotkey_capture_active,
+            controller_shortcut_change_callback=self._change_controller_shortcut,
+            controller_shortcut_capture_callback=(
+                self._set_controller_shortcut_capture_active
+            ),
+            power_capabilities_callback=self._power_control_service.capabilities,
+            power_action_callback=self._power_control_service.execute,
             startup_change_callback=self._change_start_with_windows,
             startup_available=startup_available,
             background_change_callback=self._change_run_in_background,
@@ -286,6 +336,10 @@ class VigilApplication:
         )
 
         self._hotkey_service.activated.connect(self.toggle_overlay)
+        self._controller_shortcut_service.activated.connect(self.toggle_overlay)
+        self._controller_shortcut_service.capture_ready.connect(
+            self.window.deliver_controller_shortcut
+        )
         hotkey_active = self._setup_hotkey()
         background_available = self._sync_background_availability(
             hotkey_active=hotkey_active
@@ -331,6 +385,9 @@ class VigilApplication:
         self._game_library_service.library_ready.connect(self._apply_game_library)
         self._integration_status_service.statuses_ready.connect(
             self.window.set_integration_statuses
+        )
+        self._update_check_service.update_available.connect(
+            self.window.show_available_update
         )
         self.qt_app.aboutToQuit.connect(self._before_quit)
         self.window.apply_input_policy(self._input_policy)
@@ -406,6 +463,42 @@ class VigilApplication:
             self._hotkey_service.suspend_activations()
             return
         self._hotkey_service.resume_activations()
+        self._controller_service.require_neutral_before_commands()
+
+    def _set_controller_shortcut_capture_active(self, active: bool) -> None:
+        if active:
+            self._controller_shortcut_service.begin_capture()
+            self._guide_button_service.start()
+            return
+        self._controller_shortcut_service.cancel_capture()
+        self._controller_service.require_neutral_before_commands()
+        if not (
+            self._config.controller.guide_button_enabled
+            or "gameinput:guide" in self._config.controller.shortcut_controls
+        ):
+            self._guide_button_service.deactivate()
+
+    def _change_controller_shortcut(
+        self, binding: ControllerShortcutBinding
+    ) -> tuple[bool, str]:
+        if self._read_only_config:
+            return (
+                False,
+                "Safe mode is read-only; the controller shortcut cannot change.",
+            )
+        previous = list(self._config.controller.shortcut_controls)
+        self._config.controller.shortcut_controls = list(binding.controls)
+        try:
+            self._save_config(self._config)
+        except (OSError, VigilOverlayError) as exc:
+            self._config.controller.shortcut_controls = previous
+            return False, f"Could not save the controller shortcut: {exc}"
+        self._controller_shortcut_service.set_binding(binding)
+        if "gameinput:guide" in binding.controls:
+            self._guide_button_service.start()
+        elif not self._config.controller.guide_button_enabled:
+            self._guide_button_service.deactivate()
+        return True, f"Controller shortcut changed to {binding.display_label}."
 
     def _change_start_with_windows(self, enabled: bool) -> tuple[bool, str]:
         if self._read_only_config:
@@ -899,19 +992,26 @@ class VigilApplication:
     def _handle_guide_button_command(self, command: NavigationCommand) -> None:
         """Gate Guide toggles through the persisted user preference."""
 
+        if self._controller_shortcut_service.observe_guide_pulse():
+            return
         if not self._config.controller.guide_button_enabled:
             return
         self._handle_controller_command(command)
 
     def _set_guide_button_enabled(self, enabled: bool) -> None:
-        if enabled:
+        guide_required = (
+            enabled or "gameinput:guide" in self._config.controller.shortcut_controls
+        )
+        if guide_required:
             self._guide_button_service.set_controller_ownership_active(
                 self._input_policy.hold_gameinput_ownership
             )
             self._guide_button_service.start()
         else:
             self._guide_button_service.deactivate()
-        self._controller_input_ownership_service.set_background_guide_enabled(enabled)
+        self._controller_input_ownership_service.set_background_guide_enabled(
+            guide_required
+        )
 
     def _apply_game_library(self, library: object) -> None:
         if not isinstance(library, AggregatedGameLibrary):
@@ -938,6 +1038,24 @@ class VigilApplication:
             self._recent_games,
             closable_game_identities=closable,
         )
+
+    def _request_home_library_refresh(self, *, force: bool = False) -> bool:
+        """Coalesce provider refreshes while keeping the cached Home list visible."""
+
+        if not self._game_library_started:
+            return False
+        now = self._game_library_refresh_clock()
+        previous = self._last_game_library_refresh_at
+        if (
+            not force
+            and previous is not None
+            and now - previous < _HOME_REFRESH_COOLDOWN_SECONDS
+        ):
+            return False
+        self._last_game_library_refresh_at = now
+        self._game_library_service.start()
+        _LOGGER.debug("Queued asynchronous provider recency refresh for Home")
+        return True
 
     def _close_game(self, payload: object) -> None:
         if not isinstance(payload, GameRecord):
@@ -1010,6 +1128,7 @@ class VigilApplication:
     def _show_overlay(self) -> None:
         self._fps_service.set_overlay_visible(True)
         self._refresh_home_games()
+        self._request_home_library_refresh()
         target_found = self._prepare_fps_target()
         self.window.show_overlay()
         self._begin_foreground_input_lease()
@@ -1120,10 +1239,13 @@ class VigilApplication:
         self._input_containment_health_timer.stop()
         self._release_visible_input_control("application quit")
         self._game_library_service.stop()
+        self._game_library_started = False
         self._integration_status_service.stop()
+        self._update_check_service.stop()
         self._guide_button_service.stop()
         self._controller_input_ownership_service.stop()
         self._input_containment_service.stop()
+        self._raw_controller_service.stop()
         self._controller_service.stop()
         self._fps_service.stop()
         self._telemetry_service.stop()
@@ -1139,17 +1261,23 @@ class VigilApplication:
         if self._single_instance_guard is not None:
             self._instance_activation_timer.start()
         self._input_containment_health_timer.start()
-        self._game_library_service.start()
+        self._game_library_started = True
+        self._request_home_library_refresh(force=True)
         self._integration_status_service.request(self._current_game_library)
         self._telemetry_service.start()
         self._fps_service.start()
         self._fps_service.set_overlay_visible(True)
         self._controller_service.start()
-        if self._config.controller.guide_button_enabled:
+        self._raw_controller_service.start()
+        if (
+            self._config.controller.guide_button_enabled
+            or "gameinput:guide" in self._config.controller.shortcut_controls
+        ):
             self._guide_button_service.start()
         target_found = self._prepare_fps_target()
         self.window.show_overlay()
         self._begin_foreground_input_lease()
+        QTimer.singleShot(1_500, self._update_check_service.check)
         if not target_found:
             QTimer.singleShot(0, self._prepare_fps_target)
         return self.qt_app.exec()
@@ -1159,10 +1287,13 @@ class VigilApplication:
         self._input_containment_health_timer.stop()
         self._release_visible_input_control("Qt application shutdown")
         self._game_library_service.stop()
+        self._game_library_started = False
         self._integration_status_service.stop()
+        self._update_check_service.stop()
         self._guide_button_service.stop()
         self._controller_input_ownership_service.stop()
         self._input_containment_service.stop()
+        self._raw_controller_service.stop()
         self._controller_service.stop()
         self._fps_service.stop()
         self._telemetry_service.stop()
