@@ -4,16 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QPushButton, QWidget
 
 from vigil_overlay.services.power_controls import PowerAction, PowerCapabilities
-from vigil_overlay.ui.modal_guard import ModalActivationGuard, ModalInputSource
+from vigil_overlay.ui.dialog_surface import ControllerVigilDialog
+from vigil_overlay.ui.modal_guard import ModalInputSource
 
 PowerActionCallback = Callable[[PowerAction], tuple[bool, str]]
 
 
-class PowerMenuDialog(QDialog):
+class PowerMenuDialog(ControllerVigilDialog):
     """Select and confirm one supported power action."""
 
     def __init__(
@@ -22,61 +22,25 @@ class PowerMenuDialog(QDialog):
         execute_callback: PowerActionCallback,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__("Power", parent, width=344)
         self.setObjectName("powerMenuDialog")
-        self.setWindowTitle("Power")
-        self.setModal(True)
-        self.setMinimumWidth(390)
         self._execute_callback = execute_callback
         self._actions = capabilities.actions()
         self._buttons: list[QPushButton] = []
-        self._selected_index = 0
         self._pending_action: PowerAction | None = None
-        self._guard = ModalActivationGuard(self)
 
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(22, 20, 22, 20)
-        self._layout.setSpacing(10)
-        self._title = QLabel("Power", self)
-        self._title.setObjectName("hotkeyEditorTitle")
-        self._layout.addWidget(self._title)
-        self._message = QLabel("Choose a power option.", self)
-        self._message.setWordWrap(True)
-        self._layout.addWidget(self._message)
-        self._error = QLabel("", self)
-        self._error.setWordWrap(True)
+        self._layout = self.content_layout
+        self._title = self.add_title("Power")
+        self._message = self.add_message("Choose a power option.")
+        self._error = self.add_error()
         self._error.hide()
-        self._layout.addWidget(self._error)
         self._show_action_buttons()
 
-    def begin_controller_ownership(self, source: ModalInputSource) -> None:
-        self._guard.begin(source)
-        self._sync_focus()
-
-    def notify_controller_activation_released(self) -> None:
-        self._guard.note_controller_activation_released()
-
-    def handle_controller_command(self, command: object) -> bool:
-        value = getattr(command, "value", command)
-        if value in {"move_left", "move_up"}:
-            self._selected_index = (self._selected_index - 1) % len(self._buttons)
-            self._sync_focus()
-            return True
-        if value in {"move_right", "move_down"}:
-            self._selected_index = (self._selected_index + 1) % len(self._buttons)
-            self._sync_focus()
-            return True
-        if value == "back":
-            if self._pending_action is None:
-                self.reject()
-            else:
-                self._show_action_buttons()
-            return True
-        if value == "activate":
-            if self._guard.accepts_activation():
-                self._buttons[self._selected_index].click()
-            return True
-        return True
+    def controller_back(self) -> None:
+        if self._pending_action is None:
+            self.reject()
+        else:
+            self._show_action_buttons()
 
     def _show_action_buttons(self) -> None:
         self._clear_buttons()
@@ -85,38 +49,42 @@ class PowerMenuDialog(QDialog):
         self._message.setText("Choose a power option.")
         self._error.hide()
         for action in self._actions:
-            button = QPushButton(action.label, self)
+            button = QPushButton(action.label, self.surface)
+            button.setObjectName("powerMenuAction")
+            button.setProperty("powerAction", action.value)
+            self.style_button(button, kind="row")
             button.clicked.connect(
-                lambda checked=False, selected=action: self._request_confirmation(
-                    selected
-                )
+                lambda checked=False, selected=action: self._request_confirmation(selected)
             )
             self._layout.addWidget(button)
             self._buttons.append(button)
-        cancel = QPushButton("Cancel", self)
+        cancel = QPushButton("Cancel", self.surface)
+        cancel.setObjectName("powerMenuCancel")
+        self.style_button(cancel, kind="row")
         cancel.clicked.connect(self.reject)
         self._layout.addWidget(cancel)
         self._buttons.append(cancel)
-        self._selected_index = 0
-        self._sync_focus()
+        self.set_controller_buttons(self._buttons)
 
     def _request_confirmation(self, action: PowerAction) -> None:
         self._clear_buttons()
         self._pending_action = action
         self._title.setText(f"Confirm {action.label}")
-        self._message.setText(
-            f"Are you sure you want to {action.label.casefold()} this PC?"
-        )
-        confirm = QPushButton(action.label, self)
-        cancel = QPushButton("Cancel", self)
+        self._message.setText(f"Are you sure you want to {action.label.casefold()} this PC?")
+        confirm = QPushButton(action.label, self.surface)
+        confirm.setObjectName("powerMenuConfirm")
+        confirm.setProperty("powerAction", action.value)
+        self.style_button(confirm, kind="row")
+        cancel = QPushButton("Cancel", self.surface)
+        cancel.setObjectName("powerMenuCancel")
+        self.style_button(cancel, kind="row")
         confirm.clicked.connect(self._execute)
         cancel.clicked.connect(self._show_action_buttons)
         self._layout.addWidget(confirm)
         self._layout.addWidget(cancel)
         self._buttons = [confirm, cancel]
-        self._selected_index = 1
+        self.set_controller_buttons(self._buttons, selected_index=1)
         self._guard.begin(ModalInputSource.UNKNOWN)
-        self._sync_focus()
 
     def _execute(self) -> None:
         action = self._pending_action
@@ -134,11 +102,7 @@ class PowerMenuDialog(QDialog):
             self._layout.removeWidget(button)
             button.deleteLater()
         self._buttons.clear()
-
-    def _sync_focus(self) -> None:
-        if not self._buttons:
-            return
-        self._buttons[self._selected_index].setFocus(Qt.FocusReason.OtherFocusReason)
+        self.set_controller_buttons(())
 
 
 __all__ = ["PowerActionCallback", "PowerMenuDialog"]

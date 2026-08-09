@@ -68,11 +68,12 @@ QScrollArea#widgetPageScroller QScrollBar#widgetPageVerticalScrollBar::add-page:
 QScrollArea#widgetPageScroller QScrollBar#widgetPageVerticalScrollBar::sub-page:vertical {
     background-color: transparent;
 }
-QPushButton#compactWidgetButton {
+QPushButton#compactWidgetButton, QPushButton#compactPowerButton {
     border-radius: 9px;
     padding: 0;
 }
-QPushButton#compactWidgetButton[navigationFocus="true"] {
+QPushButton#compactWidgetButton[navigationFocus="true"],
+QPushButton#compactPowerButton[navigationFocus="true"] {
     border-width: 3px;
     border-style: solid;
 }
@@ -360,17 +361,24 @@ QLabel#toggleRowTitle {
     font-size: 14px;
     font-weight: 700;
 }
-QDialog#hotkeyEditorDialog, QDialog#hotkeyFailureDialog, QDialog#updateAvailableDialog {
-    border-width: 2px;
-    border-style: solid;
-    border-radius: 10px;
+QDialog[vigilDialog="true"] {
+    background-color: transparent;
 }
-QLabel#hotkeyEditorTitle {
+QFrame#vigilDialogSurface {
+    border-width: 1px;
+    border-style: solid;
+    border-radius: 12px;
+}
+QLabel#vigilDialogTitle {
     font-size: 18px;
     font-weight: 700;
 }
-QLabel#hotkeyEditorHelp, QLabel#hotkeyEditorError {
+QLabel#vigilDialogMessage, QLabel#vigilDialogDetail, QLabel#vigilDialogError {
     font-size: 12px;
+    font-weight: 500;
+}
+QLabel#vigilDialogDetail {
+    font-size: 13px;
     font-weight: 600;
 }
 QKeySequenceEdit#hotkeySequenceEdit {
@@ -382,15 +390,25 @@ QKeySequenceEdit#hotkeySequenceEdit {
     font-size: 15px;
     font-weight: 600;
 }
-QDialogButtonBox#hotkeyEditorButtons QPushButton {
+QDialogButtonBox#vigilDialogButtons QPushButton,
+QPushButton[vigilDialogButton="true"] {
     min-width: 92px;
-    min-height: 38px;
-    border-width: 1px;
-    border-style: solid;
-    border-radius: 7px;
+    min-height: 40px;
+    border: 1px solid transparent;
+    border-radius: 8px;
     padding: 0 12px;
     font-size: 13px;
     font-weight: 600;
+}
+QPushButton[vigilDialogButton="true"][dialogButtonKind="row"] {
+    min-width: 0;
+    min-height: 48px;
+    text-align: left;
+}
+QDialogButtonBox#vigilDialogButtons QPushButton:focus,
+QPushButton[vigilDialogButton="true"]:focus {
+    border-width: 3px;
+    border-style: solid;
 }
 
 QFrame#performanceMetricSelector, QFrame#performanceMetricDetail {
@@ -473,16 +491,18 @@ QPushButton#widgetOptionsAction {
 }
 """
 
-_DARK_STYLESHEET = _COMMON_STYLESHEET + """
+_DARK_STYLESHEET = (
+    _COMMON_STYLESHEET
+    + """
 QLabel#overlayBrandTitle {
     color: #f4f5f7;
 }
-QPushButton#compactWidgetButton {
+QPushButton#compactWidgetButton, QPushButton#compactPowerButton {
     color: #e7e8eb;
     background-color: rgba(42, 46, 52, 245);
     border: 1px solid #555b65;
 }
-QPushButton#compactWidgetButton:hover {
+QPushButton#compactWidgetButton:hover, QPushButton#compactPowerButton:hover {
     background-color: #424750;
 }
 QPushButton#compactWidgetButton[activeWidget="true"] {
@@ -490,7 +510,8 @@ QPushButton#compactWidgetButton[activeWidget="true"] {
     background-color: #ececef;
     border-color: #ffffff;
 }
-QPushButton#compactWidgetButton[navigationFocus="true"] {
+QPushButton#compactWidgetButton[navigationFocus="true"],
+QPushButton#compactPowerButton[navigationFocus="true"] {
     border-color: #ffffff;
 }
 QLabel[widgetStripOverflowIndicator="true"] {
@@ -699,18 +720,18 @@ QPushButton#settingsRowButton:disabled, QPushButton#integrationRowButton:disable
 QPushButton#settingsRowButton:disabled QLabel, QPushButton#integrationRowButton:disabled QLabel {
     color: #767d87;
 }
-QDialog#hotkeyEditorDialog, QDialog#hotkeyFailureDialog, QDialog#updateAvailableDialog {
+QFrame#vigilDialogSurface {
     color: #f4f5f7;
-    background-color: #252b35;
-    border-color: #697383;
+    background-color: rgba(41, 44, 50, 252);
+    border-color: #555b65;
 }
-QLabel#hotkeyEditorTitle {
+QLabel#vigilDialogTitle {
     color: #f4f5f7;
 }
-QLabel#hotkeyEditorHelp {
+QLabel#vigilDialogMessage, QLabel#vigilDialogDetail {
     color: #aeb4bd;
 }
-QLabel#hotkeyEditorError {
+QLabel#vigilDialogError {
     color: #ffd4d4;
 }
 QKeySequenceEdit#hotkeySequenceEdit {
@@ -721,15 +742,31 @@ QKeySequenceEdit#hotkeySequenceEdit {
 QKeySequenceEdit#hotkeySequenceEdit:focus {
     border-color: #ffffff;
 }
-QDialogButtonBox#hotkeyEditorButtons QPushButton {
-    color: #f4f5f7;
+QDialogButtonBox#vigilDialogButtons QPushButton,
+QPushButton[vigilDialogButton="true"] {
+    color: #eef0f3;
     background-color: #323946;
     border-color: #697383;
 }
-QDialogButtonBox#hotkeyEditorButtons QPushButton:hover,
-QDialogButtonBox#hotkeyEditorButtons QPushButton:focus {
-    background-color: #414b5b;
-    border-color: #ffffff;
+QPushButton[vigilDialogButton="true"][dialogButtonKind="row"] {
+    background-color: transparent;
+}
+QDialogButtonBox#vigilDialogButtons QPushButton:hover,
+QDialogButtonBox#vigilDialogButtons QPushButton:focus,
+QPushButton[vigilDialogButton="true"]:hover,
+QPushButton[vigilDialogButton="true"]:focus {
+    background-color: #454a52;
+    border-color: #f1f2f4;
+}
+QDialogButtonBox#vigilDialogButtons QPushButton:pressed,
+QPushButton[vigilDialogButton="true"]:pressed {
+    background-color: #343941;
+}
+QDialogButtonBox#vigilDialogButtons QPushButton:disabled,
+QPushButton[vigilDialogButton="true"]:disabled {
+    color: #767d87;
+    background-color: rgba(50, 57, 70, 110);
+    border-color: rgba(105, 115, 131, 130);
 }
 
 QLabel#performanceLargeValue {
@@ -775,17 +812,20 @@ QPushButton#widgetOptionsAction[navigationFocus="true"] {
     border-color: #ffffff;
 }
 """
+)
 
-_LIGHT_STYLESHEET = _COMMON_STYLESHEET + """
+_LIGHT_STYLESHEET = (
+    _COMMON_STYLESHEET
+    + """
 QLabel#overlayBrandTitle {
     color: #20242b;
 }
-QPushButton#compactWidgetButton {
+QPushButton#compactWidgetButton, QPushButton#compactPowerButton {
     color: #20242b;
     background-color: rgba(229, 232, 236, 248);
     border: 1px solid #aeb4bd;
 }
-QPushButton#compactWidgetButton:hover {
+QPushButton#compactWidgetButton:hover, QPushButton#compactPowerButton:hover {
     background-color: #f4f5f7;
 }
 QPushButton#compactWidgetButton[activeWidget="true"] {
@@ -793,8 +833,12 @@ QPushButton#compactWidgetButton[activeWidget="true"] {
     background-color: #343a43;
     border-color: #1d2127;
 }
-QPushButton#compactWidgetButton[navigationFocus="true"] {
+QPushButton#compactWidgetButton[navigationFocus="true"],
+QPushButton#compactPowerButton[navigationFocus="true"] {
     border-color: #ffffff;
+}
+QPushButton#compactPowerButton[navigationFocus="true"] {
+    border-color: #343a43;
 }
 QLabel[widgetStripOverflowIndicator="true"] {
     color: #4f5864;
@@ -998,18 +1042,18 @@ QPushButton#settingsRowButton:disabled, QPushButton#integrationRowButton:disable
 QPushButton#settingsRowButton:disabled QLabel, QPushButton#integrationRowButton:disabled QLabel {
     color: #838a94;
 }
-QDialog#hotkeyEditorDialog, QDialog#hotkeyFailureDialog, QDialog#updateAvailableDialog {
+QFrame#vigilDialogSurface {
     color: #171a1f;
-    background-color: #f4f6f9;
-    border-color: #aab0b8;
+    background-color: rgba(224, 227, 232, 252);
+    border-color: #aeb4bd;
 }
-QLabel#hotkeyEditorTitle {
+QLabel#vigilDialogTitle {
     color: #171a1f;
 }
-QLabel#hotkeyEditorHelp {
+QLabel#vigilDialogMessage, QLabel#vigilDialogDetail {
     color: #5a626d;
 }
-QLabel#hotkeyEditorError {
+QLabel#vigilDialogError {
     color: #8a1f1f;
 }
 QKeySequenceEdit#hotkeySequenceEdit {
@@ -1020,15 +1064,31 @@ QKeySequenceEdit#hotkeySequenceEdit {
 QKeySequenceEdit#hotkeySequenceEdit:focus {
     border-color: #171a1f;
 }
-QDialogButtonBox#hotkeyEditorButtons QPushButton {
+QDialogButtonBox#vigilDialogButtons QPushButton,
+QPushButton[vigilDialogButton="true"] {
     color: #20242b;
     background-color: #ffffff;
     border-color: #aab0b8;
 }
-QDialogButtonBox#hotkeyEditorButtons QPushButton:hover,
-QDialogButtonBox#hotkeyEditorButtons QPushButton:focus {
-    background-color: #e5e9ee;
-    border-color: #171a1f;
+QPushButton[vigilDialogButton="true"][dialogButtonKind="row"] {
+    background-color: transparent;
+}
+QDialogButtonBox#vigilDialogButtons QPushButton:hover,
+QDialogButtonBox#vigilDialogButtons QPushButton:focus,
+QPushButton[vigilDialogButton="true"]:hover,
+QPushButton[vigilDialogButton="true"]:focus {
+    background-color: #cbd0d7;
+    border-color: #343a43;
+}
+QDialogButtonBox#vigilDialogButtons QPushButton:pressed,
+QPushButton[vigilDialogButton="true"]:pressed {
+    background-color: #b9c0c9;
+}
+QDialogButtonBox#vigilDialogButtons QPushButton:disabled,
+QPushButton[vigilDialogButton="true"]:disabled {
+    color: #838a94;
+    background-color: rgba(224, 227, 232, 150);
+    border-color: rgba(170, 176, 184, 150);
 }
 
 QLabel#performanceLargeValue {
@@ -1074,6 +1134,7 @@ QPushButton#widgetOptionsAction[navigationFocus="true"] {
     border-color: #171a1f;
 }
 """
+)
 
 
 def apply_host_theme(application: QApplication, requested_theme: str) -> str:
@@ -1085,7 +1146,5 @@ def apply_host_theme(application: QApplication, requested_theme: str) -> str:
         theme = "dark" if window_color.lightness() < 128 else "light"
 
     application.setProperty("vigilResolvedTheme", theme)
-    application.setStyleSheet(
-        _DARK_STYLESHEET if theme == "dark" else _LIGHT_STYLESHEET
-    )
+    application.setStyleSheet(_DARK_STYLESHEET if theme == "dark" else _LIGHT_STYLESHEET)
     return theme

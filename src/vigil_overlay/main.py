@@ -26,9 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the supported command-line interface for source and packaged runs."""
 
     parser = argparse.ArgumentParser(prog="VigilOverlay")
-    parser.add_argument(
-        "--version", action="version", version=f"Vigil Overlay {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"Vigil Overlay {__version__}")
     parser.add_argument(
         "--diagnose",
         action="store_true",
@@ -147,9 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             single_instance_guard=instance_guard,
         )
     except (VigilOverlayError, OSError, ValueError) as exc:
-        logging.getLogger("vigil_overlay").exception(
-            "Application startup failed: %s", exc
-        )
+        logging.getLogger("vigil_overlay").exception("Application startup failed: %s", exc)
         if _console_stream_available():
             print(f"Vigil Overlay startup failed: {exc}", file=sys.stderr)
         return 1
@@ -168,14 +164,28 @@ def _console_stream_available() -> bool:
         return False
 
 
-def _print_diagnostics(
-    paths: ApplicationPaths, config_path: Path, schema_version: int
-) -> None:
+def _print_diagnostics(paths: ApplicationPaths, config_path: Path, schema_version: int) -> None:
     payload = {
         "product": "Vigil Overlay",
         "version": __version__,
         "config_schema_version": schema_version,
         "config_path": str(config_path),
         "paths": {name: str(path) for name, path in paths.as_dict().items()},
+        "audio": _audio_diagnostics(),
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _audio_diagnostics() -> dict[str, object]:
+    """Return a non-sensitive Core Audio summary from the packaged runtime path."""
+
+    from vigil_overlay.services.audio_runtime import diagnose_audio_backend
+
+    snapshot = diagnose_audio_backend()
+    return {
+        "available": snapshot.available,
+        "detail": snapshot.detail,
+        "output_device_count": len(snapshot.output_devices),
+        "input_device_count": len(snapshot.input_devices),
+        "session_count": len(snapshot.sessions),
+    }

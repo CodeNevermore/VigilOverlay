@@ -17,6 +17,8 @@ separate service boundaries.
   EA app, Ubisoft Connect, GOG, Manual Games, and the optional Playnite bridge.
 - Editable global hotkey, Guide-button support, Start with Windows, background mode,
   tray controls, Safe Mode, and automatic invalid-settings recovery.
+- Consistent dark/light Vigil dialogs for power, updates, shortcut editing, FPS
+  errors, and confirmations, with controller-safe focus and activation handling.
 - Verified foreground ownership and fail-open mouse/keyboard containment while the
   overlay is visible.
 
@@ -33,6 +35,11 @@ overlay is open. Input containment is released before Vigil hides or exits.
 End users should install Vigil with the packaged Windows installer. The installer
 includes the required GameInput runtime and the compiled application does not require
 a separate Python installation.
+
+Production Windows builds request administrator approval when Vigil starts so
+PresentMon can capture FPS telemetry reliably. Start with Windows uses an elevated
+per-user scheduled task. Release artifacts are intentionally unsigned, so Windows
+may display an Unknown Publisher or SmartScreen warning.
 
 ## Running from source
 
@@ -86,7 +93,9 @@ download or replace either dependency while the application is running.
 
 Shortly after startup, Vigil makes one HTTPS request to GitHub's public latest-release
 endpoint. This check only displays an update notice; Vigil does not download or install
-updates automatically.
+updates automatically. Selecting Update opens the GitHub releases page and then closes
+Vigil after the browser handoff succeeds. Choosing Later, or a failed browser launch,
+keeps Vigil running.
 
 Configuration, logs, integration data, and caches are stored under the current user's
 Vigil Overlay application-data directories. Run `VigilOverlay --diagnose` to print the
@@ -97,6 +106,17 @@ resolved non-sensitive paths.
 The optional Playnite bridge is a read-only C# GenericPlugin that publishes a bounded
 snapshot for Vigil. Release builds compile and validate the bridge automatically.
 Installing or removing the bridge does not modify Playnite's game database.
+
+## Widgets and extensions
+
+The current Widgets surface manages Vigil's built-in widgets. Third-party
+`.widgetpack` installation and execution are not available yet. They remain blocked
+until Vigil proves that widget processes cannot inherit its administrator token.
+
+The planned extension model keeps popup ownership in Vigil. A widget may request a
+bounded declarative dialog, but Vigil will choose its geometry and own its theme,
+focus, accessibility, controller handling, actions, dismissal, and lifecycle. Widget
+code will not create native dialogs or supply executable modal behavior.
 
 ## License
 

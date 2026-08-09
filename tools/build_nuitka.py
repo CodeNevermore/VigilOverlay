@@ -27,12 +27,12 @@ OUTPUT_ROOT = PROJECT_ROOT / "build" / "nuitka"
 APPLICATION_ICON_RESOURCE = (
     PROJECT_ROOT / "src" / "vigil_overlay" / "resources" / "icons" / "vigil_overlay.ico"
 )
-APPLICATION_ICON_SHA256 = (
-    "78c2473d40dad9c4629f1208022a1e3b45ae85b3e6b10e6da98b9b75df4bcaf6"
-)
+APPLICATION_ICON_SHA256 = "78c2473d40dad9c4629f1208022a1e3b45ae85b3e6b10e6da98b9b75df4bcaf6"
 PRESENTMON_FILENAME = "PresentMon-2.5.1-x64.exe"
 PRESENTMON_SHA256 = "9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191"
-PRESENTMON_RELEASE_URL = f"https://github.com/GameTechDev/PresentMon/releases/download/v2.5.1/{PRESENTMON_FILENAME}"
+PRESENTMON_RELEASE_URL = (
+    f"https://github.com/GameTechDev/PresentMon/releases/download/v2.5.1/{PRESENTMON_FILENAME}"
+)
 PRESENTMON_MAX_BYTES = 2 * 1024 * 1024
 PRESENTMON_RESOURCE_EXE = (
     PROJECT_ROOT
@@ -71,9 +71,7 @@ REQUIRED_THIRD_PARTY_LICENSE_FILES = (
 )
 PLAYNITE_BRIDGE_ROOT = PROJECT_ROOT / "integrations" / "playnite" / "VigilOverlayBridge"
 PLAYNITE_BRIDGE_PROJECT = PLAYNITE_BRIDGE_ROOT / "VigilOverlayBridge.csproj"
-PLAYNITE_BRIDGE_DLL = (
-    PLAYNITE_BRIDGE_ROOT / "bin" / "Release" / "net462" / "VigilOverlayBridge.dll"
-)
+PLAYNITE_BRIDGE_DLL = PLAYNITE_BRIDGE_ROOT / "bin" / "Release" / "net462" / "VigilOverlayBridge.dll"
 PLAYNITE_RESOURCE_ROOT = (
     PROJECT_ROOT / "src" / "vigil_overlay" / "resources" / "integrations" / "playnite"
 )
@@ -127,6 +125,7 @@ def build_command(profile: str) -> list[str]:
         f"--file-version={__version__}",
         f"--product-version={__version__}",
         "--file-description=Vigil Overlay",
+        "--windows-uac-admin",
         f"--windows-icon-from-ico={APPLICATION_ICON_RESOURCE}",
         f"--output-dir={OUTPUT_ROOT}",
         f"--report={report_path}",
@@ -152,7 +151,7 @@ def build_command(profile: str) -> list[str]:
             f"--include-data-files={source}={destination}"
             for source, destination in LEGAL_DISTRIBUTION_FILES
         ),
-        (f"--include-data-dir={THIRD_PARTY_LICENSE_ROOT}=" "licenses/third_party"),
+        (f"--include-data-dir={THIRD_PARTY_LICENSE_ROOT}=licenses/third_party"),
         "--enable-plugin=pyside6",
     ]
 
@@ -217,9 +216,7 @@ def validate_winrt_dependency_contract(
         project = tomllib.loads(project_file.read_text(encoding="utf-8"))
         dependencies = project["project"]["dependencies"]
     except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError) as exc:
-        raise FileNotFoundError(
-            f"Could not read the project dependency contract: {exc}"
-        ) from exc
+        raise FileNotFoundError(f"Could not read the project dependency contract: {exc}") from exc
     if not isinstance(dependencies, list) or not all(
         isinstance(item, str) for item in dependencies
     ):
@@ -233,15 +230,10 @@ def validate_winrt_dependency_contract(
         if not normalized.startswith("winrt-windows-"):
             continue
         if pin != "==":
-            raise FileNotFoundError(
-                f"WinRT dependency must use an exact version pin: {name}"
-            )
+            raise FileNotFoundError(f"WinRT dependency must use an exact version pin: {name}")
         declared[normalized] = (version.strip(), marker.strip() if separator else "")
 
-    expected = {
-        _normalize_distribution_name(item.distribution_name): item
-        for item in projections
-    }
+    expected = {_normalize_distribution_name(item.distribution_name): item for item in projections}
     if set(declared) != set(expected):
         missing = sorted(set(expected) - set(declared))
         unexpected = sorted(set(declared) - set(expected))
@@ -256,9 +248,7 @@ def validate_winrt_dependency_contract(
                 f"{projection.distribution_name} must be pinned to {projection.version}"
             )
         if marker not in {"sys_platform == 'win32'", 'sys_platform == "win32"'}:
-            raise FileNotFoundError(
-                f"{projection.distribution_name} must remain Windows-only"
-            )
+            raise FileNotFoundError(f"{projection.distribution_name} must remain Windows-only")
 
 
 def _normalize_distribution_name(name: str) -> str:
@@ -279,9 +269,7 @@ def validate_application_icon() -> None:
         )
     payload = APPLICATION_ICON_RESOURCE.read_bytes()
     if len(payload) < 6 or payload[:4] != b"\x00\x00\x01\x00":
-        raise FileNotFoundError(
-            "Vigil application icon is not a valid Windows ICO resource"
-        )
+        raise FileNotFoundError("Vigil application icon is not a valid Windows ICO resource")
     image_count = int.from_bytes(payload[4:6], "little")
     if image_count < 1 or len(payload) < 6 + image_count * 16:
         raise FileNotFoundError("Vigil application icon directory is truncated")
@@ -430,8 +418,7 @@ def validate_packaged_presentmon(dist_root: Path) -> None:
             )
         if sha256_file(packaged_notice) != sha256_file(source):
             raise FileNotFoundError(
-                "Completed Nuitka distribution changed a PresentMon legal file: "
-                f"{packaged_notice}"
+                f"Completed Nuitka distribution changed a PresentMon legal file: {packaged_notice}"
             )
 
 
@@ -440,16 +427,12 @@ def validate_legal_materials() -> None:
 
     required = [
         *(source for source, _destination in LEGAL_DISTRIBUTION_FILES),
-        *(
-            THIRD_PARTY_LICENSE_ROOT / path
-            for path in REQUIRED_THIRD_PARTY_LICENSE_FILES
-        ),
+        *(THIRD_PARTY_LICENSE_ROOT / path for path in REQUIRED_THIRD_PARTY_LICENSE_FILES),
     ]
     missing = [path for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError(
-            "Release licensing material is incomplete: "
-            + ", ".join(str(path) for path in missing)
+            "Release licensing material is incomplete: " + ", ".join(str(path) for path in missing)
         )
 
     placeholders = ("[VERIFY]", "[VERSION]", "[LIST", "[LICENSE CONTACT]")
@@ -481,13 +464,11 @@ def validate_packaged_legal_materials(dist_root: Path) -> None:
         packaged = packaged_licenses / relative
         if not packaged.is_file():
             raise FileNotFoundError(
-                "Completed Nuitka distribution is missing a third-party license: "
-                f"{packaged}"
+                f"Completed Nuitka distribution is missing a third-party license: {packaged}"
             )
         if sha256_file(packaged) != sha256_file(source):
             raise FileNotFoundError(
-                "Completed Nuitka distribution changed a third-party license: "
-                f"{packaged}"
+                f"Completed Nuitka distribution changed a third-party license: {packaged}"
             )
 
 

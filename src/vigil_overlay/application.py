@@ -126,6 +126,7 @@ class VigilApplication:
         safe_mode: bool = False,
         read_only_config: bool = False,
         hotkey_backend: HotkeyBackend | None = None,
+        hotkey_probe_backend: HotkeyBackend | None = None,
         tray_available_override: bool | None = None,
         telemetry_service: TelemetryPollingService | None = None,
         fps_service: PresentMonFpsService | UnavailableFpsService | None = None,
@@ -133,9 +134,7 @@ class VigilApplication:
         raw_controller_service: RawControllerInputService | None = None,
         power_control_service: PowerControlService | None = None,
         guide_button_service: GuideButtonInputService | None = None,
-        controller_input_ownership_service: (
-            ControllerInputOwnershipService | None
-        ) = None,
+        controller_input_ownership_service: (ControllerInputOwnershipService | None) = None,
         input_containment_service: InputContainmentService | None = None,
         foreground_ownership_service: ForegroundOwnershipService | None = None,
         foreground_clock: Callable[[], float] = time.monotonic,
@@ -182,36 +181,29 @@ class VigilApplication:
         self._read_only_config = read_only_config
         self._startup_service = startup_service or create_platform_startup_service()
         self._safe_mode = safe_mode
-        self._safe_mode_restart_launcher = (
-            safe_mode_restart_launcher or launch_recovery_process
-        )
+        self._safe_mode_restart_launcher = safe_mode_restart_launcher or launch_recovery_process
         self._single_instance_guard = single_instance_guard
         self._instance_activation_timer = QTimer()
         self._instance_activation_timer.setInterval(250)
-        self._instance_activation_timer.timeout.connect(
-            self._consume_instance_activation
-        )
+        self._instance_activation_timer.timeout.connect(self._consume_instance_activation)
         self._tray: QSystemTrayIcon | None = None
         self._tray_menu: QMenu | None = None
         self._tray_toggle_action: QAction | None = None
         self._tray_reset_action: QAction | None = None
         self._tray_quit_action: QAction | None = None
         self._hotkey_service = GlobalHotkeyService(hotkey_backend)
+        self._hotkey_probe_service = GlobalHotkeyService(hotkey_probe_backend)
         self._hotkey_registration: HotkeyRegistration | None = None
+        self._hotkey_capture_active = False
+        self._startup_hotkey_failure: HotkeyRegistration | None = None
         self._quitting = False
-        self._telemetry_service = (
-            telemetry_service or create_platform_telemetry_service()
-        )
+        self._telemetry_service = telemetry_service or create_platform_telemetry_service()
         self._fps_service = fps_service or create_platform_fps_service()
         self._controller_shortcut_service = ControllerShortcutService(
             ControllerShortcutBinding(tuple(config.controller.shortcut_controls))
         )
-        self._controller_service = (
-            controller_service or create_platform_controller_service()
-        )
-        attach_shortcuts = getattr(
-            self._controller_service, "set_shortcut_service", None
-        )
+        self._controller_service = controller_service or create_platform_controller_service()
+        attach_shortcuts = getattr(self._controller_service, "set_shortcut_service", None)
         if callable(attach_shortcuts):
             attach_shortcuts(self._controller_shortcut_service)
         self._raw_controller_service = (
@@ -221,9 +213,7 @@ class VigilApplication:
         self._power_control_service = (
             power_control_service or create_platform_power_control_service()
         )
-        self._guide_button_service = (
-            guide_button_service or create_platform_guide_button_service()
-        )
+        self._guide_button_service = guide_button_service or create_platform_guide_button_service()
         self._controller_input_ownership_service = (
             controller_input_ownership_service
             or create_platform_controller_input_ownership_service()
@@ -237,8 +227,7 @@ class VigilApplication:
             self._input_containment_service.maintain
         )
         self._foreground_ownership_service = (
-            foreground_ownership_service
-            or create_platform_foreground_ownership_service()
+            foreground_ownership_service or create_platform_foreground_ownership_service()
         )
         self._foreground_clock = foreground_clock
         self._foreground_claim_timeout_seconds = foreground_claim_timeout_seconds
@@ -247,12 +236,8 @@ class VigilApplication:
         self._foreground_loss_confirming = False
         self._foreground_verified = False
         self._foreground_ownership_timer = QTimer()
-        self._foreground_ownership_timer.setInterval(
-            _FOREGROUND_LEASE_POLL_MILLISECONDS
-        )
-        self._foreground_ownership_timer.timeout.connect(
-            self._reconcile_foreground_ownership
-        )
+        self._foreground_ownership_timer.setInterval(_FOREGROUND_LEASE_POLL_MILLISECONDS)
+        self._foreground_ownership_timer.timeout.connect(self._reconcile_foreground_ownership)
         self._controller_connected_state = False
         self._controller_commands_ready = True
         self._input_policy = resolve_overlay_input_policy(
@@ -269,9 +254,7 @@ class VigilApplication:
         self._game_launch_service = game_launch_service or GameLaunchService(
             self._game_provider_registry
         )
-        self._game_close_service = (
-            game_close_service or create_platform_game_close_service()
-        )
+        self._game_close_service = game_close_service or create_platform_game_close_service()
         self._game_library_refresh_clock = game_library_refresh_clock
         self._last_game_library_refresh_at: float | None = None
         self._game_library_started = False
@@ -281,21 +264,16 @@ class VigilApplication:
             self._application_paths,
             enabled=not safe_mode,
         )
-        self._integration_status_service = (
-            integration_status_service
-            or IntegrationStatusService(self._integration_manager)
+        self._integration_status_service = integration_status_service or IntegrationStatusService(
+            self._integration_manager
         )
-        self._update_check_service = update_check_service or UpdateCheckService(
-            parent=self.qt_app
-        )
+        self._update_check_service = update_check_service or UpdateCheckService(parent=self.qt_app)
         if not self._read_only_config:
             try:
                 self._startup_service.reconcile(self._config.startup.start_with_windows)
             except OSError:
                 _LOGGER.exception("Could not reconcile Start with Windows registration")
-        startup_available = (
-            self._startup_service.supported and not self._read_only_config
-        )
+        startup_available = self._startup_service.supported and not self._read_only_config
 
         tray_available = (
             QSystemTrayIcon.isSystemTrayAvailable()
@@ -315,10 +293,9 @@ class VigilApplication:
             controller_battery_status=self._controller_service.battery_snapshot,
             hotkey_change_callback=self._change_global_hotkey,
             hotkey_capture_callback=self._set_hotkey_capture_active,
+            hotkey_probe_callback=self._probe_global_hotkey,
             controller_shortcut_change_callback=self._change_controller_shortcut,
-            controller_shortcut_capture_callback=(
-                self._set_controller_shortcut_capture_active
-            ),
+            controller_shortcut_capture_callback=(self._set_controller_shortcut_capture_active),
             power_capabilities_callback=self._power_control_service.capabilities,
             power_action_callback=self._power_control_service.execute,
             startup_change_callback=self._change_start_with_windows,
@@ -331,9 +308,7 @@ class VigilApplication:
             application_icon=self._application_icon,
         )
         self.window.setWindowIcon(self._application_icon)
-        self.window.set_integration_statuses(
-            self._integration_manager.initial_statuses()
-        )
+        self.window.set_integration_statuses(self._integration_manager.initial_statuses())
 
         self._hotkey_service.activated.connect(self.toggle_overlay)
         self._controller_shortcut_service.activated.connect(self.toggle_overlay)
@@ -341,9 +316,7 @@ class VigilApplication:
             self.window.deliver_controller_shortcut
         )
         hotkey_active = self._setup_hotkey()
-        background_available = self._sync_background_availability(
-            hotkey_active=hotkey_active
-        )
+        background_available = self._sync_background_availability(hotkey_active=hotkey_active)
 
         self._setup_tray(tray_available, background_available)
         self.window.hidden_to_background.connect(self._sync_tray_action)
@@ -353,10 +326,11 @@ class VigilApplication:
         self.window.foreground_reconciliation_requested.connect(
             self._reconcile_foreground_ownership
         )
-        self._telemetry_service.snapshot_ready.connect(
-            self.window.set_telemetry_snapshot
-        )
+        self._telemetry_service.snapshot_ready.connect(self.window.set_telemetry_snapshot)
         self._fps_service.metric_ready.connect(self._telemetry_service.apply_fps_update)
+        fps_failure_signal = getattr(self._fps_service, "failure_ready", None)
+        if fps_failure_signal is not None:
+            fps_failure_signal.connect(self.window.show_fps_runtime_failure)
         self._controller_service.command_ready.connect(self._handle_controller_command)
         self._controller_service.connection_changed.connect(
             self._handle_controller_connection_changed
@@ -367,11 +341,10 @@ class VigilApplication:
         self._controller_service.direction_released.connect(
             self.window.notify_controller_direction_released
         )
-        self._controller_service.commands_rearmed.connect(
-            self._handle_controller_commands_rearmed
-        )
-        self._guide_button_service.command_ready.connect(
-            self._handle_guide_button_command
+        self._controller_service.commands_rearmed.connect(self._handle_controller_commands_rearmed)
+        self._guide_button_service.command_ready.connect(self._handle_guide_button_command)
+        self._guide_button_service.availability_changed.connect(
+            self._handle_guide_availability_changed
         )
         self.window.guide_button_enabled_changed.connect(self._set_guide_button_enabled)
         self.window.mouse_navigation_preference_changed.connect(
@@ -379,16 +352,13 @@ class VigilApplication:
         )
         self.window.game_launch_requested.connect(self._launch_game)
         self.window.game_close_requested.connect(self._close_game)
-        self.window.integration_action_requested.connect(
-            self._handle_integration_action
-        )
+        self.window.integration_action_requested.connect(self._handle_integration_action)
         self._game_library_service.library_ready.connect(self._apply_game_library)
         self._integration_status_service.statuses_ready.connect(
             self.window.set_integration_statuses
         )
-        self._update_check_service.update_available.connect(
-            self.window.show_available_update
-        )
+        self._update_check_service.update_available.connect(self.window.show_available_update)
+        self.window.update_handoff_requested.connect(self.quit)
         self.qt_app.aboutToQuit.connect(self._before_quit)
         self.window.apply_input_policy(self._input_policy)
 
@@ -424,15 +394,14 @@ class VigilApplication:
                 combination=self._config.hotkey.combination,
                 detail=detail,
             )
+            self._startup_hotkey_failure = self._hotkey_registration
             self.window.set_hotkey_status(detail, active=False)
             _LOGGER.info(detail)
             return False
 
         try:
             combination = parse_hotkey_combination(self._config.hotkey.combination)
-        except (
-            ValueError
-        ) as exc:  # Defensive boundary for programmatic AppConfig construction.
+        except ValueError as exc:  # Defensive boundary for programmatic AppConfig construction.
             detail = f"Invalid global hotkey: {exc}"
             self._hotkey_registration = HotkeyRegistration(
                 active=False,
@@ -447,9 +416,11 @@ class VigilApplication:
         self._hotkey_registration = registration
         if registration.active:
             status = f"Hotkey: {registration.combination}"
+            self._startup_hotkey_failure = None
             _LOGGER.info("%s registered", registration.combination)
         else:
             status = f"Hotkey unavailable: {registration.detail}"
+            self._startup_hotkey_failure = registration
             _LOGGER.warning(
                 "Global hotkey %s unavailable: %s",
                 registration.combination,
@@ -460,10 +431,51 @@ class VigilApplication:
 
     def _set_hotkey_capture_active(self, active: bool) -> None:
         if active:
-            self._hotkey_service.suspend_activations()
+            if self._hotkey_capture_active:
+                return
+            self._hotkey_capture_active = True
+            self._hotkey_service.stop()
+            self._hotkey_registration = HotkeyRegistration(
+                active=False,
+                combination=self._config.hotkey.combination,
+                detail="Hotkey temporarily released while editing",
+            )
+            self._sync_background_availability(hotkey_active=False)
             return
-        self._hotkey_service.resume_activations()
+        if not self._hotkey_capture_active:
+            return
+        self._hotkey_capture_active = False
+        current = self._hotkey_service.registration
+        if current is not None and current.active:
+            self._hotkey_registration = current
+            self._sync_background_availability(hotkey_active=True)
+        elif self._config.hotkey.enabled:
+            self._restore_hotkey_registration(self._config.hotkey.combination)
+        else:
+            self._hotkey_registration = HotkeyRegistration(
+                active=False,
+                combination=self._config.hotkey.combination,
+                detail="Global hotkey disabled in settings",
+            )
+            self._sync_background_availability(hotkey_active=False)
         self._controller_service.require_neutral_before_commands()
+
+    def _probe_global_hotkey(self, candidate: str) -> tuple[bool, str]:
+        """Temporarily register a candidate without changing saved application state."""
+
+        if self._read_only_config:
+            return False, "Safe mode is read-only; the global hotkey cannot be changed."
+        try:
+            combination = parse_hotkey_combination(candidate)
+        except ValueError as exc:
+            return False, f"Invalid global hotkey: {exc}"
+        registration = self._hotkey_probe_service.start(combination)
+        try:
+            if registration.active:
+                return True, f"{registration.combination} is available."
+            return False, registration.detail
+        finally:
+            self._hotkey_probe_service.stop()
 
     def _set_controller_shortcut_capture_active(self, active: bool) -> None:
         if active:
@@ -478,9 +490,7 @@ class VigilApplication:
         ):
             self._guide_button_service.deactivate()
 
-    def _change_controller_shortcut(
-        self, binding: ControllerShortcutBinding
-    ) -> tuple[bool, str]:
+    def _change_controller_shortcut(self, binding: ControllerShortcutBinding) -> tuple[bool, str]:
         if self._read_only_config:
             return (
                 False,
@@ -522,9 +532,7 @@ class VigilApplication:
         try:
             state = self._startup_service.set_enabled(enabled)
         except OSError as exc:
-            rollback_detail = self._restore_startup_command_after_failure(
-                previous_command
-            )
+            rollback_detail = self._restore_startup_command_after_failure(previous_command)
             _LOGGER.exception("Could not update Start with Windows registration")
             return (
                 False,
@@ -532,9 +540,7 @@ class VigilApplication:
             )
 
         if not state.supported or state.enabled != enabled:
-            rollback_detail = self._restore_startup_command_after_failure(
-                previous_command
-            )
+            rollback_detail = self._restore_startup_command_after_failure(previous_command)
             return (
                 False,
                 f"Could not update Start with Windows: {state.detail}.{rollback_detail}",
@@ -545,9 +551,7 @@ class VigilApplication:
             self._save_config(self._config)
         except (OSError, VigilOverlayError) as exc:
             self._config.startup.start_with_windows = previous_enabled
-            rollback_detail = self._restore_startup_command_after_failure(
-                previous_command
-            )
+            rollback_detail = self._restore_startup_command_after_failure(previous_command)
             _LOGGER.exception("Could not persist Start with Windows setting")
             return (
                 False,
@@ -562,9 +566,7 @@ class VigilApplication:
         try:
             self._startup_service.restore_command(command)
         except OSError as exc:
-            _LOGGER.exception(
-                "Could not restore previous Start with Windows registration"
-            )
+            _LOGGER.exception("Could not restore previous Start with Windows registration")
             return f" Registry rollback also failed: {exc}."
         return " Previous startup registration was restored."
 
@@ -635,6 +637,7 @@ class VigilApplication:
         return background_recovery_available(
             tray_available=self._tray_available,
             hotkey_active=hotkey_active,
+            guide_active=self._guide_button_service.active,
         )
 
     def _sync_background_availability(self, *, hotkey_active: bool) -> bool:
@@ -642,6 +645,7 @@ class VigilApplication:
             run_in_background=self._config.background.run_in_background,
             tray_available=self._tray_available,
             hotkey_active=hotkey_active,
+            guide_active=self._guide_button_service.active,
         )
         self.window.set_background_available(available)
         self.qt_app.setQuitOnLastWindowClosed(not available)
@@ -654,13 +658,11 @@ class VigilApplication:
         hotkey_active = bool(
             self._hotkey_registration is not None and self._hotkey_registration.active
         )
-        if enabled and not self._background_recovery_available(
-            hotkey_active=hotkey_active
-        ):
+        if enabled and not self._background_recovery_available(hotkey_active=hotkey_active):
             return (
                 False,
-                "Run in background requires the system tray or an active global hotkey "
-                "so Vigil can be restored.",
+                "Run in background requires the system tray, an active global hotkey, "
+                "or an active controller Home/Guide listener so Vigil can be restored.",
             )
 
         previous = self._config.background.run_in_background
@@ -688,19 +690,13 @@ class VigilApplication:
 
     def _setup_tray(self, available: bool, background_available: bool) -> None:
         if self._tray is not None:
-            _LOGGER.debug(
-                "System tray already initialized; reusing existing tray objects"
-            )
+            _LOGGER.debug("System tray already initialized; reusing existing tray objects")
             return
         if not available:
             if background_available:
-                _LOGGER.info(
-                    "System tray unavailable; another background restore path is active"
-                )
+                _LOGGER.info("System tray unavailable; another background restore path is active")
             else:
-                _LOGGER.warning(
-                    "System tray is unavailable; hide actions will exit the app"
-                )
+                _LOGGER.warning("System tray is unavailable; hide actions will exit the app")
             return
 
         tray = QSystemTrayIcon(self._application_icon, self.qt_app)
@@ -768,9 +764,7 @@ class VigilApplication:
         *,
         overlay_visible: bool | None = None,
     ) -> OverlayInputPolicy:
-        visible = (
-            self.window.isVisible() if overlay_visible is None else overlay_visible
-        )
+        visible = self.window.isVisible() if overlay_visible is None else overlay_visible
         if (
             visible
             and self._foreground_ownership_service.required
@@ -805,9 +799,7 @@ class VigilApplication:
 
         self._input_policy = policy
         self._apply_runtime_input_policy(policy)
-        _LOGGER.debug(
-            "Overlay input mode changed: %s -> %s", previous.mode, policy.mode
-        )
+        _LOGGER.debug("Overlay input mode changed: %s -> %s", previous.mode, policy.mode)
         return policy
 
     def _apply_runtime_input_policy(self, policy: OverlayInputPolicy) -> None:
@@ -909,9 +901,7 @@ class VigilApplication:
                 service.detail,
             )
             self._release_visible_input_control(
-                "foreground ownership lost"
-                if confirmed_loss
-                else "foreground claim timed out"
+                "foreground ownership lost" if confirmed_loss else "foreground claim timed out"
             )
             self.window.request_hide()
 
@@ -998,10 +988,21 @@ class VigilApplication:
             return
         self._handle_controller_command(command)
 
-    def _set_guide_button_enabled(self, enabled: bool) -> None:
-        guide_required = (
-            enabled or "gameinput:guide" in self._config.controller.shortcut_controls
+    def _handle_guide_availability_changed(self, active: bool, detail: str) -> None:
+        """Recompute hidden-instance recovery whenever Guide capture changes."""
+
+        hotkey_active = bool(
+            self._hotkey_registration is not None and self._hotkey_registration.active
         )
+        self._sync_background_availability(hotkey_active=hotkey_active)
+        _LOGGER.info(
+            "Guide background recovery %s: %s",
+            "active" if active else "inactive",
+            detail,
+        )
+
+    def _set_guide_button_enabled(self, enabled: bool) -> None:
+        guide_required = enabled or "gameinput:guide" in self._config.controller.shortcut_controls
         if guide_required:
             self._guide_button_service.set_controller_ownership_active(
                 self._input_policy.hold_gameinput_ownership
@@ -1009,9 +1010,7 @@ class VigilApplication:
             self._guide_button_service.start()
         else:
             self._guide_button_service.deactivate()
-        self._controller_input_ownership_service.set_background_guide_enabled(
-            guide_required
-        )
+        self._controller_input_ownership_service.set_background_guide_enabled(guide_required)
 
     def _apply_game_library(self, library: object) -> None:
         if not isinstance(library, AggregatedGameLibrary):
@@ -1022,9 +1021,7 @@ class VigilApplication:
         self._recent_games = recent
         self._refresh_home_games()
         self._integration_status_service.request(library)
-        failures = [
-            result for result in library.provider_results if not result.succeeded
-        ]
+        failures = [result for result in library.provider_results if not result.succeeded]
         _LOGGER.info(
             "Game library discovery completed: games=%d recent=%d provider_failures=%d",
             len(library.games),
@@ -1046,11 +1043,7 @@ class VigilApplication:
             return False
         now = self._game_library_refresh_clock()
         previous = self._last_game_library_refresh_at
-        if (
-            not force
-            and previous is not None
-            and now - previous < _HOME_REFRESH_COOLDOWN_SECONDS
-        ):
+        if not force and previous is not None and now - previous < _HOME_REFRESH_COOLDOWN_SECONDS:
             return False
         self._last_game_library_refresh_at = now
         self._game_library_service.start()
@@ -1078,9 +1071,7 @@ class VigilApplication:
                 payload.title,
             )
         else:
-            _LOGGER.info(
-                "No safely closable running process found for %s", payload.title
-            )
+            _LOGGER.info("No safely closable running process found for %s", payload.title)
         self._refresh_home_games()
 
     def _handle_integration_action(self, action: str) -> None:
@@ -1203,13 +1194,13 @@ class VigilApplication:
         action = self._tray_toggle_action
         if action is None:
             return
-        action.setText(
-            "Hide Vigil Overlay" if self.window.isVisible() else "Show Vigil Overlay"
-        )
+        action.setText("Hide Vigil Overlay" if self.window.isVisible() else "Show Vigil Overlay")
 
     def _teardown_hotkey(self) -> None:
+        self._hotkey_probe_service.stop()
         self._hotkey_service.stop()
         self._hotkey_registration = None
+        self._hotkey_capture_active = False
 
     def _teardown_tray(self) -> None:
         tray = self._tray
@@ -1276,11 +1267,23 @@ class VigilApplication:
             self._guide_button_service.start()
         target_found = self._prepare_fps_target()
         self.window.show_overlay()
+        if self._startup_hotkey_failure is not None:
+            QTimer.singleShot(0, self._show_startup_hotkey_failure)
         self._begin_foreground_input_lease()
         QTimer.singleShot(1_500, self._update_check_service.check)
         if not target_found:
             QTimer.singleShot(0, self._prepare_fps_target)
         return self.qt_app.exec()
+
+    def _show_startup_hotkey_failure(self) -> None:
+        failure = self._startup_hotkey_failure
+        self._startup_hotkey_failure = None
+        if failure is None:
+            return
+        self.window.show_startup_hotkey_failure(
+            failure.combination,
+            failure.detail,
+        )
 
     def _before_quit(self) -> None:
         self._instance_activation_timer.stop()
@@ -1321,9 +1324,7 @@ def run_gui(
     """Assemble platform services and run the Qt application."""
 
     paths = ApplicationPaths.discover()
-    game_provider_registry = create_builtin_game_provider_registry(
-        paths, safe_mode=safe_mode
-    )
+    game_provider_registry = create_builtin_game_provider_registry(paths, safe_mode=safe_mode)
     integration_manager = IntegrationManager(paths, enabled=not safe_mode)
     application = VigilApplication(
         sys.argv,

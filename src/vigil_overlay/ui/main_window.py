@@ -34,6 +34,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -65,6 +66,7 @@ from vigil_overlay.services.system_status import (
 )
 from vigil_overlay.services.telemetry import TelemetrySnapshot
 from vigil_overlay.ui.controls import repolish_widget
+from vigil_overlay.ui.dialog_surface import VigilMessageDialog
 from vigil_overlay.ui.dim_backdrop import DimBackdropWindow
 from vigil_overlay.ui.modal_guard import ModalInputSource
 from vigil_overlay.ui.navigation import (
@@ -89,9 +91,8 @@ _LOGGER = logging.getLogger("vigil_overlay")
 PersistConfig = Callable[[AppConfig], None]
 HotkeyChangeCallback = Callable[[str], tuple[bool, str]]
 HotkeyCaptureCallback = Callable[[bool], None]
-ControllerShortcutChangeCallback = Callable[
-    [ControllerShortcutBinding], tuple[bool, str]
-]
+HotkeyProbeCallback = Callable[[str], tuple[bool, str]]
+ControllerShortcutChangeCallback = Callable[[ControllerShortcutBinding], tuple[bool, str]]
 ControllerShortcutCaptureCallback = Callable[[bool], None]
 StartupChangeCallback = Callable[[bool], tuple[bool, str]]
 BackgroundChangeCallback = Callable[[bool], tuple[bool, str]]
@@ -126,6 +127,7 @@ class OverlayWindow(QWidget):
     game_launch_requested = Signal(object)
     game_close_requested = Signal(object)
     integration_action_requested = Signal(str)
+    update_handoff_requested = Signal()
 
     def __init__(
         self,
@@ -137,12 +139,9 @@ class OverlayWindow(QWidget):
         telemetry_snapshot: TelemetrySnapshot | None = None,
         hotkey_change_callback: HotkeyChangeCallback | None = None,
         hotkey_capture_callback: HotkeyCaptureCallback | None = None,
-        controller_shortcut_change_callback: (
-            ControllerShortcutChangeCallback | None
-        ) = None,
-        controller_shortcut_capture_callback: (
-            ControllerShortcutCaptureCallback | None
-        ) = None,
+        hotkey_probe_callback: HotkeyProbeCallback | None = None,
+        controller_shortcut_change_callback: (ControllerShortcutChangeCallback | None) = None,
+        controller_shortcut_capture_callback: (ControllerShortcutCaptureCallback | None) = None,
         power_capabilities_callback: PowerCapabilitiesCallback | None = None,
         power_action_callback: PowerActionCallback | None = None,
         startup_change_callback: StartupChangeCallback | None = None,
@@ -162,14 +161,14 @@ class OverlayWindow(QWidget):
         self._background_available = background_available
         self._hotkey_change_callback = hotkey_change_callback
         self._hotkey_capture_callback = hotkey_capture_callback
+        self._hotkey_probe_callback = hotkey_probe_callback
         self._controller_shortcut_change_callback = controller_shortcut_change_callback
-        self._controller_shortcut_capture_callback = (
-            controller_shortcut_capture_callback
-        )
+        self._controller_shortcut_capture_callback = controller_shortcut_capture_callback
         self._power_capabilities_callback = power_capabilities_callback
         self._power_action_callback = power_action_callback
         self._power_dialog: PowerMenuDialog | None = None
         self._update_dialog: UpdateAvailableDialog | None = None
+        self._fps_failure_dialog: VigilMessageDialog | None = None
         self._next_power_input_source = ModalInputSource.UNKNOWN
         self._startup_change_callback = startup_change_callback
         self._startup_available = startup_available
@@ -210,30 +209,22 @@ class OverlayWindow(QWidget):
         self._mouse_event_filter_installed = False
         self._controller_mouse_guard_timer = QTimer(self)
         self._controller_mouse_guard_timer.setSingleShot(True)
-        self._controller_mouse_guard_timer.setInterval(
-            _CONTROLLER_MOUSE_GUARD_MILLISECONDS
-        )
-        self._controller_mouse_guard_timer.timeout.connect(
-            self._release_controller_mouse_guard
-        )
+        self._controller_mouse_guard_timer.setInterval(_CONTROLLER_MOUSE_GUARD_MILLISECONDS)
+        self._controller_mouse_guard_timer.timeout.connect(self._release_controller_mouse_guard)
         self._pending_keyboard_back_at: float | None = None
         self._pending_keyboard_back_timer = QTimer(self)
         self._pending_keyboard_back_timer.setSingleShot(True)
         self._pending_keyboard_back_timer.setInterval(
             int(_CONTROLLER_DUPLICATE_WINDOW_SECONDS * 1000) + 20
         )
-        self._pending_keyboard_back_timer.timeout.connect(
-            self._flush_pending_keyboard_back
-        )
+        self._pending_keyboard_back_timer.timeout.connect(self._flush_pending_keyboard_back)
         self._widget_registry = widget_registry or WidgetRegistry(
             built_in_widget_definitions(),
             enabled_widget_ids=tuple(config.widgets.enabled_widget_ids),
             widget_order=tuple(config.widgets.widget_order),
         )
         self._ensure_required_widgets_in_config()
-        self._widget_registry.set_enabled_widget_ids(
-            tuple(self._config.widgets.enabled_widget_ids)
-        )
+        self._widget_registry.set_enabled_widget_ids(tuple(self._config.widgets.enabled_widget_ids))
         self._geometry_timer = QTimer(self)
         self._geometry_timer.setSingleShot(True)
         self._geometry_timer.setInterval(250)
@@ -289,9 +280,7 @@ class OverlayWindow(QWidget):
             return
         self._input_policy = policy
         self._controller_mouse_input_suppressed = not policy.allow_mouse_events_in_vigil
-        self._controller_mouse_guard_enabled = (
-            policy.use_controller_correlated_mouse_guard
-        )
+        self._controller_mouse_guard_enabled = policy.use_controller_correlated_mouse_guard
         self._controller_mouse_guard_timer.stop()
         self._controller_widget_direction_latch = None
         self._pending_keyboard_back_timer.stop()
@@ -346,19 +335,13 @@ class OverlayWindow(QWidget):
             application_icon=self._application_icon,
         )
         self._navigation.item_activated.connect(self._on_item_activated)
-        self._navigation.item_secondary_activated.connect(
-            self._on_item_secondary_activated
-        )
+        self._navigation.item_secondary_activated.connect(self._on_item_secondary_activated)
         self._navigation.widget_changed.connect(self._on_widget_changed)
-        self._navigation.panel_size_hint_changed.connect(
-            self._schedule_panel_geometry_refresh
-        )
+        self._navigation.panel_size_hint_changed.connect(self._schedule_panel_geometry_refresh)
         integrations_view = self._navigation.integrations_view
         if integrations_view is not None:
             integrations_view.uninstall_confirmed.connect(
-                lambda: self.integration_action_requested.emit(
-                    "playnite_remove_confirmed"
-                )
+                lambda: self.integration_action_requested.emit("playnite_remove_confirmed")
             )
         panel_layout.addWidget(self._navigation, 1)
         self._sync_widget_catalog()
@@ -512,9 +495,7 @@ class OverlayWindow(QWidget):
 
         visible_games = games[:6]
         visible_closable = frozenset(
-            game.identity
-            for game in visible_games
-            if game.identity in closable_game_identities
+            game.identity for game in visible_games if game.identity in closable_game_identities
         )
         if (
             visible_games == self._home_recent_games
@@ -542,13 +523,9 @@ class OverlayWindow(QWidget):
                     secondary_action_id=(
                         "close_game" if game.identity in visible_closable else None
                     ),
-                    secondary_action_label=(
-                        "X" if game.identity in visible_closable else None
-                    ),
+                    secondary_action_label=("X" if game.identity in visible_closable else None),
                     secondary_action_description=(
-                        f"Close {game.title}"
-                        if game.identity in visible_closable
-                        else None
+                        f"Close {game.title}" if game.identity in visible_closable else None
                     ),
                 )
             )
@@ -589,9 +566,7 @@ class OverlayWindow(QWidget):
         ):
             self._begin_controller_mouse_guard()
             return self._current_navigation_result()
-        pending_back_owned = self._cancel_correlated_pending_keyboard_back(
-            command, now=now
-        )
+        pending_back_owned = self._cancel_correlated_pending_keyboard_back(command, now=now)
         keyboard_at = self._last_keyboard_command_at.get(command)
         self._last_controller_command_at[command] = now
         self._begin_controller_mouse_guard()
@@ -606,10 +581,7 @@ class OverlayWindow(QWidget):
             if display_view is not None:
                 display_view.set_next_input_source(ModalInputSource.CONTROLLER)
             integrations_view = self._navigation.integrations_view
-            if (
-                integrations_view is not None
-                and not integrations_view.interaction_active
-            ):
+            if integrations_view is not None and not integrations_view.interaction_active:
                 integrations_view.set_next_input_source(ModalInputSource.CONTROLLER)
             settings_view = self._navigation.settings_view
             if settings_view is not None and not settings_view.interaction_active:
@@ -649,6 +621,8 @@ class OverlayWindow(QWidget):
             self._power_dialog.notify_controller_activation_released()
         if self._update_dialog is not None:
             self._update_dialog.notify_controller_activation_released()
+        if self._fps_failure_dialog is not None:
+            self._fps_failure_dialog.notify_controller_activation_released()
 
     def handle_navigation_command(self, command: NavigationCommand) -> NavigationResult:
         """Apply one keyboard/controller-neutral navigation command."""
@@ -669,6 +643,10 @@ class OverlayWindow(QWidget):
 
         if self._update_dialog is not None:
             self._update_dialog.handle_controller_command(command)
+            return self._current_navigation_result()
+
+        if self._fps_failure_dialog is not None:
+            self._fps_failure_dialog.handle_controller_command(command)
             return self._current_navigation_result()
 
         if self._power_dialog is not None:
@@ -813,9 +791,7 @@ class OverlayWindow(QWidget):
 
         recent_controller = max(
             (
-                self._last_controller_command_at.get(
-                    NavigationCommand.BACK, float("-inf")
-                ),
+                self._last_controller_command_at.get(NavigationCommand.BACK, float("-inf")),
                 self._last_controller_command_at.get(
                     NavigationCommand.OPEN_OPTIONS,
                     float("-inf"),
@@ -858,8 +834,7 @@ class OverlayWindow(QWidget):
 
     def _controller_mouse_events_blocked(self) -> bool:
         return self._controller_mouse_input_suppressed or (
-            self._controller_mouse_guard_enabled
-            and self._controller_mouse_guard_timer.isActive()
+            self._controller_mouse_guard_enabled and self._controller_mouse_guard_timer.isActive()
         )
 
     def _sync_controller_mouse_cursor(self) -> None:
@@ -960,14 +935,14 @@ class OverlayWindow(QWidget):
                 settings_view.open_hotkey_editor(
                     self._hotkey_change_callback,
                     capture_callback=self._hotkey_capture_callback,
+                    probe_callback=self._hotkey_probe_callback,
                 )
                 self._navigation.restore_focus()
             return
+
         if widget_id == "settings" and item_id == "run_in_background":
             if self._background_change_callback is None:
-                self._action_status.setText(
-                    "Run in background is unavailable in this build."
-                )
+                self._action_status.setText("Run in background is unavailable in this build.")
                 return
             target = not self._config.background.run_in_background
             success, detail = self._background_change_callback(target)
@@ -977,9 +952,7 @@ class OverlayWindow(QWidget):
             return
         if widget_id == "settings" and item_id == "start_with_windows":
             if self._startup_change_callback is None:
-                self._action_status.setText(
-                    "Start with Windows is unavailable in this build."
-                )
+                self._action_status.setText("Start with Windows is unavailable in this build.")
                 return
             target = not self._config.startup.start_with_windows
             success, detail = self._startup_change_callback(target)
@@ -989,18 +962,14 @@ class OverlayWindow(QWidget):
             return
         if widget_id == "settings" and item_id == "safe_mode":
             if self._safe_mode_restart_callback is None:
-                self._action_status.setText(
-                    "Safe Mode restart is unavailable in this build."
-                )
+                self._action_status.setText("Safe Mode restart is unavailable in this build.")
                 return
             _, detail = self._safe_mode_restart_callback()
             self._action_status.setText(detail)
             return
         if widget_id == "settings" and item_id == "reset_window_position":
             if self._reset_window_position_callback is None:
-                self._action_status.setText(
-                    "Overlay position reset is unavailable in this build."
-                )
+                self._action_status.setText("Overlay position reset is unavailable in this build.")
                 return
             _, detail = self._reset_window_position_callback()
             self._action_status.setText(detail)
@@ -1030,11 +999,32 @@ class OverlayWindow(QWidget):
             if display_view is not None:
                 display_view.toggle_selector(item_id)
             return
-        selected_path = (
-            f"Selected {widget_id.replace('_', ' ')} / {item_id.replace('_', ' ')}"
-        )
+        selected_path = f"Selected {widget_id.replace('_', ' ')} / {item_id.replace('_', ' ')}"
         self._action_status.setText(selected_path)
         _LOGGER.info("Compact widget navigation activated %s/%s", widget_id, item_id)
+
+    def show_startup_hotkey_failure(self, candidate: str, detail: str) -> bool:
+        """Display one startup conflict prompt and route Try Again to the editor."""
+
+        settings_view = self._navigation.settings_view
+        if settings_view is None:
+            return False
+
+        def retry() -> None:
+            if self._hotkey_change_callback is None:
+                return
+            settings_view.open_hotkey_editor(
+                self._hotkey_change_callback,
+                capture_callback=self._hotkey_capture_callback,
+                probe_callback=self._hotkey_probe_callback,
+            )
+            self._navigation.restore_focus()
+
+        return settings_view.show_hotkey_failure(
+            candidate,
+            detail,
+            retry_callback=retry,
+        )
 
     def _on_item_secondary_activated(
         self,
@@ -1049,10 +1039,7 @@ class OverlayWindow(QWidget):
             self.game_close_requested.emit(game)
 
     def _open_power_menu(self) -> None:
-        if (
-            self._power_capabilities_callback is None
-            or self._power_action_callback is None
-        ):
+        if self._power_capabilities_callback is None or self._power_action_callback is None:
             self._action_status.setText("Power controls are unavailable.")
             return
         dialog = PowerMenuDialog(
@@ -1083,31 +1070,21 @@ class OverlayWindow(QWidget):
             return
         self._sync_guide_button_setting_label()
         self.guide_button_enabled_changed.emit(enabled)
-        _LOGGER.info(
-            "Xbox/Guide button overlay toggle %s", "enabled" if enabled else "disabled"
-        )
+        _LOGGER.info("Xbox/Guide button overlay toggle %s", "enabled" if enabled else "disabled")
 
     def _sync_guide_button_setting_label(self) -> None:
         settings_view = self._navigation.settings_view
         if settings_view is not None:
-            settings_view.set_guide_button_enabled(
-                self._config.controller.guide_button_enabled
-            )
+            settings_view.set_guide_button_enabled(self._config.controller.guide_button_enabled)
 
     def _toggle_mouse_navigation_setting(self) -> None:
-        previous = (
-            self._config.controller.allow_mouse_navigation_while_controller_connected
-        )
+        previous = self._config.controller.allow_mouse_navigation_while_controller_connected
         enabled = not previous
-        self._config.controller.allow_mouse_navigation_while_controller_connected = (
-            enabled
-        )
+        self._config.controller.allow_mouse_navigation_while_controller_connected = enabled
         try:
             self._persist_config_callback(self._config)
         except (OSError, VigilOverlayError):
-            self._config.controller.allow_mouse_navigation_while_controller_connected = (
-                previous
-            )
+            self._config.controller.allow_mouse_navigation_while_controller_connected = previous
             self._sync_mouse_navigation_setting_label()
             _LOGGER.exception("Could not persist controller mouse-navigation setting")
             return
@@ -1124,54 +1101,36 @@ class OverlayWindow(QWidget):
     def _sync_start_with_windows_setting_label(self) -> None:
         settings_view = self._navigation.settings_view
         if settings_view is not None:
-            settings_view.set_start_with_windows_enabled(
-                self._config.startup.start_with_windows
-            )
+            settings_view.set_start_with_windows_enabled(self._config.startup.start_with_windows)
 
     def _sync_run_in_background_setting_label(self) -> None:
         settings_view = self._navigation.settings_view
         if settings_view is not None:
-            settings_view.set_run_in_background_enabled(
-                self._config.background.run_in_background
-            )
+            settings_view.set_run_in_background_enabled(self._config.background.run_in_background)
 
     def _on_widget_changed(self, widget_id: str) -> None:
         self._hide_widget_options()
         audio_view = self._navigation.audio_view
-        if (
-            widget_id != "audio"
-            and audio_view is not None
-            and audio_view.interaction_active
-        ):
+        if widget_id != "audio" and audio_view is not None and audio_view.interaction_active:
             audio_view.cancel_interaction()
         if widget_id == "audio" and audio_view is not None:
             QTimer.singleShot(0, audio_view.refresh)
 
         wifi_view = self._navigation.wifi_view
-        if (
-            widget_id != "wifi"
-            and wifi_view is not None
-            and wifi_view.interaction_active
-        ):
+        if widget_id != "wifi" and wifi_view is not None and wifi_view.interaction_active:
             wifi_view.cancel_interaction()
         if widget_id == "wifi" and wifi_view is not None:
             wifi_view.refresh()
 
         display_view = self._navigation.display_view
-        if (
-            widget_id != "display"
-            and display_view is not None
-            and display_view.interaction_active
-        ):
+        if widget_id != "display" and display_view is not None and display_view.interaction_active:
             # Dropdowns must never survive after Display is no longer active. A
             # pending temporary display change is also reverted here for safety.
             display_view.cancel_interaction()
         self._sync_widget_options()
         self._apply_panel_geometry()
         if widget_id == "display" and display_view is not None:
-            display_view.refresh_screen_values(
-                self.screen() or QGuiApplication.primaryScreen()
-            )
+            display_view.refresh_screen_values(self.screen() or QGuiApplication.primaryScreen())
 
     def _schedule_panel_geometry_refresh(self) -> None:
         QTimer.singleShot(0, self._apply_panel_geometry)
@@ -1230,9 +1189,7 @@ class OverlayWindow(QWidget):
             item_id = f"widget_{definition.widget_id}"
             mapping[item_id] = definition.widget_id
             if definition.required:
-                description = (
-                    f"Open the {definition.label} widget. This widget cannot be closed."
-                )
+                description = f"Open the {definition.label} widget. This widget cannot be closed."
             elif definition.widget_id in visible:
                 description = f"Open the {definition.label} widget."
             else:
@@ -1289,8 +1246,7 @@ class OverlayWindow(QWidget):
         self._config.widgets.widget_order = next_order
         self._widget_registry.set_enabled_widget_ids(tuple(next_enabled))
         next_visible = tuple(
-            definition.widget_id
-            for definition in self._widget_registry.visible_widgets()
+            definition.widget_id for definition in self._widget_registry.visible_widgets()
         )
 
         target = previous_nav_selected
@@ -1320,9 +1276,7 @@ class OverlayWindow(QWidget):
             )
             self._sync_widget_catalog()
             self._sync_widget_options()
-            _LOGGER.exception(
-                "Could not persist widget visibility change for %s", widget_id
-            )
+            _LOGGER.exception("Could not persist widget visibility change for %s", widget_id)
             return False
 
         self._sync_widget_catalog()
@@ -1335,9 +1289,7 @@ class OverlayWindow(QWidget):
         if self._options_popup.isVisible():
             self._hide_widget_options()
             return
-        definition = self._navigation.widget_definition(
-            self._navigation.selected_widget_id
-        )
+        definition = self._navigation.widget_definition(self._navigation.selected_widget_id)
         if definition.required:
             return
         self._close_widget_button.setText(f"Close {definition.label}")
@@ -1368,9 +1320,7 @@ class OverlayWindow(QWidget):
         self._options_popup.hide()
 
     def _sync_widget_options(self) -> None:
-        definition = self._navigation.widget_definition(
-            self._navigation.selected_widget_id
-        )
+        definition = self._navigation.widget_definition(self._navigation.selected_widget_id)
         closable = not definition.required
         if not closable:
             self._hide_widget_options()
@@ -1443,10 +1393,30 @@ class OverlayWindow(QWidget):
         dialog = UpdateAvailableDialog(update, self)
         self._update_dialog = dialog
         dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
+        release_page_opened = False
+        try:
+            release_page_opened = (
+                dialog.exec() == QDialog.DialogCode.Accepted
+            )
+        finally:
+            self._update_dialog = None
+            self._navigation.restore_focus()
+        if release_page_opened:
+            self.update_handoff_requested.emit()
+
+    def show_fps_runtime_failure(self, detail: str) -> None:
+        """Show one visible, controller-dismissible PresentMon failure prompt."""
+
+        if self._fps_failure_dialog is not None:
+            return
+        dialog = VigilMessageDialog("FPS unavailable", detail, self)
+        dialog.setObjectName("fpsRuntimeFailureDialog")
+        dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
+        self._fps_failure_dialog = dialog
         try:
             dialog.exec()
         finally:
-            self._update_dialog = None
+            self._fps_failure_dialog = None
             self._navigation.restore_focus()
 
     def reset_position(self) -> None:
@@ -1470,9 +1440,7 @@ class OverlayWindow(QWidget):
             self.activateWindow()
         display_view = self._navigation.display_view
         if display_view is not None:
-            display_view.refresh_screen_values(
-                self.screen() or QGuiApplication.primaryScreen()
-            )
+            display_view.refresh_screen_values(self.screen() or QGuiApplication.primaryScreen())
         audio_view = self._navigation.audio_view
         if audio_view is not None and self._navigation.selected_widget_id == "audio":
             audio_view.refresh()
@@ -1507,9 +1475,7 @@ class OverlayWindow(QWidget):
             _LOGGER.info("Unified dimmed overlay hidden to background")
             return
 
-        _LOGGER.warning(
-            "No background restore mechanism is available; closing application"
-        )
+        _LOGGER.warning("No background restore mechanism is available; closing application")
         self._allow_close = True
         self.close()
 
@@ -1621,9 +1587,7 @@ class OverlayWindow(QWidget):
         self._apply_panel_geometry()
         display_view = self._navigation.display_view
         if display_view is not None:
-            display_view.refresh_screen_values(
-                self.screen() or QGuiApplication.primaryScreen()
-            )
+            display_view.refresh_screen_values(self.screen() or QGuiApplication.primaryScreen())
         self._configure_native_window()
         self._reassert_topmost()
         self._display_settle_timer.start()
@@ -1637,9 +1601,7 @@ class OverlayWindow(QWidget):
         self._apply_panel_geometry()
         display_view = self._navigation.display_view
         if display_view is not None:
-            display_view.refresh_screen_values(
-                self.screen() or QGuiApplication.primaryScreen()
-            )
+            display_view.refresh_screen_values(self.screen() or QGuiApplication.primaryScreen())
         self._configure_native_window()
         self._reassert_topmost()
 
@@ -1656,13 +1618,8 @@ class OverlayWindow(QWidget):
                     if display_view is not None:
                         display_view.set_next_input_source(ModalInputSource.KEYBOARD)
                     integrations_view = self._navigation.integrations_view
-                    if (
-                        integrations_view is not None
-                        and not integrations_view.interaction_active
-                    ):
-                        integrations_view.set_next_input_source(
-                            ModalInputSource.KEYBOARD
-                        )
+                    if integrations_view is not None and not integrations_view.interaction_active:
+                        integrations_view.set_next_input_source(ModalInputSource.KEYBOARD)
                 self.handle_navigation_command(command)
                 event.accept()
                 return
@@ -1672,22 +1629,14 @@ class OverlayWindow(QWidget):
                 event.accept()
                 return
             controller_at = self._last_controller_command_at.get(command)
-            if (
-                controller_at is None
-                or now - controller_at > _CONTROLLER_DUPLICATE_WINDOW_SECONDS
-            ):
+            if controller_at is None or now - controller_at > _CONTROLLER_DUPLICATE_WINDOW_SECONDS:
                 if command is NavigationCommand.ACTIVATE:
                     display_view = self._navigation.display_view
                     if display_view is not None:
                         display_view.set_next_input_source(ModalInputSource.KEYBOARD)
                     integrations_view = self._navigation.integrations_view
-                    if (
-                        integrations_view is not None
-                        and not integrations_view.interaction_active
-                    ):
-                        integrations_view.set_next_input_source(
-                            ModalInputSource.KEYBOARD
-                        )
+                    if integrations_view is not None and not integrations_view.interaction_active:
+                        integrations_view.set_next_input_source(ModalInputSource.KEYBOARD)
                 self.handle_navigation_command(command)
             event.accept()
             return
@@ -1759,11 +1708,7 @@ class OverlayWindow(QWidget):
         else:
             try:
                 backend = self._status_backend
-                snapshot = (
-                    backend.snapshot()
-                    if backend is not None
-                    else OverlayStatusSnapshot()
-                )
+                snapshot = backend.snapshot() if backend is not None else OverlayStatusSnapshot()
             except Exception:
                 _LOGGER.debug("Overlay header status refresh failed", exc_info=True)
                 snapshot = OverlayStatusSnapshot()
@@ -1801,9 +1746,7 @@ class OverlayWindow(QWidget):
         if snapshot.battery_present is False:
             text = "⚡" if snapshot.power_plugged is not False else "▰"
             tooltip = (
-                "AC power"
-                if snapshot.power_plugged is not False
-                else "Power status available"
+                "AC power" if snapshot.power_plugged is not False else "Power status available"
             )
             state = "active"
         elif snapshot.battery_present is True:
@@ -1819,9 +1762,7 @@ class OverlayWindow(QWidget):
             else:
                 glyph = "▰" if percent is None or percent > 20 else "▱"
                 text = f"{glyph} {percent}%" if percent is not None else glyph
-                tooltip = (
-                    f"Battery {percent}%" if percent is not None else "On battery power"
-                )
+                tooltip = f"Battery {percent}%" if percent is not None else "On battery power"
                 state = "warning" if percent is not None and percent <= 20 else "active"
         elif snapshot.power_plugged is True:
             text = "⚡"
@@ -1843,18 +1784,14 @@ class OverlayWindow(QWidget):
             _LOGGER.debug("Controller battery status refresh failed", exc_info=True)
             return ControllerBatterySnapshot(connected=True)
 
-    def _apply_controller_battery_status(
-        self, snapshot: ControllerBatterySnapshot
-    ) -> None:
+    def _apply_controller_battery_status(self, snapshot: ControllerBatterySnapshot) -> None:
         if not snapshot.connected:
             self._controller_battery_label.setVisible(False)
             return
 
         self._controller_battery_label.setVisible(True)
         percent = snapshot.battery_percent
-        approximate_prefix = (
-            "~" if snapshot.approximate_percent and percent is not None else ""
-        )
+        approximate_prefix = "~" if snapshot.approximate_percent and percent is not None else ""
         if snapshot.battery_present is False:
             text = "🎮"
             tooltip = "Controller connected · wired"

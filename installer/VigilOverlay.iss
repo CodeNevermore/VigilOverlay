@@ -8,7 +8,7 @@
   #error GameInputMsi must point to the official Microsoft GameInputRedist.msi.
 #endif
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.2.1"
+  #define MyAppVersion "0.1.2.2"
 #endif
 
 #define MyAppName "Vigil Overlay"
@@ -42,6 +42,9 @@ Name: "{autoprograms}\Vigil Overlay"; Filename: "{app}\{#MyAppExeName}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch Vigil Overlay"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\VigilOverlay"" /F"; Flags: runhidden; RunOnceId: "RemoveVigilOverlayStartupTask"
 
 [Code]
 function PrepareToInstall(var NeedsRestart: Boolean): String;

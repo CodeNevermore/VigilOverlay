@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
@@ -103,6 +103,91 @@ class NavigationCommand(StrEnum):
     TOGGLE_OVERLAY = "toggle_overlay"
 
 
+_SPATIAL_NAVIGATION_COMMANDS = frozenset(
+    {
+        NavigationCommand.MOVE_LEFT,
+        NavigationCommand.MOVE_RIGHT,
+        NavigationCommand.MOVE_UP,
+        NavigationCommand.MOVE_DOWN,
+    }
+)
+
+
+def spatial_navigation_target(
+    rectangles: Sequence[QRectF],
+    current_index: int,
+    command: NavigationCommand,
+) -> int | None:
+    """Return the nearest rendered control in one cardinal direction.
+
+    Controls that overlap the source control's horizontal or vertical navigation
+    beam win over diagonal candidates. This keeps rows and columns intuitive while
+    still allowing uneven host-rendered layouts to remain controller navigable.
+    """
+
+    if command not in _SPATIAL_NAVIGATION_COMMANDS:
+        return None
+    if not 0 <= current_index < len(rectangles):
+        return None
+
+    source = rectangles[current_index]
+    source_center = source.center()
+    best: tuple[tuple[float, float, float, float, int], int] | None = None
+    for index, candidate in enumerate(rectangles):
+        if index == current_index:
+            continue
+        candidate_center = candidate.center()
+        if command is NavigationCommand.MOVE_LEFT:
+            if min(source.right(), candidate.right()) - max(
+                source.left(), candidate.left()
+            ) > 0.5:
+                continue
+            primary_distance = source_center.x() - candidate_center.x()
+            primary_gap = max(source.left() - candidate.right(), 0.0)
+            cross_distance = abs(source_center.y() - candidate_center.y())
+            aligned = min(source.bottom(), candidate.bottom()) >= max(source.top(), candidate.top())
+        elif command is NavigationCommand.MOVE_RIGHT:
+            if min(source.right(), candidate.right()) - max(
+                source.left(), candidate.left()
+            ) > 0.5:
+                continue
+            primary_distance = candidate_center.x() - source_center.x()
+            primary_gap = max(candidate.left() - source.right(), 0.0)
+            cross_distance = abs(source_center.y() - candidate_center.y())
+            aligned = min(source.bottom(), candidate.bottom()) >= max(source.top(), candidate.top())
+        elif command is NavigationCommand.MOVE_UP:
+            if min(source.bottom(), candidate.bottom()) - max(
+                source.top(), candidate.top()
+            ) > 0.5:
+                continue
+            primary_distance = source_center.y() - candidate_center.y()
+            primary_gap = max(source.top() - candidate.bottom(), 0.0)
+            cross_distance = abs(source_center.x() - candidate_center.x())
+            aligned = min(source.right(), candidate.right()) >= max(source.left(), candidate.left())
+        else:
+            if min(source.bottom(), candidate.bottom()) - max(
+                source.top(), candidate.top()
+            ) > 0.5:
+                continue
+            primary_distance = candidate_center.y() - source_center.y()
+            primary_gap = max(candidate.top() - source.bottom(), 0.0)
+            cross_distance = abs(source_center.x() - candidate_center.x())
+            aligned = min(source.right(), candidate.right()) >= max(source.left(), candidate.left())
+
+        if primary_distance <= 0.5:
+            continue
+        score = (
+            0.0 if aligned else 1.0,
+            primary_gap,
+            cross_distance,
+            primary_distance,
+            index,
+        )
+        if best is None or score < best[0]:
+            best = (score, index)
+    return None if best is None else best[1]
+
+
 class FocusZone(StrEnum):
     """The current controller/keyboard focus region."""
 
@@ -155,9 +240,7 @@ class CompactFocusState:
         for widget_id in self.widget_ids:
             count = self.item_counts.get(widget_id, 0)
             if count < 0:
-                raise ValueError(
-                    f"item count cannot be negative for widget {widget_id}"
-                )
+                raise ValueError(f"item count cannot be negative for widget {widget_id}")
             normalized_counts[widget_id] = count
             self.selected_items[widget_id] = self._clamp_item_index(
                 widget_id,
@@ -252,11 +335,7 @@ class CompactFocusState:
         target_index = (self.selected_widget_index + delta) % len(self.widget_ids)
         target = self.widget_ids[target_index]
         changed = self.set_selected_widget(target, focus_zone=FocusZone.WIDGET_STRIP)
-        return (
-            NavigationOutcome.WIDGET_CHANGED
-            if changed
-            else NavigationOutcome.FOCUS_CHANGED
-        )
+        return NavigationOutcome.WIDGET_CHANGED if changed else NavigationOutcome.FOCUS_CHANGED
 
     def _move_vertical(self, delta: int) -> NavigationOutcome:
         if self.current_item_count == 0:
@@ -303,11 +382,7 @@ class CompactFocusState:
         *,
         count_override: int | None = None,
     ) -> int:
-        count = (
-            self.item_counts.get(widget_id, 0)
-            if count_override is None
-            else count_override
-        )
+        count = self.item_counts.get(widget_id, 0) if count_override is None else count_override
         if count <= 0:
             return 0
         return min(max(item_index, 0), count - 1)
@@ -326,8 +401,8 @@ def navigation_command_for_key(event: QKeyEvent) -> NavigationCommand | None:
 
     if control and not other_modifiers and key in {Qt.Key.Key_Tab, Qt.Key.Key_Backtab}:
         if shift or key == Qt.Key.Key_Backtab:
-            return NavigationCommand.MOVE_LEFT
-        return NavigationCommand.MOVE_RIGHT
+            return NavigationCommand.PREVIOUS_WIDGET
+        return NavigationCommand.NEXT_WIDGET
 
     if modifiers != Qt.KeyboardModifier.NoModifier:
         return None
@@ -337,8 +412,8 @@ def navigation_command_for_key(event: QKeyEvent) -> NavigationCommand | None:
         int(Qt.Key.Key_Right): NavigationCommand.MOVE_RIGHT,
         int(Qt.Key.Key_Up): NavigationCommand.MOVE_UP,
         int(Qt.Key.Key_Down): NavigationCommand.MOVE_DOWN,
-        int(Qt.Key.Key_Q): NavigationCommand.MOVE_LEFT,
-        int(Qt.Key.Key_E): NavigationCommand.MOVE_RIGHT,
+        int(Qt.Key.Key_Q): NavigationCommand.PREVIOUS_WIDGET,
+        int(Qt.Key.Key_E): NavigationCommand.NEXT_WIDGET,
         int(Qt.Key.Key_Return): NavigationCommand.ACTIVATE,
         int(Qt.Key.Key_Enter): NavigationCommand.ACTIVATE,
         int(Qt.Key.Key_Space): NavigationCommand.ACTIVATE,
@@ -367,7 +442,7 @@ _ICON_MAP: dict[str, QStyle.StandardPixmap] = {
 
 
 class NavigationShell(QWidget):
-    """Registry-driven widget strip with one vertically navigable active view."""
+    """Registry-driven widget strip with one spatially navigable active view."""
 
     widget_changed = Signal(str)
     item_activated = Signal(str, str)
@@ -400,14 +475,10 @@ class NavigationShell(QWidget):
         self.setObjectName("navigationShell")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._on_widget_changed = on_widget_changed
-        self._definitions = {
-            definition.widget_id: definition for definition in widget_definitions
-        }
+        self._definitions = {definition.widget_id: definition for definition in widget_definitions}
         if len(self._definitions) != len(widget_definitions):
             raise ValueError("navigation shell received duplicate widget definitions")
-        all_widget_ids = tuple(
-            definition.widget_id for definition in widget_definitions
-        )
+        all_widget_ids = tuple(definition.widget_id for definition in widget_definitions)
         widget_ids = visible_widget_ids or all_widget_ids
         if not widget_ids:
             raise ValueError("navigation shell requires at least one visible widget")
@@ -418,9 +489,7 @@ class NavigationShell(QWidget):
             raise ValueError(
                 f"navigation shell received unknown visible widget: {unknown_visible[0]}"
             )
-        initial_widget = (
-            selected_widget_id if selected_widget_id in widget_ids else widget_ids[0]
-        )
+        initial_widget = selected_widget_id if selected_widget_id in widget_ids else widget_ids[0]
         self._buttons: dict[str, QPushButton] = {}
         self._item_buttons: dict[str, list[QPushButton]] = {}
         self._secondary_action_buttons: dict[str, dict[int, QPushButton]] = {}
@@ -452,8 +521,7 @@ class NavigationShell(QWidget):
         self._safe_mode_active = safe_mode_active
         self._application_icon = application_icon or QIcon()
         item_counts = {
-            widget_id: len(self._definitions[widget_id].items)
-            for widget_id in widget_ids
+            widget_id: len(self._definitions[widget_id].items) for widget_id in widget_ids
         }
         self._state = CompactFocusState(
             widget_ids=widget_ids,
@@ -525,9 +593,7 @@ class NavigationShell(QWidget):
                     page.minimumSizeHint().height(),
                 )
             else:
-                page_height = max(
-                    page.sizeHint().height(), page.minimumSizeHint().height()
-                )
+                page_height = max(page.sizeHint().height(), page.minimumSizeHint().height())
 
             scrollbar = scroller.verticalScrollBar()
             if (scrollbar.maximum() - scrollbar.minimum()) > 4:
@@ -541,12 +607,7 @@ class NavigationShell(QWidget):
         # Keep a tiny fit allowance for platform layout/frame rounding. The host still
         # caps the result to the monitor, so genuine overflow continues to scroll.
         fit_allowance = 6 if page_height > 0 else 0
-        return (
-            self._header.height()
-            + max(spacing, 0)
-            + max(page_height, 0)
-            + fit_allowance
-        )
+        return self._header.height() + max(spacing, 0) + max(page_height, 0) + fit_allowance
 
     @property
     def performance_view(self) -> PerformanceWidgetView | None:
@@ -655,9 +716,7 @@ class NavigationShell(QWidget):
 
         if not widget_ids:
             raise ValueError("navigation shell requires at least one visible widget")
-        unknown = [
-            widget_id for widget_id in widget_ids if widget_id not in self._definitions
-        ]
+        unknown = [widget_id for widget_id in widget_ids if widget_id not in self._definitions]
         if unknown:
             raise ValueError(f"unknown widget: {unknown[0]}")
 
@@ -666,13 +725,10 @@ class NavigationShell(QWidget):
         if target not in widget_ids:
             target = widget_ids[0]
         focus_zone = (
-            previous.focus_zone
-            if target == previous.selected_widget_id
-            else FocusZone.WIDGET_STRIP
+            previous.focus_zone if target == previous.selected_widget_id else FocusZone.WIDGET_STRIP
         )
         item_counts = {
-            widget_id: len(self._definitions[widget_id].items)
-            for widget_id in widget_ids
+            widget_id: len(self._definitions[widget_id].items) for widget_id in widget_ids
         }
         self._state = CompactFocusState(
             widget_ids=widget_ids,
@@ -710,9 +766,7 @@ class NavigationShell(QWidget):
         if definition is None:
             raise ValueError(f"unknown widget: {widget_id}")
         if definition.view_kind is not WidgetViewKind.STANDARD_LIST:
-            raise ValueError(
-                "runtime item replacement is supported only for standard-list widgets"
-            )
+            raise ValueError("runtime item replacement is supported only for standard-list widgets")
         updated = replace(
             definition,
             items=items,
@@ -753,8 +807,8 @@ class NavigationShell(QWidget):
             if button in previous_buttons:
                 continue
             button.clicked.connect(
-                lambda checked=False, target_widget=widget_id, item_index=index: (
-                    self._item_clicked(target_widget, item_index)
+                lambda checked=False, target_widget=widget_id, item_index=index: self._item_clicked(
+                    target_widget, item_index
                 )
             )
         self._apply_state(persist_widget=False)
@@ -773,11 +827,9 @@ class NavigationShell(QWidget):
         selected_index = self._state.selected_item_index
         if selected_index is None:
             return None
-        return self._secondary_action_buttons.get(self.selected_widget_id, {}).get(
-            selected_index
-        )
+        return self._secondary_action_buttons.get(self.selected_widget_id, {}).get(selected_index)
 
-    def _secondary_action_result(self, outcome: NavigationOutcome) -> NavigationResult:
+    def _result_for_outcome(self, outcome: NavigationOutcome) -> NavigationResult:
         return NavigationResult(
             outcome=outcome,
             selected_widget_id=self.selected_widget_id,
@@ -801,17 +853,15 @@ class NavigationShell(QWidget):
                 item_id = button.property("itemId")
                 if isinstance(action_id, str) and isinstance(item_id, str):
                     self.item_secondary_activated.emit(widget_id, item_id, action_id)
-                    return self._secondary_action_result(
-                        NavigationOutcome.ITEM_ACTIVATED
-                    )
+                    return self._result_for_outcome(NavigationOutcome.ITEM_ACTIVATED)
             if command in {NavigationCommand.MOVE_LEFT, NavigationCommand.BACK}:
                 self._secondary_action_focus = None
                 self._apply_state(persist_widget=False)
-                return self._secondary_action_result(NavigationOutcome.FOCUS_CHANGED)
+                return self._result_for_outcome(NavigationOutcome.FOCUS_CHANGED)
             if command in {NavigationCommand.MOVE_UP, NavigationCommand.MOVE_DOWN}:
                 self._secondary_action_focus = None
             elif command is NavigationCommand.MOVE_RIGHT:
-                return self._secondary_action_result(NavigationOutcome.NO_CHANGE)
+                return self._result_for_outcome(NavigationOutcome.NO_CHANGE)
 
         if command is NavigationCommand.MOVE_RIGHT:
             secondary_button = self._selected_secondary_action_button()
@@ -819,7 +869,12 @@ class NavigationShell(QWidget):
             if secondary_button is not None and selected_index is not None:
                 self._secondary_action_focus = (self.selected_widget_id, selected_index)
                 self._apply_state(persist_widget=False)
-                return self._secondary_action_result(NavigationOutcome.FOCUS_CHANGED)
+                return self._result_for_outcome(NavigationOutcome.FOCUS_CHANGED)
+
+        spatial_outcome = self._move_content_focus_spatially(command)
+        if spatial_outcome is not None:
+            self._apply_state(persist_widget=False)
+            return self._result_for_outcome(spatial_outcome)
 
         previous_widget = self._state.selected_widget_id
         outcome = self._state.dispatch(command)
@@ -834,9 +889,7 @@ class NavigationShell(QWidget):
             if selected_index is None:
                 outcome = NavigationOutcome.NO_CHANGE
             else:
-                definition = self._definitions[self.selected_widget_id].items[
-                    selected_index
-                ]
+                definition = self._definitions[self.selected_widget_id].items[selected_index]
                 if definition.enabled:
                     self.item_activated.emit(self.selected_widget_id, selected_item_id)
                 else:
@@ -848,6 +901,87 @@ class NavigationShell(QWidget):
             focus_zone=self.focus_zone,
             selected_item_index=self.selected_item_index,
             selected_item_id=selected_item_id,
+        )
+
+    def _move_content_focus_spatially(
+        self,
+        command: NavigationCommand,
+    ) -> NavigationOutcome | None:
+        """Move content focus using host-rendered control geometry when available."""
+
+        if self._state.focus_zone is not FocusZone.CONTENT:
+            return None
+        if command not in _SPATIAL_NAVIGATION_COMMANDS:
+            return None
+        if not self.isVisible():
+            if command in {NavigationCommand.MOVE_UP, NavigationCommand.MOVE_DOWN}:
+                return None
+            return NavigationOutcome.NO_CHANGE
+        selected_index = self._state.selected_item_index
+        if selected_index is None:
+            return NavigationOutcome.NO_CHANGE
+        buttons = self._item_buttons.get(self.selected_widget_id, [])
+        if not 0 <= selected_index < len(buttons):
+            return NavigationOutcome.NO_CHANGE
+
+        entries = tuple(
+            (index, rectangle)
+            for index, button in enumerate(buttons)
+            if (rectangle := self._navigation_rectangle(button)) is not None
+        )
+        selected_position = next(
+            (
+                position
+                for position, (item_index, _rectangle) in enumerate(entries)
+                if item_index == selected_index
+            ),
+            None,
+        )
+        if selected_position is None:
+            if command in {NavigationCommand.MOVE_UP, NavigationCommand.MOVE_DOWN}:
+                return None
+            return NavigationOutcome.NO_CHANGE
+        rectangles = tuple(rectangle for _item_index, rectangle in entries)
+        source_center = rectangles[selected_position].center()
+        geometry_ready = len(rectangles) <= 1 or any(
+            abs(rectangle.center().x() - source_center.x()) > 0.5
+            or abs(rectangle.center().y() - source_center.y()) > 0.5
+            for index, rectangle in enumerate(rectangles)
+            if index != selected_position
+        )
+        if not geometry_ready:
+            if command in {NavigationCommand.MOVE_UP, NavigationCommand.MOVE_DOWN}:
+                return None
+            return NavigationOutcome.NO_CHANGE
+
+        target_position = spatial_navigation_target(
+            rectangles,
+            selected_position,
+            command,
+        )
+        if target_position is not None:
+            target_index = entries[target_position][0]
+            changed = self._state.set_selected_item(target_index)
+            return NavigationOutcome.ITEM_CHANGED if changed else NavigationOutcome.NO_CHANGE
+        if command is NavigationCommand.MOVE_UP:
+            self._state.focus_zone = FocusZone.WIDGET_STRIP
+            return NavigationOutcome.FOCUS_CHANGED
+        return NavigationOutcome.NO_CHANGE
+
+    def _navigation_rectangle(self, button: QPushButton) -> QRectF | None:
+        ancestor: QWidget | None = button
+        while ancestor is not None and ancestor is not self._stack:
+            if ancestor.width() <= 0 or ancestor.height() <= 0:
+                return None
+            ancestor = ancestor.parentWidget()
+        if ancestor is None:
+            return None
+        top_left = button.mapTo(self._stack, button.rect().topLeft())
+        return QRectF(
+            float(top_left.x()),
+            float(top_left.y()),
+            float(button.width()),
+            float(button.height()),
         )
 
     def _build_ui(self, widget_definitions: tuple[WidgetDefinition, ...]) -> None:
@@ -900,12 +1034,8 @@ class NavigationShell(QWidget):
         self._strip_scroller.setObjectName("widgetStripScroller")
         self._strip_scroller.setFrameShape(QFrame.Shape.NoFrame)
         self._strip_scroller.setWidgetResizable(False)
-        self._strip_scroller.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self._strip_scroller.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
+        self._strip_scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._strip_scroller.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._strip_scroller.setFixedHeight(_WIDGET_STRIP_HEIGHT)
         self._sync_strip_viewport_width(self._state.widget_ids)
 
@@ -940,9 +1070,7 @@ class NavigationShell(QWidget):
             page_scroller = self._wrap_page(definition.widget_id, page)
             self._item_buttons[definition.widget_id] = item_buttons
             self._page_scrollers[definition.widget_id] = page_scroller
-            self._page_indexes[definition.widget_id] = self._stack.addWidget(
-                page_scroller
-            )
+            self._page_indexes[definition.widget_id] = self._stack.addWidget(page_scroller)
 
         self._strip_scroller.setWidget(self._strip_content)
 
@@ -1020,9 +1148,7 @@ class NavigationShell(QWidget):
         )
         vertical_scrollbar.rangeChanged.connect(
             lambda minimum, maximum: (
-                self._schedule_dynamic_panel_size_hint_refresh()
-                if maximum - minimum > 4
-                else None
+                self._schedule_dynamic_panel_size_hint_refresh() if maximum - minimum > 4 else None
             )
         )
         scroller.setVerticalScrollBar(vertical_scrollbar)
@@ -1036,9 +1162,7 @@ class NavigationShell(QWidget):
         return scroller
 
     def _sync_strip_viewport_width(self, widget_ids: tuple[str, ...]) -> None:
-        self._strip_scroller.setFixedWidth(
-            _widget_strip_viewport_width(len(widget_ids))
-        )
+        self._strip_scroller.setFixedWidth(_widget_strip_viewport_width(len(widget_ids)))
         QTimer.singleShot(0, self._update_strip_overflow_indicators)
 
     def _build_strip_overflow_indicator(
@@ -1066,12 +1190,8 @@ class NavigationShell(QWidget):
         has_overflow = bar.maximum() > bar.minimum()
         self._left_overflow_slot.setVisible(has_overflow)
         self._right_overflow_slot.setVisible(has_overflow)
-        self._left_overflow_indicator.setVisible(
-            has_overflow and bar.value() > bar.minimum()
-        )
-        self._right_overflow_indicator.setVisible(
-            has_overflow and bar.value() < bar.maximum()
-        )
+        self._left_overflow_indicator.setVisible(has_overflow and bar.value() > bar.minimum())
+        self._right_overflow_indicator.setVisible(has_overflow and bar.value() < bar.maximum())
 
     def _ensure_selected_widget_visible(self) -> None:
         button = self._buttons.get(self.selected_widget_id)
@@ -1095,9 +1215,7 @@ class NavigationShell(QWidget):
     ) -> tuple[QWidget, list[QPushButton]]:
         self._secondary_action_buttons[definition.widget_id] = {}
         if definition.view_kind is WidgetViewKind.PERFORMANCE:
-            view = PerformanceWidgetView(
-                definition, self._telemetry_snapshot, self._stack
-            )
+            view = PerformanceWidgetView(definition, self._telemetry_snapshot, self._stack)
             self._performance_view = view
             performance_buttons = list(view.metric_buttons)
             for index, button in enumerate(performance_buttons):
@@ -1129,9 +1247,7 @@ class NavigationShell(QWidget):
             # Synchronize the base controls immediately. The background audio runtime
             # emits items_changed later if live mixer-session rows change the count.
             if definition.widget_id in self._state.widget_ids:
-                self._state.set_item_count(
-                    definition.widget_id, len(audio_view.item_definitions)
-                )
+                self._state.set_item_count(definition.widget_id, len(audio_view.item_definitions))
             return audio_view, audio_buttons
 
         if definition.view_kind is WidgetViewKind.WIFI:
@@ -1153,9 +1269,7 @@ class NavigationShell(QWidget):
                 definition, items=wifi_view.item_definitions
             )
             if definition.widget_id in self._state.widget_ids:
-                self._state.set_item_count(
-                    definition.widget_id, len(wifi_view.item_definitions)
-                )
+                self._state.set_item_count(definition.widget_id, len(wifi_view.item_definitions))
             return wifi_view, wifi_buttons
 
         if definition.view_kind is WidgetViewKind.DISPLAY:
@@ -1227,15 +1341,20 @@ class NavigationShell(QWidget):
 
         buttons: list[QPushButton] = []
         for index, item in enumerate(definition.items):
-            if definition.widget_id == "home" and item.item_id == "power":
+            is_home_power = definition.widget_id == "home" and item.item_id == "power"
+            if is_home_power:
                 layout.addStretch(1)
             button = QPushButton(item.label, page)
-            button.setObjectName("compactListItem")
+            button.setObjectName("compactPowerButton" if is_home_power else "compactListItem")
             button.setProperty("itemId", item.item_id)
             button.setCheckable(False)
             button.setEnabled(item.enabled)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            if item.widget_icon_source_id is not None:
+            if is_home_power:
+                button.setText("")
+                button.setIcon(self._outline_widget_icon(button, "power"))
+                button.setProperty("iconStyle", "outline-power")
+            elif item.widget_icon_source_id is not None:
                 source_button = self._buttons.get(item.widget_icon_source_id)
                 if source_button is not None and not source_button.icon().isNull():
                     button.setIcon(source_button.icon())
@@ -1253,7 +1372,9 @@ class NavigationShell(QWidget):
                 button.setIcon(icon)
             else:
                 button.setIcon(self.style().standardIcon(self._icon(item.icon_key)))
-            button.setIconSize(QSize(34, 34))
+            button.setIconSize(QSize(28, 28) if is_home_power else QSize(34, 34))
+            if is_home_power:
+                button.setFixedSize(_WIDGET_STRIP_BUTTON_SIZE, _WIDGET_STRIP_BUTTON_SIZE)
             button.setToolTip(item.description)
             button.setAccessibleName(f"{item.label}. {item.description}")
             button.clicked.connect(
@@ -1263,16 +1384,17 @@ class NavigationShell(QWidget):
             )
             buttons.append(button)
             if item.secondary_action_id is None:
-                layout.addWidget(button)
+                if is_home_power:
+                    layout.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
+                else:
+                    layout.addWidget(button)
             else:
                 row = QWidget(page)
                 row.setObjectName("compactListItemRow")
                 row_layout = QHBoxLayout(row)
                 row_layout.setContentsMargins(0, 0, 0, 0)
                 row_layout.setSpacing(8)
-                button.setSizePolicy(
-                    QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-                )
+                button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 row_layout.addWidget(button, 1)
                 action_button = QPushButton(item.secondary_action_label or "", row)
                 action_button.setObjectName("compactListItemSecondaryAction")
@@ -1283,9 +1405,7 @@ class NavigationShell(QWidget):
                 action_button.setAccessibleName(
                     f"{item.secondary_action_description or item.secondary_action_label}"
                 )
-                self._secondary_action_buttons[definition.widget_id][
-                    index
-                ] = action_button
+                self._secondary_action_buttons[definition.widget_id][index] = action_button
 
                 def emit_secondary_action(
                     checked: bool = False,
@@ -1295,9 +1415,7 @@ class NavigationShell(QWidget):
                     action_id: str | None = item.secondary_action_id,
                 ) -> None:
                     del checked
-                    self.item_secondary_activated.emit(
-                        widget_id, item_id, action_id or ""
-                    )
+                    self.item_secondary_activated.emit(widget_id, item_id, action_id or "")
 
                 action_button.clicked.connect(emit_secondary_action)
                 row_layout.addWidget(action_button)
@@ -1363,9 +1481,7 @@ class NavigationShell(QWidget):
                     current_widget_id,
                     index,
                 )
-                self._set_dynamic_property(
-                    action_button, "navigationFocus", action_focus
-                )
+                self._set_dynamic_property(action_button, "navigationFocus", action_focus)
 
         if self._performance_view is not None and widget_id == "performance":
             self._performance_view.set_selected_metric(selected_index or 0)
@@ -1495,6 +1611,14 @@ class NavigationShell(QWidget):
         elif widget_id == "widgets":
             for x, y in ((5.0, 5.0), (15.5, 5.0), (5.0, 15.5), (15.5, 15.5)):
                 path.addRoundedRect(QRectF(x, y, 7.5, 7.5), 1.4, 1.4)
+        elif widget_id == "power":
+            path.moveTo(14.0, 3.5)
+            path.lineTo(14.0, 13.5)
+            path.moveTo(8.5, 7.0)
+            path.cubicTo(5.0, 9.1, 3.8, 13.6, 5.6, 17.2)
+            path.cubicTo(7.4, 20.8, 11.4, 22.8, 15.4, 22.0)
+            path.cubicTo(19.4, 21.2, 22.2, 17.7, 22.2, 13.6)
+            path.cubicTo(22.2, 10.8, 20.8, 8.3, 18.5, 6.9)
         else:
             path.addRoundedRect(QRectF(5.0, 5.0, 18.0, 18.0), 3.0, 3.0)
 

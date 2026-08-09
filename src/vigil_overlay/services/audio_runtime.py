@@ -20,6 +20,7 @@ from vigil_overlay.services.audio_control import (
 
 _LOGGER = logging.getLogger("vigil_overlay")
 AudioBackendFactory = Callable[[], AudioControlBackend]
+_DIAGNOSTIC_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,51 @@ class AudioOperation:
 
     method: str
     args: tuple[Any, ...] = ()
+
+
+def diagnose_audio_backend(
+    *,
+    backend_factory: AudioBackendFactory | None = None,
+    timeout_seconds: float = _DIAGNOSTIC_TIMEOUT_SECONDS,
+) -> AudioSnapshot:
+    """Probe Core Audio on a dedicated owning thread for packaged diagnostics."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    factory = backend_factory or create_platform_audio_control_backend
+    completed: queue.Queue[AudioSnapshot] = queue.Queue(maxsize=1)
+
+    def probe() -> None:
+        backend: AudioControlBackend | None = None
+        try:
+            backend = factory()
+            snapshot = backend.snapshot()
+        except Exception as exc:
+            snapshot = AudioSnapshot(
+                False,
+                f"Could not initialize or read Windows audio controls: {exc}",
+            )
+        finally:
+            if backend is not None:
+                try:
+                    backend.close()
+                except Exception:
+                    _LOGGER.exception("Audio diagnostic backend shutdown failed")
+        completed.put(snapshot)
+
+    thread = threading.Thread(
+        target=probe,
+        name="VigilAudioDiagnostic",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+    if thread.is_alive():
+        return AudioSnapshot(False, "Windows audio diagnostic timed out.")
+    try:
+        return completed.get_nowait()
+    except queue.Empty:
+        return AudioSnapshot(False, "Windows audio diagnostic returned no result.")
 
 
 class AudioControlRuntime(QObject):
@@ -106,11 +152,7 @@ class AudioControlRuntime(QObject):
         self._stop.set()
         self._queue.put(None)
         thread = self._thread
-        if (
-            thread is not None
-            and thread.is_alive()
-            and thread is not threading.current_thread()
-        ):
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2.0)
         if thread is None or not thread.is_alive():
             self._thread = None
@@ -120,9 +162,7 @@ class AudioControlRuntime(QObject):
             backend = self._backend_factory()
         except Exception as exc:
             if not self._stop.is_set():
-                self.error_ready.emit(
-                    f"Could not initialize Windows audio controls: {exc}"
-                )
+                self.error_ready.emit(f"Could not initialize Windows audio controls: {exc}")
             return
 
         try:
@@ -165,9 +205,7 @@ class AudioControlRuntime(QObject):
             snapshot = AudioSnapshot(False, str(exc))
         except Exception as exc:
             _LOGGER.exception("Audio snapshot failed")
-            snapshot = AudioSnapshot(
-                False, f"Could not read Windows audio state: {exc}"
-            )
+            snapshot = AudioSnapshot(False, f"Could not read Windows audio state: {exc}")
         if not self._stop.is_set():
             self.snapshot_ready.emit(generation, snapshot)
 

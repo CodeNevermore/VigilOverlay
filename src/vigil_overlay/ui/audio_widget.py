@@ -95,9 +95,7 @@ class AudioVolumeButton(QPushButton):
             icon_label = QLabel(self)
             icon_label.setObjectName("audioSessionIcon")
             icon_label.setPixmap(icon.pixmap(34, 34))
-            icon_label.setAttribute(
-                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
-            )
+            icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             layout.addWidget(icon_label)
 
         body = QWidget(self)
@@ -111,9 +109,7 @@ class AudioVolumeButton(QPushButton):
         title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._value_label = QLabel("0", body)
         self._value_label.setObjectName("audioVolumeValue")
-        self._value_label.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
-        )
+        self._value_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         top.addWidget(title, 1)
         top.addWidget(self._value_label)
         self._slider = QSlider(Qt.Orientation.Horizontal, body)
@@ -186,9 +182,7 @@ class AudioWidgetView(QWidget):
 
         actual = tuple(item.item_id for item in definition.items)
         if actual != self._FIXED_IDS:
-            raise ValueError(
-                "Audio widget item contract does not match the fixed control layout"
-            )
+            raise ValueError("Audio widget item contract does not match the fixed control layout")
 
         self._base_definition = definition
         self._item_definitions: tuple[WidgetItemDefinition, ...] = definition.items
@@ -200,9 +194,7 @@ class AudioWidgetView(QWidget):
             self._runtime = AudioControlRuntime(self, backend_factory=lambda: backend)
         else:
             self._runtime = AudioControlRuntime(self)
-        self._snapshot = AudioSnapshot(
-            False, "Audio controls have not been queried yet."
-        )
+        self._snapshot = AudioSnapshot(False, "Audio controls have not been queried yet.")
         self._buttons: list[QPushButton] = []
         self._buttons_by_item: dict[str, QPushButton] = {}
         self._session_backend_ids: dict[str, str] = {}
@@ -218,6 +210,7 @@ class AudioWidgetView(QWidget):
         self._refresh_timer.timeout.connect(self.refresh)
         self._latest_requested_generation = 0
         self._latest_applied_generation = 0
+        self._last_logged_error: str | None = None
         self._runtime.snapshot_ready.connect(self._on_snapshot_ready)
         self._runtime.error_ready.connect(self._show_error)
         self._build_ui(definition)
@@ -273,9 +266,7 @@ class AudioWidgetView(QWidget):
             session = self._session_for_item(item_id)
             if session is None:
                 return False
-            self._runtime.submit(
-                "set_session_muted", session.session_id, not session.muted
-            )
+            self._runtime.submit("set_session_muted", session.session_id, not session.muted)
         else:
             return False
         return True
@@ -285,13 +276,9 @@ class AudioWidgetView(QWidget):
             return False
         amount = _VOLUME_STEP if delta > 0 else -_VOLUME_STEP
         if item_id == "output_volume":
-            self._runtime.submit(
-                "set_output_volume", self._snapshot.output_volume_percent + amount
-            )
+            self._runtime.submit("set_output_volume", self._snapshot.output_volume_percent + amount)
         elif item_id == "input_volume":
-            self._runtime.submit(
-                "set_input_volume", self._snapshot.input_volume_percent + amount
-            )
+            self._runtime.submit("set_input_volume", self._snapshot.input_volume_percent + amount)
         elif item_id in self._session_backend_ids:
             session = self._session_for_item(item_id)
             if session is None:
@@ -404,6 +391,7 @@ class AudioWidgetView(QWidget):
                 button.setEnabled(False)
             return
         self._error_label.hide()
+        self._last_logged_error = None
         for button in self._buttons:
             button.setEnabled(True)
 
@@ -416,13 +404,9 @@ class AudioWidgetView(QWidget):
         if isinstance(input_mute, AudioToggleButton):
             input_mute.set_state(snapshot.input_muted)
         if isinstance(output_volume, AudioVolumeButton):
-            output_volume.set_volume_state(
-                snapshot.output_volume_percent, snapshot.output_muted
-            )
+            output_volume.set_volume_state(snapshot.output_volume_percent, snapshot.output_muted)
         if isinstance(input_volume, AudioVolumeButton):
-            input_volume.set_volume_state(
-                snapshot.input_volume_percent, snapshot.input_muted
-            )
+            input_volume.set_volume_state(snapshot.input_volume_percent, snapshot.input_muted)
 
         output_selector = self._buttons_by_item["output_device"]
         input_selector = self._buttons_by_item["input_device"]
@@ -476,9 +460,7 @@ class AudioWidgetView(QWidget):
                 icon = icon_provider.icon(QFileInfo(session.process_path))
             row = AudioVolumeButton(dynamic, self._mixer_container, icon=icon)
             row.volume_changed.connect(
-                lambda value, target_item_id=item_id: self._set_direct_volume(
-                    target_item_id, value
-                )
+                lambda value, target_item_id=item_id: self._set_direct_volume(target_item_id, value)
             )
             self._mixer_layout.addWidget(row)
             self._session_backend_ids[item_id] = session.session_id
@@ -513,7 +495,9 @@ class AudioWidgetView(QWidget):
         open_item_id = (
             "output_device"
             if self._choice_kind == "output"
-            else "input_device" if self._choice_kind == "input" else None
+            else "input_device"
+            if self._choice_kind == "input"
+            else None
         )
         action = selector_toggle_action(open_item_id, item_id)
         if action is SelectorToggleAction.CLOSE:
@@ -525,9 +509,7 @@ class AudioWidgetView(QWidget):
             self._close_choice_popup()
 
         devices = (
-            self._snapshot.output_devices
-            if kind == "output"
-            else self._snapshot.input_devices
+            self._snapshot.output_devices if kind == "output" else self._snapshot.input_devices
         )
         default_id = (
             self._snapshot.default_output_device_id
@@ -540,11 +522,7 @@ class AudioWidgetView(QWidget):
         self._choice_kind = kind
         self._choice_devices = devices
         selected_index = next(
-            (
-                index
-                for index, device in enumerate(devices)
-                if device.device_id == default_id
-            ),
+            (index for index, device in enumerate(devices) if device.device_id == default_id),
             0,
         )
         item_id = "output_device" if kind == "output" else "input_device"
@@ -593,21 +571,17 @@ class AudioWidgetView(QWidget):
     def _show_error(self, message: str) -> None:
         self._error_label.setText(message)
         self._error_label.show()
-        _LOGGER.debug("Audio widget status: %s", message)
+        if message != self._last_logged_error:
+            _LOGGER.warning("Audio widget unavailable: %s", message)
+            self._last_logged_error = message
 
 
-def _device_name(
-    devices: tuple[AudioDeviceInfo, ...], device_id: str | None
-) -> str | None:
+def _device_name(devices: tuple[AudioDeviceInfo, ...], device_id: str | None) -> str | None:
     if device_id is None:
         return None
-    return next(
-        (device.name for device in devices if device.device_id == device_id), None
-    )
+    return next((device.name for device in devices if device.device_id == device_id), None)
 
 
 def _session_item_id(session_id: str) -> str:
-    digest = hashlib.sha256(session_id.encode("utf-8", errors="replace")).hexdigest()[
-        :20
-    ]
+    digest = hashlib.sha256(session_id.encode("utf-8", errors="replace")).hexdigest()[:20]
     return f"audio_session_{digest}"

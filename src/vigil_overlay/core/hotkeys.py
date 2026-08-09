@@ -49,6 +49,39 @@ _NAMED_KEYS = {
     "backtick": ("Grave", 0xC0),
 }
 
+SUPPORTED_HOTKEY_PRIMARY_KEYS = (
+    *(chr(code) for code in range(ord("A"), ord("Z") + 1)),
+    *(str(digit) for digit in range(10)),
+    "Backspace",
+    "Space",
+    "Tab",
+    "Enter",
+    "Escape",
+    "Left",
+    "Up",
+    "Right",
+    "Down",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+    "Insert",
+    "Delete",
+    "Minus",
+    "Equals",
+    "Comma",
+    "Period",
+    "Slash",
+    "Semicolon",
+    "Quote",
+    "LeftBracket",
+    "RightBracket",
+    "Backslash",
+    "Grave",
+    *(f"F{number}" for number in range(1, 25) if number != 12),
+    *(f"Numpad{digit}" for digit in range(10)),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class HotkeyCombination:
@@ -83,15 +116,11 @@ def parse_hotkey_combination(value: str) -> HotkeyCombination:
         normalized_modifier = _MODIFIER_ALIASES.get(token.casefold())
         if normalized_modifier is not None:
             if normalized_modifier in modifiers:
-                raise ValueError(
-                    f"hotkey modifier is duplicated: {normalized_modifier}"
-                )
+                raise ValueError(f"hotkey modifier is duplicated: {normalized_modifier}")
             modifiers.add(normalized_modifier)
             continue
         if key_token is not None:
-            raise ValueError(
-                "hotkey combination must contain exactly one non-modifier key"
-            )
+            raise ValueError("hotkey combination must contain exactly one non-modifier key")
         key_token = token
 
     if not modifiers:

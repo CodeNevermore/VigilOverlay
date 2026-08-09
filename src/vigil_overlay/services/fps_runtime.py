@@ -59,7 +59,13 @@ class PresentMonCaptureDiagnostics:
     stderr_tail: tuple[str, ...]
 
     @property
+    def permission_required(self) -> bool:
+        return _presentmon_permission_required(self.stderr_tail)
+
+    @property
     def no_frame_status(self) -> str:
+        if self.permission_required:
+            return "FPS PERMISSION REQUIRED"
         rejection_counts = dict(self.rejection_counts)
         if not self.header_columns and self.lines_seen:
             return "PRESENTMON OUTPUT UNSUPPORTED"
@@ -77,9 +83,7 @@ class PresentMonCaptureDiagnostics:
     @property
     def summary(self) -> str:
         columns = ",".join(self.header_columns) if self.header_columns else "<none>"
-        rejections = ",".join(
-            f"{reason}:{count}" for reason, count in self.rejection_counts
-        )
+        rejections = ",".join(f"{reason}:{count}" for reason, count in self.rejection_counts)
         stderr = " | ".join(self.stderr_tail) if self.stderr_tail else "<empty>"
         return (
             f"lines={self.lines_seen} header={columns} rows={self.data_rows_seen} "
@@ -146,10 +150,7 @@ class PresentMonCsvParser:
         except ValueError:
             self._rejections["displayed_time_invalid"] += 1
             return None
-        if (
-            not math.isfinite(displayed_time_ms)
-            or not 0.01 <= displayed_time_ms <= 10_000.0
-        ):
+        if not math.isfinite(displayed_time_ms) or not 0.01 <= displayed_time_ms <= 10_000.0:
             self._rejections["displayed_time_range"] += 1
             return None
         frame = PresentMonFrame(
@@ -204,9 +205,7 @@ class FpsWindowAccumulator:
         self._last_event_wall = None
         self._history.clear()
 
-    def ingest(
-        self, frame: PresentMonFrame, *, observed_at: float | None = None
-    ) -> None:
+    def ingest(self, frame: PresentMonFrame, *, observed_at: float | None = None) -> None:
         wall = time.monotonic() if observed_at is None else observed_at
         self._display_clock_ms += frame.displayed_time_ms
         self._session_frame_count += 1
@@ -221,10 +220,7 @@ class FpsWindowAccumulator:
         self, *, now: float | None = None, append_history: bool = True
     ) -> TelemetryMetricSnapshot:
         wall = time.monotonic() if now is None else now
-        if (
-            self._last_event_wall is None
-            or wall - self._last_event_wall > _STALE_AFTER_SECONDS
-        ):
+        if self._last_event_wall is None or wall - self._last_event_wall > _STALE_AFTER_SECONDS:
             if append_history:
                 self._history.append(None)
             return _unavailable_fps_metric(self.history)
@@ -267,9 +263,7 @@ class FpsWindowAccumulator:
         if not self._frames:
             return None
         cutoff = self._display_clock_ms - window_ms
-        durations = [
-            duration for end_time, duration in self._frames if end_time > cutoff
-        ]
+        durations = [duration for end_time, duration in self._frames if end_time > cutoff]
         total = sum(durations)
         if not durations or total <= 0:
             return None
@@ -287,17 +281,13 @@ class FpsStreamSelector:
     def __init__(self) -> None:
         self._streams: dict[str, FpsWindowAccumulator] = {}
 
-    def ingest(
-        self, frame: PresentMonFrame, *, observed_at: float | None = None
-    ) -> None:
+    def ingest(self, frame: PresentMonFrame, *, observed_at: float | None = None) -> None:
         accumulator = self._streams.setdefault(frame.swap_chain, FpsWindowAccumulator())
         accumulator.ingest(frame, observed_at=observed_at)
 
     def metric(self, *, now: float | None = None) -> TelemetryMetricSnapshot:
         wall = time.monotonic() if now is None else now
-        active_streams = [
-            stream for stream in self._streams.values() if stream.is_fresh(now=wall)
-        ]
+        active_streams = [stream for stream in self._streams.values() if stream.is_fresh(now=wall)]
         if not active_streams:
             return _unavailable_fps_metric(())
         selected = max(
@@ -312,6 +302,7 @@ class _CaptureOutcome(StrEnum):
     NO_FRAMES = "no_frames"
     COMPLETED_WITH_FRAMES = "completed_with_frames"
     COLLECTOR_FAILED = "collector_failed"
+    PERMISSION_REQUIRED = "permission_required"
     STALLED = "stalled"
 
 
@@ -319,6 +310,7 @@ class PresentMonFpsService(QObject):
     """Run PresentMon against GPU-ranked candidate processes until frames are found."""
 
     metric_ready = Signal(object)
+    failure_ready = Signal(str)
 
     def __init__(
         self,
@@ -471,9 +463,7 @@ class PresentMonFpsService(QObject):
                 or previous_target is None
                 or previous_target.identity_key != target.identity_key
             ):
-                self._stream_identity = (
-                    target.identity_key if target is not None else None
-                )
+                self._stream_identity = target.identity_key if target is not None else None
                 self._stream_selector = FpsStreamSelector()
         if previous_stop is not None:
             previous_stop.set()
@@ -487,21 +477,15 @@ class PresentMonFpsService(QObject):
             previous_thread.join(timeout=2.0)
         if target is None:
             self.metric_ready.emit(
-                FpsMetricUpdate(
-                    _unavailable_fps_metric((), "OPEN VIGIL OVER A GAME"), None
-                )
+                FpsMetricUpdate(_unavailable_fps_metric((), "OPEN VIGIL OVER A GAME"), None)
             )
             return
         if not self._started:
             return
         initial_status = (
-            "FINDING GAME"
-            if self._candidate_provider is not None
-            else "ATTACHING TO GAME"
+            "FINDING GAME" if self._candidate_provider is not None else "ATTACHING TO GAME"
         )
-        self.metric_ready.emit(
-            FpsMetricUpdate(_unavailable_fps_metric((), initial_status), target)
-        )
+        self.metric_ready.emit(FpsMetricUpdate(_unavailable_fps_metric((), initial_status), target))
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._capture_loop,
@@ -550,9 +534,7 @@ class PresentMonFpsService(QObject):
                 return
             discovered = self._candidate_cycle(seed_target if first_cycle else None)
             first_cycle = False
-            current_visible_identities = {
-                candidate.identity_key for candidate in discovered
-            }
+            current_visible_identities = {candidate.identity_key for candidate in discovered}
 
             if completed_candidate_scan:
                 reappeared = current_visible_identities - previous_visible_identities
@@ -635,6 +617,26 @@ class PresentMonFpsService(QObject):
                         if generation == self._generation and self._process is process:
                             self._process = None
                 if outcome is _CaptureOutcome.CANCELLED:
+                    return
+                if outcome is _CaptureOutcome.PERMISSION_REQUIRED:
+                    diagnostics = self.last_capture_diagnostics
+                    detail = (
+                        "PresentMon could not start its Windows trace session. "
+                        "Run Vigil Overlay as administrator and try again."
+                    )
+                    if diagnostics is not None:
+                        _LOGGER.error(
+                            "PresentMon requires elevated FPS access for %s (pid=%d): %s",
+                            candidate.executable_name,
+                            candidate.process_id,
+                            diagnostics.summary,
+                        )
+                    self._complete_capture(
+                        generation,
+                        candidate,
+                        secondary_text="FPS PERMISSION REQUIRED",
+                    )
+                    self.failure_ready.emit(detail)
                     return
                 if outcome is _CaptureOutcome.COLLECTOR_FAILED:
                     diagnostics = self.last_capture_diagnostics
@@ -741,18 +743,12 @@ class PresentMonFpsService(QObject):
 
     def _mark_target_has_frames(self, target: FpsTarget) -> None:
         with self._lock:
-            if (
-                self._target is not None
-                and self._target.identity_key == target.identity_key
-            ):
+            if self._target is not None and self._target.identity_key == target.identity_key:
                 self._target_has_frames = True
 
     def _mark_target_stalled(self, target: FpsTarget) -> None:
         with self._lock:
-            if (
-                self._target is not None
-                and self._target.identity_key == target.identity_key
-            ):
+            if self._target is not None and self._target.identity_key == target.identity_key:
                 self._target_has_frames = False
 
     def _selector_for_target(self, target: FpsTarget) -> FpsStreamSelector:
@@ -768,9 +764,7 @@ class PresentMonFpsService(QObject):
             try:
                 discovered = self._candidate_provider()
             except Exception:
-                _LOGGER.exception(
-                    "FPS candidate discovery failed; using foreground seed target"
-                )
+                _LOGGER.exception("FPS candidate discovery failed; using foreground seed target")
         ordered: list[FpsTarget] = []
         seen_pids: set[int] = set()
         for candidate in (
@@ -811,9 +805,7 @@ class PresentMonFpsService(QObject):
         with self._lock:
             if generation != self._generation:
                 return
-        self.metric_ready.emit(
-            FpsMetricUpdate(_unavailable_fps_metric((), secondary_text), target)
-        )
+        self.metric_ready.emit(FpsMetricUpdate(_unavailable_fps_metric((), secondary_text), target))
 
     def _complete_capture(
         self,
@@ -896,6 +888,8 @@ class PresentMonFpsService(QObject):
                 exit_code = process.poll()
                 if saw_usable_frame:
                     outcome = _CaptureOutcome.COMPLETED_WITH_FRAMES
+                elif _presentmon_permission_required(stderr_tail):
+                    outcome = _CaptureOutcome.PERMISSION_REQUIRED
                 elif exit_code not in {None, 0}:
                     outcome = _CaptureOutcome.COLLECTOR_FAILED
                 else:
@@ -910,6 +904,9 @@ class PresentMonFpsService(QObject):
                     last_frame_at = time.monotonic()
                     selector.ingest(frame, observed_at=last_frame_at)
             now = time.monotonic()
+            if not saw_usable_frame and _presentmon_permission_required(stderr_tail):
+                outcome = _CaptureOutcome.PERMISSION_REQUIRED
+                break
             overlay_visible = self._overlay_is_visible()
             if not saw_usable_frame:
                 if overlay_visible:
@@ -943,6 +940,8 @@ class PresentMonFpsService(QObject):
                 exit_code = process.poll()
                 if saw_usable_frame:
                     outcome = _CaptureOutcome.COMPLETED_WITH_FRAMES
+                elif _presentmon_permission_required(stderr_tail):
+                    outcome = _CaptureOutcome.PERMISSION_REQUIRED
                 elif exit_code not in {None, 0}:
                     outcome = _CaptureOutcome.COLLECTOR_FAILED
                 else:
@@ -951,7 +950,11 @@ class PresentMonFpsService(QObject):
         exit_code_before_stop = process.poll()
         if outcome is _CaptureOutcome.CANCELLED:
             stop_event.set()
-        elif outcome in {_CaptureOutcome.NO_FRAMES, _CaptureOutcome.STALLED}:
+        elif outcome in {
+            _CaptureOutcome.NO_FRAMES,
+            _CaptureOutcome.PERMISSION_REQUIRED,
+            _CaptureOutcome.STALLED,
+        }:
             _terminate_process(process)
         reader.join(timeout=1.0)
         if stderr_reader is not None:
@@ -961,11 +964,13 @@ class PresentMonFpsService(QObject):
             exit_code=exit_code_before_stop,
             stderr_tail=tuple(stderr_tail),
         )
+        if (
+            outcome in {_CaptureOutcome.NO_FRAMES, _CaptureOutcome.COLLECTOR_FAILED}
+            and diagnostics.permission_required
+        ):
+            outcome = _CaptureOutcome.PERMISSION_REQUIRED
         with self._lock:
-            if (
-                self._target is not None
-                and self._target.identity_key == target.identity_key
-            ):
+            if self._target is not None and self._target.identity_key == target.identity_key:
                 self._last_capture_diagnostics = diagnostics
         return outcome
 
@@ -978,6 +983,7 @@ class UnavailableFpsService(QObject):
     """No-op FPS service for unsupported platforms."""
 
     metric_ready = Signal(object)
+    failure_ready = Signal(str)
 
     def start(self) -> None:
         return
@@ -1052,9 +1058,7 @@ def _read_lines(
             try:
                 output.put(line, timeout=0.1)
             except queue.Full:
-                _LOGGER.warning(
-                    "FPS broker line queue overflow; dropping one PresentMon row"
-                )
+                _LOGGER.warning("FPS broker line queue overflow; dropping one PresentMon row")
     finally:
         with suppress(queue.Full):
             output.put_nowait(None)
@@ -1071,6 +1075,19 @@ def _read_stderr_lines(
         stripped = line.strip()
         if stripped:
             output.append(stripped[:_STDERR_LINE_LIMIT])
+
+
+def _presentmon_permission_required(stderr_lines: Sequence[str]) -> bool:
+    """Recognize PresentMon's system-wide ETW privilege failure."""
+
+    folded = "\n".join(stderr_lines).casefold()
+    return bool(
+        "performance log users" in folded
+        or "requires elevated privilege" in folded
+        or "failed to start trace session: access denied" in folded
+        or "failed to start trace session: access is denied" in folded
+        or ("trace session" in folded and "access denied" in folded)
+    )
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:

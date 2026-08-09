@@ -39,12 +39,8 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
             items=(
                 WidgetItemDefinition("cpu", "CPU", "CPU utilization.", "computer"),
                 WidgetItemDefinition("gpu", "GPU", "GPU utilization.", "computer"),
-                WidgetItemDefinition(
-                    "vram", "VRAM", "Video memory utilization.", "computer"
-                ),
-                WidgetItemDefinition(
-                    "ram", "RAM", "System memory utilization.", "computer"
-                ),
+                WidgetItemDefinition("vram", "VRAM", "Video memory utilization.", "computer"),
+                WidgetItemDefinition("ram", "RAM", "System memory utilization.", "computer"),
                 WidgetItemDefinition("fps", "FPS", "Current frame rate.", "computer"),
             ),
             view_kind=WidgetViewKind.PERFORMANCE,
@@ -220,9 +216,9 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
                 ),
                 WidgetItemDefinition(
                     "allow_mouse_navigation_while_controller_connected",
-                    "Allow mouse navigation in Vigil while a controller is connected",
-                    "Use a physical or controller-mapped mouse inside Vigil. When off, "
-                    "Vigil uses native controller navigation. Background Raw Input/XInput "
+                    "Switch to mouse",
+                    "Use a physical or controller-mapped mouse inside Vigil. Switch this "
+                    "off to return navigation to the controller. Background Raw Input/XInput "
                     "consumers may still observe the controller.",
                     "controls",
                 ),
@@ -242,7 +238,8 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
                     "run_in_background",
                     "Run in background",
                     "Keep Vigil resident after the overlay is hidden so it can be "
-                    "restored quickly.",
+                    "restored by the tray, hotkey, or Home/Guide button. When off, hiding "
+                    "exits Vigil, so those controls cannot reopen it.",
                     "overlay",
                 ),
                 WidgetItemDefinition(

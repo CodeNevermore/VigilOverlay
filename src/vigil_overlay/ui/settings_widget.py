@@ -6,9 +6,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -21,16 +22,19 @@ from PySide6.QtWidgets import (
 )
 
 from vigil_overlay.core.controller_shortcuts import ControllerShortcutBinding
-from vigil_overlay.core.hotkeys import parse_hotkey_combination
+from vigil_overlay.core.hotkeys import (
+    SUPPORTED_HOTKEY_PRIMARY_KEYS,
+    parse_hotkey_combination,
+)
 from vigil_overlay.ui.controls import VigilToggleSwitch
-from vigil_overlay.ui.modal_guard import ModalActivationGuard, ModalInputSource
+from vigil_overlay.ui.dialog_surface import ControllerVigilDialog
+from vigil_overlay.ui.modal_guard import ModalInputSource
 from vigil_overlay.widgets.registry import WidgetDefinition, WidgetItemDefinition
 
 HotkeyChangeCallback = Callable[[str], tuple[bool, str]]
 HotkeyCaptureCallback = Callable[[bool], None]
-ControllerShortcutChangeCallback = Callable[
-    [ControllerShortcutBinding], tuple[bool, str]
-]
+HotkeyProbeCallback = Callable[[str], tuple[bool, str]]
+ControllerShortcutChangeCallback = Callable[[ControllerShortcutBinding], tuple[bool, str]]
 ControllerShortcutCaptureCallback = Callable[[bool], None]
 
 
@@ -100,8 +104,7 @@ def describe_hotkey_failure(
     elif "could not save the global hotkey" in folded:
         kind = HotkeyFailureKind.SAVE_FAILED
         explanation = (
-            "Vigil could not save the shortcut setting. The incomplete change was "
-            "rolled back."
+            "Vigil could not save the shortcut setting. The incomplete change was rolled back."
         )
     elif any(
         marker in folded
@@ -121,9 +124,7 @@ def describe_hotkey_failure(
         )
     else:
         kind = HotkeyFailureKind.INVALID
-        explanation = (
-            f"{normalized_detail.rstrip('.') or 'The selected combination is invalid'}."
-        )
+        explanation = f"{normalized_detail.rstrip('.') or 'The selected combination is invalid'}."
 
     if "previous hotkey also could not be restored" in folded:
         explanation += (
@@ -132,8 +133,7 @@ def describe_hotkey_failure(
         )
     elif "previous hotkey" in folded and "was restored" in folded:
         explanation += (
-            f" Your previous shortcut {current_combination} was restored and remains "
-            "active."
+            f" Your previous shortcut {current_combination} was restored and remains active."
         )
     else:
         explanation += f" Your saved shortcut {current_combination} was not changed."
@@ -141,7 +141,7 @@ def describe_hotkey_failure(
     return HotkeyFailureMessage(kind, heading, explanation)
 
 
-class HotkeyFailureDialog(QDialog):
+class HotkeyFailureDialog(ControllerVigilDialog):
     """Controller-safe explanation and retry prompt for a failed hotkey change."""
 
     def __init__(
@@ -151,148 +151,115 @@ class HotkeyFailureDialog(QDialog):
         detail: str,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__("Global hotkey problem", parent, width=480)
         self.setObjectName("hotkeyFailureDialog")
-        self.setWindowTitle("Global hotkey problem")
-        self.setModal(True)
-        self.setMinimumWidth(480)
         self.message = describe_hotkey_failure(
             candidate,
             current_combination,
             detail,
         )
-        self._guard = ModalActivationGuard(self)
-        self._controller_index = 0
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(12)
-
-        heading = QLabel(self.message.heading, self)
-        heading.setObjectName("hotkeyEditorTitle")
-        heading.setWordWrap(True)
-        layout.addWidget(heading)
-
-        self.explanation_label = QLabel(self.message.explanation, self)
-        self.explanation_label.setObjectName("hotkeyEditorHelp")
-        self.explanation_label.setWordWrap(True)
-        layout.addWidget(self.explanation_label)
+        self.add_title(self.message.heading)
+        self.explanation_label = self.add_message(self.message.explanation)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Retry
-            | QDialogButtonBox.StandardButton.Cancel,
-            parent=self,
+            QDialogButtonBox.StandardButton.Retry | QDialogButtonBox.StandardButton.Cancel,
+            parent=self.surface,
         )
-        buttons.setObjectName("hotkeyEditorButtons")
+        buttons.setObjectName("vigilDialogButtons")
         retry_button = buttons.button(QDialogButtonBox.StandardButton.Retry)
         cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
         if retry_button is None or cancel_button is None:
             raise RuntimeError("hotkey failure dialog buttons could not be created")
         retry_button.setText("Try Again")
+        self.style_button(retry_button, kind="primary")
+        self.style_button(cancel_button)
         retry_button.clicked.connect(self.accept)
         cancel_button.clicked.connect(self.reject)
-        layout.addWidget(buttons)
-        self._controller_buttons = [retry_button, cancel_button]
-
-    def begin_controller_ownership(self, source: ModalInputSource) -> None:
-        self._guard.begin(source)
-        self._sync_controller_focus()
-
-    def notify_controller_activation_released(self) -> None:
-        self._guard.note_controller_activation_released()
-
-    def handle_controller_command(self, command: object) -> bool:
-        value = getattr(command, "value", command)
-        if value in {"move_left", "move_up"}:
-            self._controller_index = (self._controller_index - 1) % len(
-                self._controller_buttons
-            )
-            self._sync_controller_focus()
-            return True
-        if value in {"move_right", "move_down"}:
-            self._controller_index = (self._controller_index + 1) % len(
-                self._controller_buttons
-            )
-            self._sync_controller_focus()
-            return True
-        if value == "back":
-            self.reject()
-            return True
-        if value == "activate":
-            if self._guard.accepts_activation():
-                self._controller_buttons[self._controller_index].click()
-            return True
-        return True
-
-    def _sync_controller_focus(self) -> None:
-        self._controller_buttons[self._controller_index].setFocus(
-            Qt.FocusReason.OtherFocusReason
-        )
+        self.content_layout.addWidget(buttons)
+        self.set_controller_buttons((retry_button, cancel_button))
 
 
-class HotkeyEditorDialog(QDialog):
+class HotkeyEditorDialog(ControllerVigilDialog):
     """Modal editor that validates one conservative global hotkey combination."""
 
     def __init__(
         self,
         current_combination: str,
         apply_callback: HotkeyChangeCallback,
+        probe_callback: HotkeyProbeCallback | None = None,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__("Global hotkey", parent, width=480)
         self.setObjectName("hotkeyEditorDialog")
-        self.setWindowTitle("Global hotkey")
-        self.setModal(True)
-        self.setMinimumWidth(480)
         self._apply_callback = apply_callback
+        self._probe_callback = probe_callback
         self._combination = current_combination
-        self._guard = ModalActivationGuard(self)
-        self._controller_buttons: list[QPushButton] = []
-        self._controller_index = 0
         self._failure_dialog: HotkeyFailureDialog | None = None
         self._controller_activation_in_progress = False
+        self._candidate_available = probe_callback is None
+        self._validated_candidate: str | None = None
+        self._picker_sync_active = False
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(12)
-
-        title = QLabel("Change global hotkey", self)
-        title.setObjectName("hotkeyEditorTitle")
-        layout.addWidget(title)
-
-        help_label = QLabel(
+        layout = self.content_layout
+        self.add_title("Change global hotkey")
+        self.add_message(
             "Press the modifier and key combination you want to use. "
-            "Vigil requires at least one modifier key.",
-            self,
+            "Vigil requires at least one modifier key."
         )
-        help_label.setObjectName("hotkeyEditorHelp")
-        help_label.setWordWrap(True)
-        layout.addWidget(help_label)
 
         self.sequence_edit = QKeySequenceEdit(QKeySequence(current_combination), self)
         self.sequence_edit.setObjectName("hotkeySequenceEdit")
         self.sequence_edit.setMaximumSequenceLength(1)
         layout.addWidget(self.sequence_edit)
 
-        self.error_label = QLabel("", self)
-        self.error_label.setObjectName("hotkeyEditorError")
-        self.error_label.setWordWrap(True)
+        self.add_detail(
+            "If Windows or another app consumes the chord, choose its modifiers and "
+            "primary key here instead."
+        )
+
+        picker_row = QHBoxLayout()
+        picker_row.setSpacing(8)
+        parsed_current = parse_hotkey_combination(current_combination)
+        self.modifier_buttons: dict[str, QPushButton] = {}
+        for modifier in ("Ctrl", "Alt", "Shift", "Win"):
+            button = QPushButton(modifier, self)
+            button.setObjectName(f"hotkeyModifier{modifier}")
+            button.setCheckable(True)
+            button.setChecked(modifier in parsed_current.modifiers)
+            button.setAccessibleName(f"{modifier} modifier")
+            picker_row.addWidget(button)
+            self.modifier_buttons[modifier] = button
+        self.primary_key_picker = QComboBox(self)
+        self.primary_key_picker.setObjectName("hotkeyPrimaryKeyPicker")
+        self.primary_key_picker.setAccessibleName("Global hotkey primary key")
+        self.primary_key_picker.addItems(list(SUPPORTED_HOTKEY_PRIMARY_KEYS))
+        self.primary_key_picker.setCurrentText(parsed_current.key)
+        picker_row.addWidget(self.primary_key_picker, 1)
+        layout.addLayout(picker_row)
+
+        self.error_label = self.add_error()
         self.error_label.hide()
-        layout.addWidget(self.error_label)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel,
-            parent=self,
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
+            parent=self.surface,
         )
-        buttons.setObjectName("hotkeyEditorButtons")
+        buttons.setObjectName("vigilDialogButtons")
         save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
-        if save_button is not None:
-            save_button.setText("Apply")
+        if save_button is None:
+            raise RuntimeError("hotkey editor Apply button could not be created")
+        self._save_button = save_button
+        self._save_button.setText("Apply")
+        self._save_button.setEnabled(self._candidate_available)
+        self.style_button(self._save_button, kind="primary")
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_button is not None:
+            self.style_button(cancel_button)
         buttons.accepted.connect(self._apply)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        self._controller_buttons = [
+        controller_buttons = [
             button
             for button in (
                 buttons.button(QDialogButtonBox.StandardButton.Save),
@@ -300,65 +267,120 @@ class HotkeyEditorDialog(QDialog):
             )
             if button is not None
         ]
-
-    def begin_controller_ownership(self, source: ModalInputSource) -> None:
-        self._guard.begin(source)
-        self._sync_controller_focus()
+        self.set_controller_buttons(controller_buttons)
+        self.sequence_edit.keySequenceChanged.connect(self._on_sequence_changed)
+        for button in self.modifier_buttons.values():
+            button.toggled.connect(self._on_picker_changed)
+        self.primary_key_picker.currentTextChanged.connect(self._on_picker_changed)
 
     def notify_controller_activation_released(self) -> None:
         if self._failure_dialog is not None:
             self._failure_dialog.notify_controller_activation_released()
             return
-        self._guard.note_controller_activation_released()
+        super().notify_controller_activation_released()
 
     def handle_controller_command(self, command: object) -> bool:
         if self._failure_dialog is not None:
             return self._failure_dialog.handle_controller_command(command)
-        value = getattr(command, "value", command)
-        if value in {"move_left", "move_up"}:
-            self._controller_index = (self._controller_index - 1) % len(
-                self._controller_buttons
-            )
-            self._sync_controller_focus()
-            return True
-        if value in {"move_right", "move_down"}:
-            self._controller_index = (self._controller_index + 1) % len(
-                self._controller_buttons
-            )
-            self._sync_controller_focus()
-            return True
-        if value == "back":
-            self.reject()
-            return True
-        if value == "activate":
-            if self._guard.accepts_activation():
-                self._controller_activation_in_progress = True
-                try:
-                    self._controller_buttons[self._controller_index].click()
-                finally:
-                    self._controller_activation_in_progress = False
-            return True
-        return True
+        return super().handle_controller_command(command)
 
-    def _sync_controller_focus(self) -> None:
-        if not self._controller_buttons:
-            return
-        self._controller_buttons[self._controller_index].setFocus(
-            Qt.FocusReason.OtherFocusReason
-        )
+    def activate_controller_selection(self) -> None:
+        self._controller_activation_in_progress = True
+        try:
+            super().activate_controller_selection()
+        finally:
+            self._controller_activation_in_progress = False
 
     @property
     def combination(self) -> str:
         return self._combination
 
+    def begin_availability_checks(self) -> None:
+        """Validate the displayed candidate after the active registration is released."""
+
+        self._validate_candidate(show_failure=True)
+
+    def _on_sequence_changed(self, _sequence: QKeySequence) -> None:
+        if self._picker_sync_active:
+            return
+        candidate = self._candidate_text()
+        try:
+            parsed = parse_hotkey_combination(candidate)
+        except ValueError:
+            self._validate_candidate(
+                show_failure=self._probe_callback is not None and bool(candidate.strip())
+            )
+            return
+        self._picker_sync_active = True
+        try:
+            for modifier, button in self.modifier_buttons.items():
+                button.setChecked(modifier in parsed.modifiers)
+            self.primary_key_picker.setCurrentText(parsed.key)
+        finally:
+            self._picker_sync_active = False
+        self._validate_candidate(show_failure=self._probe_callback is not None)
+
+    def _on_picker_changed(self, _value: object = None) -> None:
+        if self._picker_sync_active:
+            return
+        modifiers = [
+            modifier
+            for modifier in ("Ctrl", "Alt", "Shift", "Win")
+            if self.modifier_buttons[modifier].isChecked()
+        ]
+        candidate = "+".join((*modifiers, self.primary_key_picker.currentText()))
+        self._picker_sync_active = True
+        try:
+            self.sequence_edit.setKeySequence(QKeySequence(candidate))
+        finally:
+            self._picker_sync_active = False
+        self._validate_candidate(show_failure=self._probe_callback is not None)
+
+    def _candidate_text(self) -> str:
+        return self.sequence_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
+
+    def _validate_candidate(self, *, show_failure: bool) -> bool:
+        candidate = self._candidate_text()
+        self._candidate_available = False
+        self._validated_candidate = None
+        self._save_button.setEnabled(False)
+        try:
+            canonical = parse_hotkey_combination(candidate).canonical
+        except ValueError as exc:
+            detail = str(exc)
+            self.error_label.setText(detail)
+            self.error_label.show()
+            folded = detail.casefold()
+            if show_failure and "missing its primary key" not in folded:
+                self._show_failure(candidate, detail)
+            return False
+
+        if self._probe_callback is not None:
+            available, detail = self._probe_callback(canonical)
+            if not available:
+                self.error_label.setText(detail)
+                self.error_label.show()
+                if show_failure:
+                    self._show_failure(canonical, detail)
+                return False
+
+        self._candidate_available = True
+        self._validated_candidate = canonical
+        self._save_button.setEnabled(True)
+        self.error_label.hide()
+        return True
+
     def _apply(self) -> None:
-        candidate = self.sequence_edit.keySequence().toString(
-            QKeySequence.SequenceFormat.PortableText
-        )
+        candidate = self._candidate_text()
         try:
             canonical = parse_hotkey_combination(candidate).canonical
         except ValueError as exc:
             self._show_failure(candidate, str(exc))
+            return
+
+        if (
+            not self._candidate_available or self._validated_candidate != canonical
+        ) and not self._validate_candidate(show_failure=True):
             return
 
         success, detail = self._apply_callback(canonical)
@@ -400,7 +422,7 @@ class HotkeyEditorDialog(QDialog):
         self.sequence_edit.setFocus(Qt.FocusReason.OtherFocusReason)
 
 
-class ControllerShortcutEditorDialog(QDialog):
+class ControllerShortcutEditorDialog(ControllerVigilDialog):
     """Neutral-gated physical controller capture with controller-owned review."""
 
     def __init__(
@@ -410,38 +432,22 @@ class ControllerShortcutEditorDialog(QDialog):
         capture_callback: ControllerShortcutCaptureCallback,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__("Controller shortcut", parent, width=480)
         self.setObjectName("controllerShortcutEditorDialog")
-        self.setWindowTitle("Controller shortcut")
-        self.setModal(True)
-        self.setMinimumWidth(480)
         self._binding = current_binding
         self._apply_callback = apply_callback
         self._capture_callback = capture_callback
-        self._guard = ModalActivationGuard(self)
         self._review_buttons: list[QPushButton] = []
-        self._review_index = 0
         self._listening = True
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(12)
-        title = QLabel("Capture controller shortcut", self)
-        title.setObjectName("hotkeyEditorTitle")
-        layout.addWidget(title)
-        self._status = QLabel(
-            "Release all controls, then press the button or combination you want.",
-            self,
+        layout = self.content_layout
+        self.add_title("Capture controller shortcut")
+        self._status = self.add_message(
+            "Release all controls, then press the button or combination you want."
         )
-        self._status.setWordWrap(True)
-        layout.addWidget(self._status)
-        self._captured = QLabel("Waiting for controller input…", self)
-        self._captured.setObjectName("settingsRowTrailing")
-        layout.addWidget(self._captured)
-        self._error = QLabel("", self)
-        self._error.setWordWrap(True)
+        self._captured = self.add_detail("Waiting for controller input…")
+        self._error = self.add_error()
         self._error.hide()
-        layout.addWidget(self._error)
 
         row = QHBoxLayout()
         apply_button = QPushButton("Apply", self)
@@ -455,20 +461,21 @@ class ControllerShortcutEditorDialog(QDialog):
         row.addWidget(cancel_button)
         layout.addLayout(row)
         self._review_buttons = [apply_button, retry_button, cancel_button]
+        self.style_button(apply_button, kind="primary")
+        self.style_button(retry_button)
+        self.style_button(cancel_button)
         for button in self._review_buttons:
             button.setEnabled(False)
         cancel_button.setEnabled(True)
+        self.set_controller_buttons(self._review_buttons)
 
     @property
     def binding(self) -> ControllerShortcutBinding:
         return self._binding
 
     def begin_controller_ownership(self, source: ModalInputSource) -> None:
-        self._guard.begin(source)
+        super().begin_controller_ownership(source)
         self._capture_callback(True)
-
-    def notify_controller_activation_released(self) -> None:
-        self._guard.note_controller_activation_released()
 
     def set_captured_binding(self, binding: ControllerShortcutBinding) -> None:
         self._binding = binding
@@ -477,37 +484,19 @@ class ControllerShortcutEditorDialog(QDialog):
         self._status.setText("Review the detected shortcut, then Apply or Retry.")
         for button in self._review_buttons:
             button.setEnabled(True)
-        self._review_index = 0
         self._guard.begin(ModalInputSource.UNKNOWN)
-        self._sync_focus()
+        self.set_controller_buttons(self._review_buttons)
 
     def handle_controller_command(self, command: object) -> bool:
         value = getattr(command, "value", command)
         if self._listening:
             return True
-        if value in {"move_left", "move_up"}:
-            self._review_index = (self._review_index - 1) % len(self._review_buttons)
-            self._sync_focus()
-            return True
-        if value in {"move_right", "move_down"}:
-            self._review_index = (self._review_index + 1) % len(self._review_buttons)
-            self._sync_focus()
-            return True
-        if value == "back":
-            self.reject()
-            return True
-        if value == "activate":
-            if self._guard.accepts_activation():
-                self._review_buttons[self._review_index].click()
-            return True
-        return True
+        return super().handle_controller_command(value)
 
     def _retry(self) -> None:
         self._listening = True
         self._captured.setText("Waiting for controller input…")
-        self._status.setText(
-            "Release all controls, then press the button or combination you want."
-        )
+        self._status.setText("Release all controls, then press the button or combination you want.")
         self._error.hide()
         for button in self._review_buttons:
             button.setEnabled(False)
@@ -521,11 +510,6 @@ class ControllerShortcutEditorDialog(QDialog):
             return
         self._error.setText(detail)
         self._error.show()
-
-    def _sync_focus(self) -> None:
-        self._review_buttons[self._review_index].setFocus(
-            Qt.FocusReason.OtherFocusReason
-        )
 
 
 class SettingsToggleSwitch(VigilToggleSwitch):
@@ -579,9 +563,7 @@ class SettingsRowButton(QPushButton):
         elif trailing_text is not None:
             self.trailing_label = QLabel(trailing_text, self)
             self.trailing_label.setObjectName("settingsRowTrailing")
-            self.trailing_label.setAttribute(
-                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
-            )
+            self.trailing_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             layout.addWidget(self.trailing_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._title_text = item.label
@@ -640,14 +622,10 @@ class SettingsWidgetView(QWidget):
         self.setProperty("compactPage", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
-        expected = tuple(
-            item_id for section in self._SECTIONS for item_id in section.item_ids
-        )
+        expected = tuple(item_id for section in self._SECTIONS for item_id in section.item_ids)
         actual = tuple(item.item_id for item in definition.items)
         if actual != expected:
-            raise ValueError(
-                "Settings widget item contract does not match section layout"
-            )
+            raise ValueError("Settings widget item contract does not match section layout")
 
         self._buttons: list[QPushButton] = []
         self._buttons_by_item: dict[str, SettingsRowButton] = {}
@@ -656,7 +634,7 @@ class SettingsWidgetView(QWidget):
             controller_shortcut_binding or ControllerShortcutBinding()
         )
         self._active_dialog: (
-            HotkeyEditorDialog | ControllerShortcutEditorDialog | None
+            HotkeyEditorDialog | HotkeyFailureDialog | ControllerShortcutEditorDialog | None
         ) = None
         self._next_input_source = ModalInputSource.UNKNOWN
         self._allow_mouse_navigation_while_controller_connected = (
@@ -688,9 +666,7 @@ class SettingsWidgetView(QWidget):
     def allow_mouse_navigation_while_controller_connected(self) -> bool:
         return self._allow_mouse_navigation_while_controller_connected
 
-    def set_allow_mouse_navigation_while_controller_connected(
-        self, enabled: bool
-    ) -> None:
+    def set_allow_mouse_navigation_while_controller_connected(self, enabled: bool) -> None:
         self._allow_mouse_navigation_while_controller_connected = enabled
         row = self._buttons_by_item["allow_mouse_navigation_while_controller_connected"]
         row.set_toggle_checked(enabled)
@@ -749,9 +725,7 @@ class SettingsWidgetView(QWidget):
             return False
         return dialog.handle_controller_command(command)
 
-    def set_controller_shortcut_binding(
-        self, binding: ControllerShortcutBinding
-    ) -> None:
+    def set_controller_shortcut_binding(self, binding: ControllerShortcutBinding) -> None:
         self._controller_shortcut_binding = binding
         row = self._buttons_by_item["controller_shortcut"]
         if row.trailing_label is not None:
@@ -767,13 +741,20 @@ class SettingsWidgetView(QWidget):
         apply_callback: HotkeyChangeCallback,
         *,
         capture_callback: HotkeyCaptureCallback | None = None,
+        probe_callback: HotkeyProbeCallback | None = None,
     ) -> bool:
-        dialog = HotkeyEditorDialog(self._hotkey_combination, apply_callback, self)
+        dialog = HotkeyEditorDialog(
+            self._hotkey_combination,
+            apply_callback,
+            probe_callback=probe_callback,
+            parent=self,
+        )
         self._active_dialog = dialog
         source = self._consume_input_source()
         dialog.begin_controller_ownership(source)
         if capture_callback is not None:
             capture_callback(True)
+        dialog.begin_availability_checks()
         try:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return False
@@ -783,6 +764,37 @@ class SettingsWidgetView(QWidget):
             self._active_dialog = None
             if capture_callback is not None:
                 capture_callback(False)
+
+    def show_hotkey_failure(
+        self,
+        candidate: str,
+        detail: str,
+        *,
+        retry_callback: Callable[[], None] | None = None,
+    ) -> bool:
+        """Show one non-blocking startup failure prompt owned by Settings."""
+
+        if self._active_dialog is not None:
+            return False
+        dialog = HotkeyFailureDialog(
+            candidate,
+            self._hotkey_combination,
+            detail,
+            self,
+        )
+        self._active_dialog = dialog
+        dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
+
+        def finished(result: int) -> None:
+            if self._active_dialog is dialog:
+                self._active_dialog = None
+            dialog.deleteLater()
+            if result == QDialog.DialogCode.Accepted and retry_callback is not None:
+                QTimer.singleShot(0, retry_callback)
+
+        dialog.finished.connect(finished)
+        dialog.open()
+        return True
 
     def open_controller_shortcut_editor(
         self,
