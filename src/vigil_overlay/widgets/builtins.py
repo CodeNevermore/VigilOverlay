@@ -204,61 +204,62 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
             items=(
                 WidgetItemDefinition(
                     "guide_button",
-                    "Use controller Home/Guide button",
-                    "Allow any exposed controller Home/Guide button to open or close Vigil.",
+                    "Home/Guide button",
+                    "Use Home/Guide to open or close Vigil.",
                     "controls",
                 ),
                 WidgetItemDefinition(
                     "controller_shortcut",
                     "Controller shortcut",
-                    "Capture any exposed button or same-controller combination.",
+                    "Choose a button or same-controller button combination.",
+                    "controls",
+                ),
+                WidgetItemDefinition(
+                    "focus_preserving_controller_isolation",
+                    "Keep the game focused",
+                    "Keep game active while using HidHide.",
                     "controls",
                 ),
                 WidgetItemDefinition(
                     "allow_mouse_navigation_while_controller_connected",
                     "Switch to mouse",
-                    "Use a physical or controller-mapped mouse inside Vigil. Switch this "
-                    "off to return navigation to the controller. Background Raw Input/XInput "
-                    "consumers may still observe the controller.",
+                    "Use mouse navigation in Vigil; switch off to return to controller.",
                     "controls",
                 ),
                 WidgetItemDefinition(
                     "global_hotkey",
                     "Global hotkey",
-                    "Choose the keyboard shortcut for opening or closing Vigil.",
+                    "Choose the keyboard shortcut that opens or closes Vigil.",
                     "controls",
                 ),
                 WidgetItemDefinition(
                     "start_with_windows",
-                    "Start Vigil with Windows",
-                    "Launch Vigil automatically after you sign in to Windows.",
+                    "Start with Windows",
+                    "Open Vigil automatically after signing in to Windows.",
                     "overlay",
                 ),
                 WidgetItemDefinition(
                     "run_in_background",
                     "Run in background",
-                    "Keep Vigil resident after the overlay is hidden so it can be "
-                    "restored by the tray, hotkey, or Home/Guide button. When off, hiding "
-                    "exits Vigil, so those controls cannot reopen it.",
+                    "Keep Vigil running while hidden so tray, hotkey, or Guide can reopen it.",
                     "overlay",
                 ),
                 WidgetItemDefinition(
                     "widgets",
-                    "Manage Widgets",
-                    "Open the Widgets tab to show or restore installed widgets.",
+                    "Manage widgets",
+                    "Open the Widgets tab to show or restore widgets.",
                     "widgets",
                 ),
                 WidgetItemDefinition(
                     "safe_mode",
-                    "Restart in Safe Mode",
-                    "Restart Vigil with temporary default settings and integrations disabled. "
-                    "Your saved settings are not changed.",
+                    "Safe Mode",
+                    "Restart with temporary defaults; saved settings stay unchanged.",
                     "controls",
                 ),
                 WidgetItemDefinition(
                     "reset_window_position",
-                    "Reset Overlay Position",
-                    "Move Vigil to the primary display to recover an off-screen overlay.",
+                    "Reset position",
+                    "Move Vigil to the primary display if the overlay is off-screen.",
                     "controls",
                 ),
             ),

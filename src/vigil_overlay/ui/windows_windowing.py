@@ -38,12 +38,13 @@ class _WindowsMessage(ctypes.Structure):
     ]
 
 
-def overlay_extended_style(current_style: int) -> int:
-    """Return a focusable tool-window style that never clicks through."""
+def overlay_extended_style(current_style: int, *, no_activate: bool = False) -> int:
+    """Return an input-blocking overlay style with explicit focus behavior."""
 
-    return (
-        (current_style | _WS_EX_TOOLWINDOW) & ~_WS_EX_TRANSPARENT & ~_WS_EX_NOACTIVATE
-    )
+    requested = (current_style | _WS_EX_TOOLWINDOW) & ~_WS_EX_TRANSPARENT
+    if no_activate:
+        return requested | _WS_EX_NOACTIVATE
+    return requested & ~_WS_EX_NOACTIVATE
 
 
 def backdrop_extended_style(current_style: int) -> int:
@@ -52,8 +53,12 @@ def backdrop_extended_style(current_style: int) -> int:
     return (current_style | _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE) & ~_WS_EX_TRANSPARENT
 
 
-def configure_native_overlay_window(window_id: int) -> bool:
-    """Remove click-through styles and refresh the native frame on Windows."""
+def configure_native_overlay_window(
+    window_id: int,
+    *,
+    no_activate: bool = False,
+) -> bool:
+    """Apply the selected focus mode and refresh the native frame on Windows."""
 
     if sys.platform != "win32":
         return False
@@ -74,7 +79,7 @@ def configure_native_overlay_window(window_id: int) -> bool:
         _LOGGER.error("Could not read overlay window style: WinError %s", get_error)
         return False
 
-    requested_style = overlay_extended_style(current_style)
+    requested_style = overlay_extended_style(current_style, no_activate=no_activate)
     style_changed = requested_style != current_style
     if style_changed:
         ctypes.set_last_error(0)
@@ -178,14 +183,20 @@ def enforce_native_topmost(window_id: int, *, frame_changed: bool = False) -> bo
     return False
 
 
-def native_overlay_message(message_pointer: int) -> tuple[bool, int] | None:
-    """Force the entire overlay surface to remain a client-area hit target."""
+def native_overlay_message(
+    message_pointer: int,
+    *,
+    no_activate: bool = False,
+) -> tuple[bool, int] | None:
+    """Keep the overlay hit-testable and optionally reject mouse activation."""
 
     if sys.platform != "win32" or not message_pointer:
         return None
     message = ctypes.cast(message_pointer, ctypes.POINTER(_WindowsMessage)).contents
     if message.message == _WM_NCHITTEST:
         return True, _HTCLIENT
+    if no_activate and message.message == _WM_MOUSEACTIVATE:
+        return True, _MA_NOACTIVATE
     return None
 
 

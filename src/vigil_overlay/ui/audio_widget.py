@@ -157,6 +157,8 @@ class AudioWidgetView(QWidget):
 
     items_changed = Signal(object, object)
 
+    _OUTPUT_IDS = frozenset(("output_mute", "output_volume", "output_device"))
+    _INPUT_IDS = frozenset(("input_mute", "input_volume", "input_device"))
     _FIXED_IDS = (
         "output_mute",
         "input_mute",
@@ -256,6 +258,13 @@ class AudioWidgetView(QWidget):
     def activate_item(self, item_id: str) -> bool:
         if not self._snapshot.available:
             return False
+        if (
+            item_id in self._OUTPUT_IDS
+            and not self._snapshot.output_endpoint_available
+        ):
+            return False
+        if item_id in self._INPUT_IDS and not self._snapshot.input_endpoint_available:
+            return False
         if item_id == "output_mute":
             self._runtime.submit("set_output_muted", not self._snapshot.output_muted)
         elif item_id == "input_mute":
@@ -273,6 +282,13 @@ class AudioWidgetView(QWidget):
 
     def adjust_item(self, item_id: str, delta: int) -> bool:
         if not self._snapshot.available or delta == 0:
+            return False
+        if (
+            item_id in self._OUTPUT_IDS
+            and not self._snapshot.output_endpoint_available
+        ):
+            return False
+        if item_id in self._INPUT_IDS and not self._snapshot.input_endpoint_available:
             return False
         amount = _VOLUME_STEP if delta > 0 else -_VOLUME_STEP
         if item_id == "output_volume":
@@ -294,6 +310,13 @@ class AudioWidgetView(QWidget):
 
     def _set_direct_volume(self, item_id: str, percent: int) -> None:
         if not self._snapshot.available:
+            return
+        if (
+            item_id in self._OUTPUT_IDS
+            and not self._snapshot.output_endpoint_available
+        ):
+            return
+        if item_id in self._INPUT_IDS and not self._snapshot.input_endpoint_available:
             return
         if item_id == "output_volume":
             self._runtime.submit("set_output_volume", percent)
@@ -394,6 +417,21 @@ class AudioWidgetView(QWidget):
         self._last_logged_error = None
         for button in self._buttons:
             button.setEnabled(True)
+        for item_id in self._OUTPUT_IDS:
+            self._buttons_by_item[item_id].setEnabled(
+                snapshot.output_endpoint_available
+            )
+        for item_id in self._INPUT_IDS:
+            self._buttons_by_item[item_id].setEnabled(
+                snapshot.input_endpoint_available
+            )
+        if (
+            self._choice_kind == "output"
+            and not snapshot.output_endpoint_available
+        ) or (
+            self._choice_kind == "input" and not snapshot.input_endpoint_available
+        ):
+            self._close_choice_popup()
 
         output_mute = self._buttons_by_item["output_mute"]
         input_mute = self._buttons_by_item["input_mute"]

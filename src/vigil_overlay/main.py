@@ -67,6 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--controller-isolation-watchdog",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -74,6 +79,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Initialize Vigil and return its process exit code."""
 
     args = build_parser().parse_args(argv)
+    if args.controller_isolation_watchdog is not None:
+        paths = ApplicationPaths.discover()
+        from vigil_overlay.services.controller_isolation import (
+            run_controller_isolation_watchdog,
+        )
+
+        return run_controller_isolation_watchdog(
+            args.controller_isolation_watchdog,
+            paths.cache_root,
+            paths.user_data_root,
+        )
     instance_guard = None
     if not args.diagnose:
         instance_guard = create_platform_single_instance_guard()

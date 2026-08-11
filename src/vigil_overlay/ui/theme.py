@@ -82,7 +82,7 @@ QWidget#widgetStripRightOverflowSlot {
     background-color: transparent;
     border: none;
 }
-QLabel[widgetStripOverflowIndicator="true"] {
+QPushButton[widgetStripOverflowIndicator="true"] {
     background-color: transparent;
     border: none;
     padding: 0;
@@ -514,8 +514,11 @@ QPushButton#compactWidgetButton[navigationFocus="true"],
 QPushButton#compactPowerButton[navigationFocus="true"] {
     border-color: #ffffff;
 }
-QLabel[widgetStripOverflowIndicator="true"] {
+QPushButton[widgetStripOverflowIndicator="true"] {
     color: #cdd2d9;
+}
+QPushButton[widgetStripOverflowIndicator="true"]:hover {
+    color: #ffffff;
 }
 QScrollArea#widgetPageScroller {
     background-color: rgba(41, 44, 50, 248);
@@ -840,8 +843,11 @@ QPushButton#compactPowerButton[navigationFocus="true"] {
 QPushButton#compactPowerButton[navigationFocus="true"] {
     border-color: #343a43;
 }
-QLabel[widgetStripOverflowIndicator="true"] {
+QPushButton[widgetStripOverflowIndicator="true"] {
     color: #4f5864;
+}
+QPushButton[widgetStripOverflowIndicator="true"]:hover {
+    color: #171a1f;
 }
 QScrollArea#widgetPageScroller {
     background-color: rgba(224, 227, 232, 248);

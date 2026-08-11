@@ -66,6 +66,7 @@ REQUIRED_THIRD_PARTY_LICENSE_FILES = (
     Path("psutil/LICENSE.txt"),
     Path("PyWinRT/LICENSE.txt"),
     Path("Microsoft.GameInput/LICENSE.txt"),
+    Path("Nefarius.HidHide/LICENSE.txt"),
     Path("PlayniteSDK/LICENSE.txt"),
     Path("Inno_Setup/LICENSE.txt"),
 )

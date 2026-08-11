@@ -460,6 +460,8 @@ class NavigationShell(QWidget):
         visible_widget_ids: tuple[str, ...] | None = None,
         guide_button_enabled: bool = True,
         controller_shortcut_binding: ControllerShortcutBinding | None = None,
+        focus_preserving_controller_isolation_enabled: bool = False,
+        focus_preserving_controller_isolation_available: bool = True,
         allow_mouse_navigation_while_controller_connected: bool = False,
         hotkey_combination: str = "Ctrl+Alt+Shift+G",
         start_with_windows_enabled: bool = False,
@@ -509,6 +511,12 @@ class NavigationShell(QWidget):
         self._guide_button_enabled = guide_button_enabled
         self._controller_shortcut_binding = (
             controller_shortcut_binding or ControllerShortcutBinding()
+        )
+        self._focus_preserving_controller_isolation_enabled = (
+            focus_preserving_controller_isolation_enabled
+        )
+        self._focus_preserving_controller_isolation_available = (
+            focus_preserving_controller_isolation_available
         )
         self._allow_mouse_navigation_while_controller_connected = (
             allow_mouse_navigation_while_controller_connected
@@ -1084,6 +1092,7 @@ class NavigationShell(QWidget):
             "widgetStripLeftOverflowIndicator",
             "\u276e",
             "More widget tabs to the left",
+            -1,
             self._left_overflow_slot,
         )
         left_overflow_layout.addWidget(
@@ -1102,6 +1111,7 @@ class NavigationShell(QWidget):
             "widgetStripRightOverflowIndicator",
             "\u276f",
             "More widget tabs to the right",
+            1,
             self._right_overflow_slot,
         )
         right_overflow_layout.addWidget(
@@ -1170,19 +1180,25 @@ class NavigationShell(QWidget):
         object_name: str,
         label: str,
         accessible_name: str,
+        scroll_slots: int,
         parent: QWidget,
-    ) -> QLabel:
-        indicator = QLabel(label, parent)
+    ) -> QPushButton:
+        indicator = QPushButton(label, parent)
         indicator.setObjectName(object_name)
         indicator.setProperty("widgetStripOverflowIndicator", True)
         indicator.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        indicator.setCursor(Qt.CursorShape.PointingHandCursor)
         indicator.setFixedSize(
             _WIDGET_STRIP_OVERFLOW_INDICATOR_WIDTH,
             _WIDGET_STRIP_BUTTON_SIZE,
         )
         indicator.setAccessibleName(accessible_name)
+        indicator.setToolTip(accessible_name)
+        indicator.clicked.connect(
+            lambda checked=False, slots=scroll_slots: self._strip_scroller.scroll_widget_slots(
+                slots
+            )
+        )
         return indicator
 
     def _update_strip_overflow_indicators(self, *_args: int) -> None:
@@ -1302,6 +1318,12 @@ class NavigationShell(QWidget):
                 self._stack,
                 guide_button_enabled=self._guide_button_enabled,
                 controller_shortcut_binding=self._controller_shortcut_binding,
+                focus_preserving_controller_isolation_enabled=(
+                    self._focus_preserving_controller_isolation_enabled
+                ),
+                focus_preserving_controller_isolation_available=(
+                    self._focus_preserving_controller_isolation_available
+                ),
                 allow_mouse_navigation_while_controller_connected=(
                     self._allow_mouse_navigation_while_controller_connected
                 ),
@@ -1507,6 +1529,18 @@ class NavigationShell(QWidget):
             return
         scroller = self._page_scrollers.get(widget_id)
         if scroller is None:
+            return
+        if selected_index == 0:
+            # The first control is below the page heading and description. Qt's
+            # ensureWidgetVisible would reveal only the control and can leave that
+            # introductory text above the viewport. At the first item, the semantic
+            # controller position is the true beginning of the page.
+            scrollbar = scroller.verticalScrollBar()
+            scrollbar.setValue(scrollbar.minimum())
+            QTimer.singleShot(
+                0,
+                lambda bar=scrollbar: bar.setValue(bar.minimum()),
+            )
             return
         ensure_controller_target_visible(
             scroller,

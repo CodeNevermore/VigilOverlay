@@ -7,11 +7,13 @@ import logging
 import os
 import sys
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, NoReturn, Protocol
 
 _LOGGER = logging.getLogger("vigil_overlay")
 _MAX_MIXER_SESSIONS = 16
+_ENDPOINT_NOT_FOUND_HRESULT = 0x80070490
 
 
 class AudioControlError(RuntimeError):
@@ -43,6 +45,8 @@ class AudioSnapshot:
 
     available: bool
     detail: str
+    output_endpoint_available: bool = True
+    input_endpoint_available: bool = True
     output_volume_percent: int = 0
     output_muted: bool = False
     input_volume_percent: int = 0
@@ -166,32 +170,68 @@ class PycawAudioControlBackend:
 
     def snapshot(self) -> AudioSnapshot:
         try:
-            output = self._audio_utilities.GetSpeakers()
-            capture = self._audio_utilities.GetMicrophone()
             output_devices = self._active_devices(
                 self._constants.EDataFlow.eRender.value
             )
             input_devices = self._active_devices(
                 self._constants.EDataFlow.eCapture.value
             )
-            output_volume = self._endpoint_volume(output)
-            input_volume = self._endpoint_volume(capture)
+            output = self._optional_default_endpoint(
+                self._audio_utilities.GetSpeakers
+            )
+            capture = self._optional_default_endpoint(
+                self._audio_utilities.GetMicrophone
+            )
+            if output is None and capture is None:
+                return AudioSnapshot(
+                    available=False,
+                    detail=(
+                        "No active Windows audio output or input device is available."
+                    ),
+                    output_endpoint_available=False,
+                    input_endpoint_available=False,
+                    output_devices=output_devices,
+                    input_devices=input_devices,
+                )
+
+            output_volume = self._endpoint_volume(output) if output is not None else None
+            input_volume = self._endpoint_volume(capture) if capture is not None else None
+            if output is None:
+                detail = "No active Windows audio output device is available."
+            elif capture is None:
+                detail = "No active Windows microphone is available."
+            else:
+                detail = "Windows Core Audio controls are active."
             return AudioSnapshot(
                 available=True,
-                detail="Windows Core Audio controls are active.",
-                output_volume_percent=_percent(
-                    output_volume.GetMasterVolumeLevelScalar()
+                detail=detail,
+                output_endpoint_available=output is not None,
+                input_endpoint_available=capture is not None,
+                output_volume_percent=(
+                    _percent(output_volume.GetMasterVolumeLevelScalar())
+                    if output_volume is not None
+                    else 0
                 ),
-                output_muted=bool(output_volume.GetMute()),
-                input_volume_percent=_percent(
-                    input_volume.GetMasterVolumeLevelScalar()
+                output_muted=(
+                    bool(output_volume.GetMute()) if output_volume is not None else False
                 ),
-                input_muted=bool(input_volume.GetMute()),
-                default_output_device_id=self._device_id(output),
-                default_input_device_id=self._device_id(capture),
+                input_volume_percent=(
+                    _percent(input_volume.GetMasterVolumeLevelScalar())
+                    if input_volume is not None
+                    else 0
+                ),
+                input_muted=(
+                    bool(input_volume.GetMute()) if input_volume is not None else False
+                ),
+                default_output_device_id=(
+                    self._device_id(output) if output is not None else None
+                ),
+                default_input_device_id=(
+                    self._device_id(capture) if capture is not None else None
+                ),
                 output_devices=output_devices,
                 input_devices=input_devices,
-                sessions=self._sessions(),
+                sessions=self._sessions() if output is not None else (),
             )
         except Exception as exc:
             raise AudioControlError(
@@ -262,6 +302,17 @@ class PycawAudioControlBackend:
         ]
         resolved.sort(key=lambda item: item.name.casefold())
         return tuple(resolved)
+
+    @staticmethod
+    def _optional_default_endpoint(getter: Callable[[], Any]) -> Any | None:
+        """Return no endpoint only for Windows' documented no-device result."""
+
+        try:
+            return getter()
+        except Exception as exc:
+            if _is_endpoint_not_found(exc):
+                return None
+            raise
 
     def _sessions(self) -> tuple[AudioSessionInfo, ...]:
         grouped: dict[str, AudioSessionInfo] = {}
@@ -413,6 +464,20 @@ def _session_key(session: Any) -> str:
     if instance:
         return f"session:{instance}"
     return "session:system-sounds"
+
+
+def _is_endpoint_not_found(exc: BaseException) -> bool:
+    """Recognize HRESULT_FROM_WIN32(ERROR_NOT_FOUND) from Core Audio."""
+
+    hresult = getattr(exc, "hresult", None)
+    if not isinstance(hresult, int) and exc.args:
+        first_arg = exc.args[0]
+        if isinstance(first_arg, int):
+            hresult = first_arg
+    return (
+        isinstance(hresult, int)
+        and hresult & 0xFFFFFFFF == _ENDPOINT_NOT_FOUND_HRESULT
+    )
 
 
 def _friendly_process_name(name: str) -> str:

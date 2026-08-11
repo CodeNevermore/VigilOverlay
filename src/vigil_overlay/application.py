@@ -18,7 +18,11 @@ from vigil_overlay.core.background import (
     background_recovery_available,
     background_residency_available,
 )
-from vigil_overlay.core.config import AppConfig, save_config
+from vigil_overlay.core.config import (
+    AppConfig,
+    apply_controller_isolation_install_default,
+    save_config,
+)
 from vigil_overlay.core.controller_shortcuts import ControllerShortcutBinding
 from vigil_overlay.core.errors import VigilOverlayError
 from vigil_overlay.core.hotkeys import parse_hotkey_combination
@@ -35,6 +39,11 @@ from vigil_overlay.providers.builtins import create_builtin_game_provider_regist
 from vigil_overlay.services.controller import (
     ControllerInputService,
     create_platform_controller_service,
+)
+from vigil_overlay.services.controller_isolation import (
+    ControllerIsolationService,
+    consume_fresh_hidhide_install_marker,
+    create_platform_controller_isolation_service,
 )
 from vigil_overlay.services.controller_shortcuts import ControllerShortcutService
 from vigil_overlay.services.foreground_ownership import (
@@ -135,6 +144,7 @@ class VigilApplication:
         power_control_service: PowerControlService | None = None,
         guide_button_service: GuideButtonInputService | None = None,
         controller_input_ownership_service: (ControllerInputOwnershipService | None) = None,
+        controller_isolation_service: ControllerIsolationService | None = None,
         input_containment_service: InputContainmentService | None = None,
         foreground_ownership_service: ForegroundOwnershipService | None = None,
         foreground_clock: Callable[[], float] = time.monotonic,
@@ -218,6 +228,17 @@ class VigilApplication:
             controller_input_ownership_service
             or create_platform_controller_input_ownership_service()
         )
+        self._controller_isolation_service = (
+            controller_isolation_service
+            or create_platform_controller_isolation_service(
+                self._application_paths.cache_root,
+                self._application_paths.user_data_root,
+            )
+        )
+        self._focus_preserving_input_active = False
+        self._controller_isolation_health_timer = QTimer()
+        self._controller_isolation_health_timer.setInterval(500)
+        self._controller_isolation_health_timer.timeout.connect(self._maintain_controller_isolation)
         self._input_containment_service = (
             input_containment_service or create_platform_input_containment_service()
         )
@@ -296,6 +317,9 @@ class VigilApplication:
             hotkey_probe_callback=self._probe_global_hotkey,
             controller_shortcut_change_callback=self._change_controller_shortcut,
             controller_shortcut_capture_callback=(self._set_controller_shortcut_capture_active),
+            controller_isolation_change_callback=(
+                None if safe_mode else self._change_controller_isolation
+            ),
             power_capabilities_callback=self._power_control_service.capabilities,
             power_action_callback=self._power_control_service.execute,
             startup_change_callback=self._change_start_with_windows,
@@ -372,12 +396,16 @@ class VigilApplication:
 
         return InputControlDiagnostics(
             mode=self._input_policy.mode,
-            foreground_verification_required=self._foreground_ownership_service.required,
+            foreground_verification_required=(
+                self._foreground_ownership_service.required
+                and not self._focus_preserving_input_active
+            ),
             foreground_verification_supported=self._foreground_ownership_service.supported,
             foreground_verified=self._foreground_verified,
             gameinput_exclusivity_active=self._controller_input_ownership_service.active,
             mouse_keyboard_containment_supported=self._input_containment_service.supported,
             mouse_keyboard_containment_active=self._input_containment_service.active,
+            xinput_isolation_available=self._focus_preserving_input_active,
         )
 
     def _save_config(self, config: AppConfig) -> None:
@@ -509,6 +537,46 @@ class VigilApplication:
         elif not self._config.controller.guide_button_enabled:
             self._guide_button_service.deactivate()
         return True, f"Controller shortcut changed to {binding.display_label}."
+
+    def _change_controller_isolation(self, enabled: bool) -> tuple[bool, str]:
+        """Persist an explicit choice only after HidHide proves a safe setup."""
+
+        if self._read_only_config:
+            return (
+                False,
+                "Safe mode is read-only; controller isolation cannot change.",
+            )
+        if enabled:
+            if self._config.controller.allow_mouse_navigation_while_controller_connected:
+                return (
+                    False,
+                    "Switch to mouse must be off before controller isolation can be enabled.",
+                )
+            readiness = self._controller_isolation_service.readiness()
+            if not readiness.ready:
+                return False, f"Controller isolation is not ready: {readiness.detail}"
+
+        previous = self._config.controller.focus_preserving_controller_isolation_enabled
+        previous_initialized = (
+            self._config.controller.focus_preserving_controller_isolation_preference_initialized
+        )
+        self._config.controller.focus_preserving_controller_isolation_enabled = enabled
+        self._config.controller.focus_preserving_controller_isolation_preference_initialized = True
+        try:
+            self._save_config(self._config)
+        except (OSError, VigilOverlayError) as exc:
+            self._config.controller.focus_preserving_controller_isolation_enabled = previous
+            self._config.controller.focus_preserving_controller_isolation_preference_initialized = (
+                previous_initialized
+            )
+            return False, f"Could not save controller isolation: {exc}"
+
+        if enabled:
+            return (
+                True,
+                "Controller isolation enabled. Close and reopen Vigil to keep the game focused.",
+            )
+        return True, "Controller isolation disabled for the next overlay opening."
 
     def _change_start_with_windows(self, enabled: bool) -> tuple[bool, str]:
         if self._read_only_config:
@@ -748,7 +816,11 @@ class VigilApplication:
         self._controller_commands_ready = True
 
     def _handle_mouse_navigation_preference_changed(self, enabled: bool) -> None:
-        del enabled
+        if enabled and self._focus_preserving_input_active:
+            self._release_visible_input_control("mouse navigation requested")
+            self.window.show_overlay(preserve_foreground=False)
+            self._begin_foreground_input_lease()
+            return
         self._sync_input_policy()
 
     def _handle_overlay_hidden(self) -> None:
@@ -767,6 +839,7 @@ class VigilApplication:
         visible = self.window.isVisible() if overlay_visible is None else overlay_visible
         if (
             visible
+            and not self._focus_preserving_input_active
             and self._foreground_ownership_service.required
             and not self._foreground_verified
         ):
@@ -805,14 +878,29 @@ class VigilApplication:
     def _apply_runtime_input_policy(self, policy: OverlayInputPolicy) -> None:
         """Synchronize window routing and native ownership without crossing modes."""
 
+        containment_policy = policy
+        if self._focus_preserving_input_active:
+            # HidHide isolates only the configured controller. Vigil deliberately
+            # leaves keyboard/mouse hooks off while the game owns foreground.
+            containment_policy = resolve_overlay_input_policy(
+                overlay_visible=False,
+                controller_connected=self._controller_connected_state,
+                allow_mouse_navigation_while_controller_connected=(
+                    self._config.controller.allow_mouse_navigation_while_controller_connected
+                ),
+            )
+
         # Release global hooks before publishing a route that needs mouse input.
         # Entering controller-primary does the inverse: first make Qt ignore mouse,
         # then acquire ordinary controller ownership and native containment.
         if policy.mode is not OverlayInputMode.CONTROLLER_PRIMARY:
-            self._input_containment_service.apply_policy(policy)
+            self._input_containment_service.apply_policy(containment_policy)
 
         self.window.apply_input_policy(policy)
-        if policy.hold_gameinput_ownership:
+        hold_gameinput_ownership = (
+            policy.hold_gameinput_ownership and not self._focus_preserving_input_active
+        )
+        if hold_gameinput_ownership:
             self._guide_button_service.set_controller_ownership_active(True)
             self._controller_input_ownership_service.activate(
                 background_guide_enabled=self._config.controller.guide_button_enabled
@@ -822,7 +910,7 @@ class VigilApplication:
             self._guide_button_service.set_controller_ownership_active(False)
 
         if policy.mode is OverlayInputMode.CONTROLLER_PRIMARY:
-            self._input_containment_service.apply_policy(policy)
+            self._input_containment_service.apply_policy(containment_policy)
 
     def _begin_foreground_input_lease(self) -> None:
         """Suspend input until Windows confirms that Vigil owns foreground."""
@@ -923,14 +1011,54 @@ class VigilApplication:
         """Drop all process/global containment state before hiding or shutdown."""
 
         had_lease_state = self._foreground_claim_pending or self._foreground_verified
+        had_controller_isolation = (
+            self._focus_preserving_input_active or self._controller_isolation_service.active
+        )
+        self._controller_isolation_health_timer.stop()
         self._foreground_ownership_timer.stop()
         self._foreground_ownership_service.release()
         self._foreground_claim_pending = False
         self._foreground_loss_confirming = False
         self._foreground_verified = False
         self._sync_input_policy(overlay_visible=False)
-        if had_lease_state:
+        if had_controller_isolation:
+            if not self._controller_isolation_service.deactivate():
+                _LOGGER.critical(
+                    "HidHide controller isolation did not release cleanly: %s",
+                    self._controller_isolation_service.detail,
+                )
+                tray = self._tray
+                if tray is not None:
+                    tray.showMessage(
+                        "Controller isolation needs attention",
+                        "Open HidHide and turn off Enable device hiding.",
+                        QSystemTrayIcon.MessageIcon.Critical,
+                        8_000,
+                    )
+            self._focus_preserving_input_active = False
+        if had_lease_state or had_controller_isolation:
             self._log_input_control_status(reason)
+
+    def _maintain_controller_isolation(self) -> None:
+        """Hide immediately if the fail-safe HidHide lease stops being trustworthy."""
+
+        if not self._focus_preserving_input_active:
+            if not self._controller_isolation_service.active:
+                self._controller_isolation_health_timer.stop()
+                return
+            if self._controller_isolation_service.deactivate(timeout_seconds=0.1):
+                _LOGGER.warning("Recovered uncertain HidHide state and restored pass-through")
+                self._controller_isolation_health_timer.stop()
+            return
+        if self._controller_isolation_service.maintain():
+            return
+        _LOGGER.critical(
+            "Focus-preserving controller isolation was lost: %s",
+            self._controller_isolation_service.detail,
+        )
+        self._release_visible_input_control("controller isolation health check failed")
+        self.window.request_hide()
+        self._sync_tray_action()
 
     def _log_input_control_status(self, reason: str) -> None:
         status = self.input_control_diagnostics
@@ -1121,10 +1249,64 @@ class VigilApplication:
         self._refresh_home_games()
         self._request_home_library_refresh()
         target_found = self._prepare_fps_target()
-        self.window.show_overlay()
-        self._begin_foreground_input_lease()
+        self._show_overlay_with_safe_input_mode()
         if not target_found:
             QTimer.singleShot(0, self._prepare_fps_target)
+
+    def _show_overlay_with_safe_input_mode(self) -> None:
+        """Preserve game focus only after a verified HidHide lease is active."""
+
+        configured = self._config.controller.focus_preserving_controller_isolation_enabled
+        requested = (
+            configured
+            and self._controller_connected_state
+            and not self._config.controller.allow_mouse_navigation_while_controller_connected
+        )
+        isolated = requested and self._controller_isolation_service.activate()
+        self._focus_preserving_input_active = isolated
+        self.window.show_overlay(preserve_foreground=isolated)
+        if isolated:
+            self._controller_isolation_health_timer.start()
+            self._foreground_ownership_timer.stop()
+            self._foreground_ownership_service.release()
+            self._foreground_claim_pending = False
+            self._foreground_loss_confirming = False
+            self._foreground_verified = False
+            self._sync_input_policy(overlay_visible=True)
+            self._log_input_control_status("focus-preserving controller isolation acquired")
+            return
+        if requested and self._controller_isolation_service.active:
+            self._controller_isolation_health_timer.start()
+            _LOGGER.critical(
+                "HidHide pass-through is uncertain after a failed activation: %s",
+                self._controller_isolation_service.detail,
+            )
+            tray = self._tray
+            if tray is not None:
+                tray.showMessage(
+                    "Controller isolation needs attention",
+                    "Open HidHide and turn off Enable device hiding.",
+                    QSystemTrayIcon.MessageIcon.Critical,
+                    8_000,
+                )
+        if requested:
+            _LOGGER.warning(
+                "Focus-preserving controller isolation was unavailable; using foreground "
+                "ownership instead: %s",
+                self._controller_isolation_service.detail,
+            )
+        elif (
+            configured and self._config.controller.allow_mouse_navigation_while_controller_connected
+        ):
+            _LOGGER.info(
+                "Focus-preserving controller isolation deferred because Switch to mouse is on"
+            )
+        elif configured:
+            _LOGGER.info(
+                "Focus-preserving controller isolation deferred because no controller "
+                "is currently connected"
+            )
+        self._begin_foreground_input_lease()
 
     def _consume_instance_activation(self) -> None:
         guard = self._single_instance_guard
@@ -1177,8 +1359,7 @@ class VigilApplication:
         self._fps_service.set_overlay_visible(True)
         target_found = self._prepare_fps_target()
         self.window.reset_position()
-        self.window.show_overlay()
-        self._begin_foreground_input_lease()
+        self._show_overlay_with_safe_input_mode()
         if not target_found:
             QTimer.singleShot(0, self._prepare_fps_target)
         self._sync_tray_action()
@@ -1227,6 +1408,7 @@ class VigilApplication:
     def quit(self) -> None:
         self._quitting = True
         self._instance_activation_timer.stop()
+        self._controller_isolation_health_timer.stop()
         self._input_containment_health_timer.stop()
         self._release_visible_input_control("application quit")
         self._game_library_service.stop()
@@ -1235,6 +1417,7 @@ class VigilApplication:
         self._update_check_service.stop()
         self._guide_button_service.stop()
         self._controller_input_ownership_service.stop()
+        self._controller_isolation_service.stop()
         self._input_containment_service.stop()
         self._raw_controller_service.stop()
         self._controller_service.stop()
@@ -1266,10 +1449,9 @@ class VigilApplication:
         ):
             self._guide_button_service.start()
         target_found = self._prepare_fps_target()
-        self.window.show_overlay()
+        self._show_overlay_with_safe_input_mode()
         if self._startup_hotkey_failure is not None:
             QTimer.singleShot(0, self._show_startup_hotkey_failure)
-        self._begin_foreground_input_lease()
         QTimer.singleShot(1_500, self._update_check_service.check)
         if not target_found:
             QTimer.singleShot(0, self._prepare_fps_target)
@@ -1287,6 +1469,7 @@ class VigilApplication:
 
     def _before_quit(self) -> None:
         self._instance_activation_timer.stop()
+        self._controller_isolation_health_timer.stop()
         self._input_containment_health_timer.stop()
         self._release_visible_input_control("Qt application shutdown")
         self._game_library_service.stop()
@@ -1295,6 +1478,7 @@ class VigilApplication:
         self._update_check_service.stop()
         self._guide_button_service.stop()
         self._controller_input_ownership_service.stop()
+        self._controller_isolation_service.stop()
         self._input_containment_service.stop()
         self._raw_controller_service.stop()
         self._controller_service.stop()
@@ -1324,6 +1508,31 @@ def run_gui(
     """Assemble platform services and run the Qt application."""
 
     paths = ApplicationPaths.discover()
+    controller_isolation_service = create_platform_controller_isolation_service(
+        paths.cache_root,
+        paths.user_data_root,
+    )
+    fresh_hidhide = (
+        None
+        if read_only_config
+        else consume_fresh_hidhide_install_marker(
+            controller_isolation_service,
+            paths.install_root,
+        )
+    )
+    if fresh_hidhide is not None:
+        log = _LOGGER.info if fresh_hidhide.configured else _LOGGER.warning
+        log("Fresh HidHide setup: %s", fresh_hidhide.detail)
+    if not read_only_config and apply_controller_isolation_install_default(
+        config,
+        hidhide_available=controller_isolation_service.available,
+    ):
+        try:
+            save_config(config_path, config)
+        except (OSError, VigilOverlayError):
+            _LOGGER.exception(
+                "Could not persist the installed-HidHide controller-isolation default"
+            )
     game_provider_registry = create_builtin_game_provider_registry(paths, safe_mode=safe_mode)
     integration_manager = IntegrationManager(paths, enabled=not safe_mode)
     application = VigilApplication(
@@ -1334,6 +1543,7 @@ def run_gui(
         read_only_config=read_only_config,
         game_provider_registry=game_provider_registry,
         integration_manager=integration_manager,
+        controller_isolation_service=controller_isolation_service,
         single_instance_guard=single_instance_guard,
     )
     _LOGGER.info(

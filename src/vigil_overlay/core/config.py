@@ -65,6 +65,8 @@ class ControllerSettings:
 
     guide_button_enabled: bool = True
     allow_mouse_navigation_while_controller_connected: bool = False
+    focus_preserving_controller_isolation_enabled: bool = False
+    focus_preserving_controller_isolation_preference_initialized: bool = False
     shortcut_controls: list[str] = field(default_factory=list)
 
 
@@ -72,9 +74,7 @@ class ControllerSettings:
 class WidgetStripSettings:
     """Enabled widgets and their presentation order."""
 
-    enabled_widget_ids: list[str] = field(
-        default_factory=lambda: list(_DEFAULT_WIDGET_IDS)
-    )
+    enabled_widget_ids: list[str] = field(default_factory=lambda: list(_DEFAULT_WIDGET_IDS))
     widget_order: list[str] = field(default_factory=lambda: list(_DEFAULT_WIDGET_IDS))
 
 
@@ -148,9 +148,7 @@ class AppConfig:
 
         hotkey_raw = _require_mapping(migrated["hotkey"], "hotkey")
         _require_exact_keys(hotkey_raw, {"enabled", "combination"}, "hotkey")
-        hotkey_combination = _require_string(
-            hotkey_raw["combination"], "hotkey.combination"
-        )
+        hotkey_combination = _require_string(hotkey_raw["combination"], "hotkey.combination")
         try:
             hotkey_combination = parse_hotkey_combination(hotkey_combination).canonical
         except ValueError as exc:
@@ -188,6 +186,8 @@ class AppConfig:
             {
                 "guide_button_enabled",
                 "allow_mouse_navigation_while_controller_connected",
+                "focus_preserving_controller_isolation_enabled",
+                "focus_preserving_controller_isolation_preference_initialized",
                 "shortcut_controls",
             },
             "controller",
@@ -197,9 +197,7 @@ class AppConfig:
                 controller_raw["shortcut_controls"]
             )
         except ValueError as exc:
-            raise ConfigError(
-                f"controller.shortcut_controls is invalid: {exc}"
-            ) from exc
+            raise ConfigError(f"controller.shortcut_controls is invalid: {exc}") from exc
         controller = ControllerSettings(
             guide_button_enabled=_require_bool(
                 controller_raw["guide_button_enabled"],
@@ -208,6 +206,14 @@ class AppConfig:
             allow_mouse_navigation_while_controller_connected=_require_bool(
                 controller_raw["allow_mouse_navigation_while_controller_connected"],
                 "controller.allow_mouse_navigation_while_controller_connected",
+            ),
+            focus_preserving_controller_isolation_enabled=_require_bool(
+                controller_raw["focus_preserving_controller_isolation_enabled"],
+                "controller.focus_preserving_controller_isolation_enabled",
+            ),
+            focus_preserving_controller_isolation_preference_initialized=_require_bool(
+                controller_raw["focus_preserving_controller_isolation_preference_initialized"],
+                "controller.focus_preserving_controller_isolation_preference_initialized",
             ),
             shortcut_controls=list(shortcut_binding.controls),
         )
@@ -221,13 +227,9 @@ class AppConfig:
         enabled_widget_ids = _require_widget_id_list(
             widgets_raw["enabled_widget_ids"], "widgets.enabled_widget_ids"
         )
-        widget_order = _require_widget_id_list(
-            widgets_raw["widget_order"], "widgets.widget_order"
-        )
+        widget_order = _require_widget_id_list(widgets_raw["widget_order"], "widgets.widget_order")
         if "home" not in enabled_widget_ids or "settings" not in enabled_widget_ids:
-            raise ConfigError(
-                "widgets.enabled_widget_ids must include home and settings"
-            )
+            raise ConfigError("widgets.enabled_widget_ids must include home and settings")
         if selected_widget not in enabled_widget_ids:
             selected_widget = "home"
 
@@ -246,16 +248,12 @@ class AppConfig:
             plugins_raw["max_message_bytes"], "plugins.max_message_bytes"
         )
         if not 4_096 <= max_message_bytes <= 4 * 1024 * 1024:
-            raise ConfigError(
-                "plugins.max_message_bytes must be between 4096 and 4194304"
-            )
+            raise ConfigError("plugins.max_message_bytes must be between 4096 and 4194304")
         max_messages = _require_int(
             plugins_raw["max_messages_per_second"], "plugins.max_messages_per_second"
         )
         if not 1 <= max_messages <= 120:
-            raise ConfigError(
-                "plugins.max_messages_per_second must be between 1 and 120"
-            )
+            raise ConfigError("plugins.max_messages_per_second must be between 1 and 120")
 
         window_raw = _require_mapping(migrated["window"], "window")
         _require_exact_keys(
@@ -300,9 +298,7 @@ class AppConfig:
                 height=height,
                 x=_require_optional_int(window_raw["x"], "window.x"),
                 y=_require_optional_int(window_raw["y"], "window.y"),
-                always_on_top=_require_bool(
-                    window_raw["always_on_top"], "window.always_on_top"
-                ),
+                always_on_top=_require_bool(window_raw["always_on_top"], "window.always_on_top"),
             ),
         )
 
@@ -465,6 +461,29 @@ def _migrate_v13_to_v14(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _migrate_v14_to_v15(raw: dict[str, Any]) -> dict[str, Any]:
+    controller = raw.get("controller")
+    if not isinstance(controller, dict):
+        controller = {}
+        raw["controller"] = controller
+    controller.setdefault("focus_preserving_controller_isolation_enabled", False)
+    raw["schema_version"] = 15
+    return raw
+
+
+def _migrate_v15_to_v16(raw: dict[str, Any]) -> dict[str, Any]:
+    controller = raw.get("controller")
+    if not isinstance(controller, dict):
+        controller = {}
+        raw["controller"] = controller
+    controller.setdefault(
+        "focus_preserving_controller_isolation_preference_initialized",
+        False,
+    )
+    raw["schema_version"] = 16
+    return raw
+
+
 _MIGRATIONS: dict[int, Migration] = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
@@ -479,7 +498,27 @@ _MIGRATIONS: dict[int, Migration] = {
     11: _migrate_v11_to_v12,
     12: _migrate_v12_to_v13,
     13: _migrate_v13_to_v14,
+    14: _migrate_v14_to_v15,
+    15: _migrate_v15_to_v16,
 }
+
+
+def apply_controller_isolation_install_default(
+    config: AppConfig,
+    *,
+    hidhide_available: bool,
+) -> bool:
+    """Enable the one-time default after an installed build detects HidHide."""
+
+    controller = config.controller
+    if (
+        not hidhide_available
+        or controller.focus_preserving_controller_isolation_preference_initialized
+    ):
+        return False
+    controller.focus_preserving_controller_isolation_enabled = True
+    controller.focus_preserving_controller_isolation_preference_initialized = True
+    return True
 
 
 def load_config(path: Path) -> AppConfig:
@@ -597,9 +636,7 @@ def _migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
     while version < CONFIG_SCHEMA_VERSION:
         migration = _MIGRATIONS.get(version)
         if migration is None:
-            raise ConfigError(
-                f"No migration exists from configuration schema {version}"
-            )
+            raise ConfigError(f"No migration exists from configuration schema {version}")
         raw = migration(raw)
         version = raw.get("schema_version")
         if type(version) is not int:
@@ -631,9 +668,7 @@ def _require_widget_id_list(value: Any, name: str) -> list[str]:
         raise ConfigError(f"{name} must be an array")
     if len(value) > 128:
         raise ConfigError(f"{name} cannot contain more than 128 entries")
-    result = [
-        _require_widget_id(item, f"{name}[{index}]") for index, item in enumerate(value)
-    ]
+    result = [_require_widget_id(item, f"{name}[{index}]") for index, item in enumerate(value)]
     if len(result) != len(set(result)):
         raise ConfigError(f"{name} must not contain duplicate widget IDs")
     return result
@@ -657,14 +692,10 @@ def _require_optional_int(value: Any, name: str) -> int | None:
     return _require_int(value, name)
 
 
-def _require_exact_keys(
-    mapping: dict[str, Any], required: set[str], context: str
-) -> None:
+def _require_exact_keys(mapping: dict[str, Any], required: set[str], context: str) -> None:
     missing = required - mapping.keys()
     unknown = mapping.keys() - required
     if missing:
         raise ConfigError(f"{context} is missing fields: {', '.join(sorted(missing))}")
     if unknown:
-        raise ConfigError(
-            f"{context} contains unknown fields: {', '.join(sorted(unknown))}"
-        )
+        raise ConfigError(f"{context} contains unknown fields: {', '.join(sorted(unknown))}")
