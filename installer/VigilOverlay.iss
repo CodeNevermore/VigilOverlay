@@ -11,7 +11,7 @@
   #error HidHideInstaller must point to the approved official HidHide installer.
 #endif
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.2.3"
+  #define MyAppVersion "0.1.2.4"
 #endif
 
 #define MyAppName "Vigil Overlay"
@@ -57,30 +57,104 @@ Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\VigilOverlay"" /F"; 
 Type: files; Name: "{app}\.vigil-hidhide-fresh-install.json"
 
 [Code]
+const
+  HidHideRegistryKey = 'SOFTWARE\Nefarius Software Solutions e.U.\HidHide';
+  HidHideReceiptKey = 'SOFTWARE\Vigil Overlay\Prerequisites\HidHide';
+  HidHideReceiptSource = 'VigilOverlay Setup';
+  HidHideReceiptVersion = '1.5.230';
+
 var
   PrerequisiteRestartRequired: Boolean;
   HidHideInstalledByVigil: Boolean;
+
+function HidHideCliExists(InstallPath: String): Boolean;
+var
+  Root: String;
+begin
+  Root := AddBackslash(InstallPath);
+  Result := FileExists(Root + 'HidHideCLI.exe') or
+    FileExists(Root + 'x64\HidHideCLI.exe') or
+    FileExists(Root + 'bin\HidHideCLI.exe') or
+    FileExists(Root + 'bin\x64\HidHideCLI.exe');
+end;
 
 function IsHidHideInstalled: Boolean;
 var
   InstalledVersion: String;
   InstallPath: String;
+  HasVersion: Boolean;
+  HasPath: Boolean;
 begin
-  Result := RegQueryStringValue(
-    HKCR,
-    'Installer\Dependencies\NSS.Drivers.HidHide.x64',
+  HasVersion := RegQueryStringValue(
+    HKLM,
+    HidHideRegistryKey,
     'Version',
     InstalledVersion
   ) and (Trim(InstalledVersion) <> '');
-  if Result then
-    exit;
-
-  Result := RegQueryStringValue(
-    HKCR,
-    'SOFTWARE\Nefarius Software Solutions e.U.\Nefarius Software Solutions e.U. HidHide',
+  HasPath := RegQueryStringValue(
+    HKLM,
+    HidHideRegistryKey,
     'Path',
     InstallPath
   ) and (Trim(InstallPath) <> '');
+  Result := HasVersion and HasPath and HidHideCliExists(InstallPath);
+end;
+
+procedure RemoveHidHideInstallReceipt;
+begin
+  RegDeleteKeyIncludingSubkeys(HKLM, HidHideReceiptKey);
+end;
+
+function IsHidHideInstallReceiptState(ExpectedState: String): Boolean;
+var
+  Schema: Cardinal;
+  Source: String;
+  HidHideVersion: String;
+  State: String;
+begin
+  Result := RegQueryDWordValue(HKLM, HidHideReceiptKey, 'Schema', Schema) and
+    (Schema = 1) and
+    RegQueryStringValue(HKLM, HidHideReceiptKey, 'Source', Source) and
+    (Source = HidHideReceiptSource) and
+    RegQueryStringValue(
+      HKLM,
+      HidHideReceiptKey,
+      'HidHideVersion',
+      HidHideVersion
+    ) and
+    (HidHideVersion = HidHideReceiptVersion) and
+    RegQueryStringValue(HKLM, HidHideReceiptKey, 'State', State) and
+    (State = ExpectedState);
+end;
+
+function WriteInstallingHidHideReceipt: Boolean;
+begin
+  RemoveHidHideInstallReceipt;
+  Result := RegWriteDWordValue(HKLM, HidHideReceiptKey, 'Schema', 1) and
+    RegWriteStringValue(
+      HKLM,
+      HidHideReceiptKey,
+      'Source',
+      HidHideReceiptSource
+    ) and
+    RegWriteStringValue(
+      HKLM,
+      HidHideReceiptKey,
+      'HidHideVersion',
+      HidHideReceiptVersion
+    ) and
+    RegWriteStringValue(HKLM, HidHideReceiptKey, 'State', 'installing');
+end;
+
+function PromoteHidHideReceiptToPending: Boolean;
+begin
+  if IsHidHideInstallReceiptState('pending') then
+  begin
+    Result := True;
+    exit;
+  end;
+  Result := IsHidHideInstallReceiptState('installing') and
+    RegWriteStringValue(HKLM, HidHideReceiptKey, 'State', 'pending');
 end;
 
 function InstallGameInput(var NeedsRestart: Boolean): String;
@@ -124,8 +198,27 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  if not WizardIsTaskSelected('hidhide') or IsHidHideInstalled then
+  if IsHidHideInstalled then
+  begin
+    if IsHidHideInstallReceiptState('installing') then
+    begin
+      if not PromoteHidHideReceiptToPending then
+      begin
+        Result := 'Vigil Overlay could not finalize its protected HidHide receipt.';
+        exit;
+      end;
+    end;
+    HidHideInstalledByVigil := IsHidHideInstallReceiptState('pending');
     exit;
+  end;
+  if not WizardIsTaskSelected('hidhide') then
+    exit;
+
+  if not WriteInstallingHidHideReceipt then
+  begin
+    Result := 'Vigil Overlay could not create its protected HidHide install receipt.';
+    exit;
+  end;
 
   ExtractTemporaryFile('HidHide_1.5.230_x64.exe');
   InstallerPath := ExpandConstant('{tmp}\HidHide_1.5.230_x64.exe');
@@ -138,12 +231,29 @@ begin
     ResultCode
   ) then
   begin
+    RemoveHidHideInstallReceipt;
     Result := 'Vigil Overlay could not start the HidHide prerequisite installer.';
     exit;
   end;
 
+  Log('HidHide prerequisite installer exit code: ' + IntToStr(ResultCode));
+
   if (ResultCode = 0) or (ResultCode = 1641) or (ResultCode = 3010) then
+  begin
+    if not IsHidHideInstalled then
+    begin
+      Result := 'HidHide reported a successful installation, but its required ';
+      Result := Result + 'registration and command-line client were not detected. ';
+      Result := Result + 'Restart Windows, then rerun Vigil Setup.';
+      exit;
+    end;
+    if not PromoteHidHideReceiptToPending then
+    begin
+      Result := 'Vigil Overlay could not finalize its protected HidHide receipt.';
+      exit;
+    end;
     HidHideInstalledByVigil := True;
+  end;
 
   if (ResultCode = 1641) or (ResultCode = 3010) then
   begin
@@ -152,6 +262,7 @@ begin
   end
   else if ResultCode <> 0 then
   begin
+    RemoveHidHideInstallReceipt;
     Result := 'HidHide installation failed with exit code ';
     Result := Result + IntToStr(ResultCode);
     Result := Result + '. Vigil Overlay was not installed.';
@@ -214,5 +325,8 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
+  begin
     RemoveOwnedStartupRegistration;
+    RemoveHidHideInstallReceipt;
+  end;
 end;

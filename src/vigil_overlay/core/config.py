@@ -42,7 +42,7 @@ class HotkeySettings:
 class StartupSettings:
     """Per-user Windows startup preference."""
 
-    start_with_windows: bool = False
+    start_with_windows: bool = True
 
 
 @dataclass(slots=True)

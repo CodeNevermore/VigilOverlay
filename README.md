@@ -27,15 +27,21 @@ separate service boundaries.
 Vigil Setup selects a pinned, verified official HidHide package for installation by
 default when HidHide is absent; the user may clear that optional component. Setup does
 not enable hiding, replace an existing HidHide version, or remove the driver when Vigil
-is uninstalled. When this Setup installs a fresh HidHide, it leaves a one-time marker
-so Vigil can add its installed executable and only connected inputs that HidHide itself
-identifies as gaming devices. Vigil records the exact configuration it created; its
-watchdog then adds newly connected HidHide-verified controllers automatically, so a
-replacement or additional controller does not require another trip through the HidHide
-client. Existing HidHide installations are never automatically configured. Without
-the optional HidHide integration, applications that independently poll XInput or
-subscribe to Raw Input can still observe the physical controller while the overlay is
-open. Input containment is released before Vigil hides or exits.
+is uninstalled. Setup accepts the prerequisite only after HidHide's official version
+and path registrations and its command-line client are present. Before launching that
+package, Setup writes an administrator-protected `installing` receipt and promotes it
+to `pending` only after those postconditions pass. This lets a later Vigil installation
+resume the one-time safe handoff if Setup is interrupted after installing HidHide.
+Setup never creates the receipt merely because it finds an existing installation.
+When Vigil consumes a valid pending receipt, it may add its installed executable and
+only connected inputs that HidHide itself identifies as gaming devices. Vigil records
+the exact configuration it created; its watchdog then adds newly connected
+HidHide-verified controllers automatically, so a replacement or additional controller
+does not require another trip through the HidHide client. Existing HidHide
+installations are never automatically configured. Without the optional HidHide
+integration, applications that independently poll XInput or subscribe to Raw Input can
+still observe the physical controller while the overlay is open. Input containment is
+released before Vigil hides or exits.
 
 The **Keep the game focused** setting defaults on once an installed Windows build
 detects HidHide. An explicit user choice is preserved. On a fresh HidHide installation,
@@ -125,10 +131,14 @@ python tools/build_installer.py `
 The installer builder verifies both publishers, product metadata, versions, and
 approved hashes before invoking Inno Setup. HidHide is selected by default as an
 optional component when no existing HidHide installation is detected, and the user
-may clear that selection. Setup never enables device hiding. Only a fresh HidHide
-installed by that Setup is eligible for Vigil's one-time, gaming-device-only initial
-configuration; existing configurations remain untouched. Vigil does not remove HidHide
-when Vigil is uninstalled.
+may clear that selection. Setup reads HidHide's 64-bit machine registration and
+verifies its version, path, and command-line client after installation; a success exit
+code without those postconditions is rejected with restart and rerun guidance. Setup
+never enables device hiding. Only a fresh HidHide installed by that Setup receives the
+protected pending receipt that permits Vigil's one-time, gaming-device-only initial
+configuration; existing configurations remain untouched. The receipt survives an
+interrupted install, is consumed after a terminal configuration decision, and is
+removed with Vigil without removing HidHide itself.
 
 ## Data and privacy
 

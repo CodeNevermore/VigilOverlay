@@ -138,36 +138,28 @@ def spatial_navigation_target(
             continue
         candidate_center = candidate.center()
         if command is NavigationCommand.MOVE_LEFT:
-            if min(source.right(), candidate.right()) - max(
-                source.left(), candidate.left()
-            ) > 0.5:
+            if min(source.right(), candidate.right()) - max(source.left(), candidate.left()) > 0.5:
                 continue
             primary_distance = source_center.x() - candidate_center.x()
             primary_gap = max(source.left() - candidate.right(), 0.0)
             cross_distance = abs(source_center.y() - candidate_center.y())
             aligned = min(source.bottom(), candidate.bottom()) >= max(source.top(), candidate.top())
         elif command is NavigationCommand.MOVE_RIGHT:
-            if min(source.right(), candidate.right()) - max(
-                source.left(), candidate.left()
-            ) > 0.5:
+            if min(source.right(), candidate.right()) - max(source.left(), candidate.left()) > 0.5:
                 continue
             primary_distance = candidate_center.x() - source_center.x()
             primary_gap = max(candidate.left() - source.right(), 0.0)
             cross_distance = abs(source_center.y() - candidate_center.y())
             aligned = min(source.bottom(), candidate.bottom()) >= max(source.top(), candidate.top())
         elif command is NavigationCommand.MOVE_UP:
-            if min(source.bottom(), candidate.bottom()) - max(
-                source.top(), candidate.top()
-            ) > 0.5:
+            if min(source.bottom(), candidate.bottom()) - max(source.top(), candidate.top()) > 0.5:
                 continue
             primary_distance = source_center.y() - candidate_center.y()
             primary_gap = max(source.top() - candidate.bottom(), 0.0)
             cross_distance = abs(source_center.x() - candidate_center.x())
             aligned = min(source.right(), candidate.right()) >= max(source.left(), candidate.left())
         else:
-            if min(source.bottom(), candidate.bottom()) - max(
-                source.top(), candidate.top()
-            ) > 0.5:
+            if min(source.bottom(), candidate.bottom()) - max(source.top(), candidate.top()) > 0.5:
                 continue
             primary_distance = candidate_center.y() - source_center.y()
             primary_gap = max(candidate.top() - source.bottom(), 0.0)
@@ -464,7 +456,7 @@ class NavigationShell(QWidget):
         focus_preserving_controller_isolation_available: bool = True,
         allow_mouse_navigation_while_controller_connected: bool = False,
         hotkey_combination: str = "Ctrl+Alt+Shift+G",
-        start_with_windows_enabled: bool = False,
+        start_with_windows_enabled: bool = True,
         start_with_windows_available: bool = True,
         run_in_background_enabled: bool = True,
         run_in_background_available: bool = True,

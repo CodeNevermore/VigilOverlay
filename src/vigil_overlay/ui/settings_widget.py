@@ -613,7 +613,7 @@ class SettingsWidgetView(QWidget):
         focus_preserving_controller_isolation_available: bool = True,
         allow_mouse_navigation_while_controller_connected: bool = False,
         hotkey_combination: str,
-        start_with_windows_enabled: bool = False,
+        start_with_windows_enabled: bool = True,
         start_with_windows_available: bool = True,
         run_in_background_enabled: bool = True,
         run_in_background_available: bool = True,

@@ -1,10 +1,10 @@
 """Fail-safe HidHide controller isolation for focus-preserving overlays.
 
 Vigil normally treats HidHide's shared allow/block lists as user-owned. The narrow
-exception is a configuration created from a marker written when Vigil Setup installs
-a fresh HidHide. Vigil records that exact clean configuration and may extend it with
-new device IDs that HidHide identifies as present gaming input. Existing, already
-configured, or later externally changed HidHide installations remain read-only.
+exception is a configuration created from a protected receipt written when Vigil Setup
+installs a fresh HidHide. Vigil records that exact clean configuration and may extend
+it with new device IDs that HidHide identifies as present gaming input. Existing,
+already configured, or later externally changed HidHide installations remain read-only.
 
 Vigil only leases the global hiding switch after proving that configured entries are
 either currently verified gaming-device IDs or previously verified IDs retained in
@@ -70,9 +70,7 @@ _IOCTL_GET_INVERSE: Final = (
     (_DEVICE_TYPE << 16) | (_FILE_READ_DATA << 14) | (2054 << 2) | _METHOD_BUFFERED
 )
 
-_HIDHIDE_REGISTRY_KEY: Final = (
-    "SOFTWARE\\Nefarius Software Solutions e.U.\\Nefarius Software Solutions e.U. HidHide"
-)
+_HIDHIDE_REGISTRY_KEY: Final = "SOFTWARE\\Nefarius Software Solutions e.U.\\HidHide"
 _LEASE_DIRECTORY_NAME: Final = "controller-isolation"
 _LEASE_PREFIX: Final = "lease-"
 _LEASE_SUFFIX: Final = ".json"
@@ -81,6 +79,15 @@ _HIDHIDE_OWNERSHIP_SCHEMA: Final = 1
 FRESH_HIDHIDE_INSTALL_MARKER: Final = ".vigil-hidhide-fresh-install.json"
 _FRESH_HIDHIDE_INSTALL_MARKER_SCHEMA: Final = 1
 _FRESH_HIDHIDE_INSTALL_VERSION: Final = "1.5.230"
+_FRESH_HIDHIDE_INSTALL_RECEIPT_REGISTRY_KEY: Final = (
+    "SOFTWARE\\Vigil Overlay\\Prerequisites\\HidHide"
+)
+_FRESH_HIDHIDE_INSTALL_RECEIPT_VALUE_NAMES: Final = (
+    "Schema",
+    "Source",
+    "HidHideVersion",
+    "State",
+)
 _MAX_AUTOMATIC_DEVICE_IDS: Final = 32
 _WATCHDOG_DEVICE_REFRESH_SECONDS: Final = 1.0
 
@@ -151,6 +158,9 @@ class ControllerIsolationBackend(Protocol):
     def supported(self) -> bool: ...
 
     @property
+    def availability_detail(self) -> str: ...
+
+    @property
     def application_full_image_name(self) -> str | None: ...
 
     @property
@@ -178,6 +188,10 @@ class UnsupportedControllerIsolationBackend:
     @property
     def supported(self) -> bool:
         return False
+
+    @property
+    def availability_detail(self) -> str:
+        return self.detail
 
     @property
     def application_full_image_name(self) -> str | None:
@@ -230,6 +244,29 @@ class WindowsHidHideBackend:
             and self._application_full_image_name is not None
             and self._cli_path is not None
         )
+
+    @property
+    def availability_detail(self) -> str:
+        if self._application_path is None:
+            return "Vigil must run from its packaged Windows executable to use HidHide."
+        if self._install_root is None:
+            return (
+                "HidHide's registered install path and official clients were not found. "
+                "Restart Windows if Setup just installed HidHide, then rerun Vigil Setup "
+                "if it remains unavailable."
+            )
+        if self._cli_path is None:
+            return (
+                "HidHide is registered, but HidHideCLI.exe was not found under "
+                f"{self._install_root}. Restart Windows, then rerun Vigil Setup if the "
+                "client is still missing."
+            )
+        if self._application_full_image_name is None:
+            return (
+                "Windows could not resolve VigilOverlay.exe for HidHide's Applications "
+                "list. Reinstall Vigil to a local fixed drive."
+            )
+        return "HidHide's installed driver tools are available to Vigil."
 
     @property
     def application_full_image_name(self) -> str | None:
@@ -446,22 +483,60 @@ class WindowsHidHideBackend:
         return tuple(value for value in raw.split("\0") if value)
 
     def _resolve_install_root(self) -> Path | None:
+        registered_root: Path | None = None
         try:
             import winreg
 
-            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, _HIDHIDE_REGISTRY_KEY) as key:
-                raw, _kind = winreg.QueryValueEx(key, "Path")
+            access = winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                _HIDHIDE_REGISTRY_KEY,
+                0,
+                access,
+            ) as registry_key:
+                raw, _kind = winreg.QueryValueEx(registry_key, "Path")
         except (ImportError, OSError):
-            return None
-        if not isinstance(raw, str) or not raw.strip():
-            return None
-        return Path(raw).expanduser().resolve()
+            raw = None
+        if isinstance(raw, str) and raw.strip():
+            expanded = os.path.expandvars(raw.strip().strip('"'))
+            candidate = Path(expanded).expanduser().resolve()
+            registered_root = candidate.parent if candidate.is_file() else candidate
+
+        candidates: list[Path] = []
+        if registered_root is not None:
+            candidates.append(registered_root)
+        for variable in ("ProgramW6432", "ProgramFiles"):
+            raw_program_files = os.environ.get(variable)
+            if not raw_program_files:
+                continue
+            program_files = Path(raw_program_files).expanduser().resolve()
+            candidates.extend(
+                (
+                    program_files / "Nefarius Software Solutions" / "HidHide",
+                    program_files / "Nefarius Software Solutions e.U." / "HidHide",
+                )
+            )
+
+        unique: list[Path] = []
+        observed: set[str] = set()
+        for candidate in candidates:
+            candidate_key = str(candidate).casefold()
+            if candidate_key in observed:
+                continue
+            observed.add(candidate_key)
+            unique.append(candidate)
+        for candidate in unique:
+            if any(
+                path.is_file() for path in _hidhide_binary_candidates(candidate, "HidHideCLI.exe")
+            ):
+                return candidate
+        return registered_root
 
     def _find_installed_binary(self, name: str) -> Path | None:
         root = self._install_root
         if root is None:
             return None
-        for candidate in (root / name, root / "x64" / name):
+        for candidate in _hidhide_binary_candidates(root, name):
             if candidate.is_file():
                 return candidate
         return None
@@ -567,7 +642,7 @@ class ControllerIsolationService:
             return FreshHidHideConfigurationOutcome(
                 False,
                 True,
-                "HidHide is not ready yet; automatic configuration will retry later.",
+                self._backend.availability_detail + " Automatic configuration will retry later.",
             )
         try:
             before = self._backend.snapshot()
@@ -673,8 +748,9 @@ class ControllerIsolationService:
         if not self._backend.supported:
             return ControllerIsolationReadiness(
                 False,
-                "HidHide is unavailable. Install it with Vigil Setup or the official "
-                "package, restart Windows if requested, and use the installed Vigil build.",
+                self._backend.availability_detail
+                + " Install HidHide with Vigil Setup or the official package, and "
+                "restart Windows if requested.",
             )
         try:
             managed_sync = _synchronize_owned_hidhide_configuration(
@@ -969,6 +1045,7 @@ def create_platform_controller_isolation_service(
         except OSError as exc:
             backend = UnsupportedControllerIsolationBackend(str(exc))
     _recover_stale_leases(cache_root / _LEASE_DIRECTORY_NAME, backend)
+    _LOGGER.info("HidHide readiness: %s", backend.availability_detail)
     return ControllerIsolationService(
         backend,
         cache_root,
@@ -976,40 +1053,142 @@ def create_platform_controller_isolation_service(
     )
 
 
+def _no_fresh_hidhide_install_receipt() -> None:
+    return None
+
+
+def _ignore_fresh_hidhide_install_receipt() -> None:
+    return None
+
+
 def consume_fresh_hidhide_install_marker(
     service: ControllerIsolationService,
     install_root: Path,
+    *,
+    receipt_reader: Callable[[], object | None] = _no_fresh_hidhide_install_receipt,
+    receipt_clearer: Callable[[], None] = _ignore_fresh_hidhide_install_receipt,
 ) -> FreshHidHideConfigurationOutcome | None:
-    """Consume the installer-owned marker without touching existing HidHide setups."""
+    """Consume supplied installer proof without touching existing HidHide setups."""
 
     marker_path = install_root / FRESH_HIDHIDE_INSTALL_MARKER
+    marker_payload: object | None = None
+    marker_present = False
     try:
-        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker_present = True
     except FileNotFoundError:
-        return None
+        pass
     except (OSError, UnicodeError, json.JSONDecodeError):
-        _safe_unlink(marker_path)
-        return FreshHidHideConfigurationOutcome(
-            False,
-            False,
-            "The fresh HidHide install marker was invalid; automatic setup was skipped.",
-        )
-    if payload != {
+        marker_present = True
+
+    receipt_payload = receipt_reader()
+    if not marker_present and receipt_payload is None:
+        return None
+
+    expected_marker = {
         "schema": _FRESH_HIDHIDE_INSTALL_MARKER_SCHEMA,
         "source": "VigilOverlay Setup",
         "hidhide_version": _FRESH_HIDHIDE_INSTALL_VERSION,
-    }:
+    }
+    expected_receipt = {
+        **expected_marker,
+        "state": "pending",
+    }
+    if marker_payload != expected_marker and receipt_payload != expected_receipt:
         _safe_unlink(marker_path)
+        receipt_clearer()
         return FreshHidHideConfigurationOutcome(
             False,
             False,
-            "The fresh HidHide install marker was not recognized; automatic setup was skipped.",
+            "The fresh HidHide installation receipt was not recognized; automatic "
+            "setup was skipped.",
         )
 
     outcome = service.configure_fresh_install()
     if not outcome.retry_later:
         _safe_unlink(marker_path)
+        receipt_clearer()
     return outcome
+
+
+def consume_platform_fresh_hidhide_install_receipt(
+    service: ControllerIsolationService,
+    install_root: Path,
+) -> FreshHidHideConfigurationOutcome | None:
+    """Consume Vigil Setup's legacy marker or protected Windows receipt."""
+
+    return consume_fresh_hidhide_install_marker(
+        service,
+        install_root,
+        receipt_reader=_read_fresh_hidhide_install_receipt,
+        receipt_clearer=_clear_fresh_hidhide_install_receipt,
+    )
+
+
+def _read_fresh_hidhide_install_receipt() -> object | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    access = winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+    try:
+        registry_key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            _FRESH_HIDHIDE_INSTALL_RECEIPT_REGISTRY_KEY,
+            0,
+            access,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        with registry_key:
+            schema, _schema_kind = winreg.QueryValueEx(registry_key, "Schema")
+            source, _source_kind = winreg.QueryValueEx(registry_key, "Source")
+            version, _version_kind = winreg.QueryValueEx(registry_key, "HidHideVersion")
+            state, _state_kind = winreg.QueryValueEx(registry_key, "State")
+    except OSError as exc:
+        _LOGGER.warning("Could not read the complete HidHide install receipt: %s", exc)
+        return {}
+    return {
+        "schema": schema,
+        "source": source,
+        "hidhide_version": version,
+        "state": state,
+    }
+
+
+def _clear_fresh_hidhide_install_receipt() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+    except ImportError:
+        return
+
+    access = winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            _FRESH_HIDHIDE_INSTALL_RECEIPT_REGISTRY_KEY,
+            0,
+            access,
+        ) as registry_key:
+            for value_name in _FRESH_HIDHIDE_INSTALL_RECEIPT_VALUE_NAMES:
+                with suppress(FileNotFoundError):
+                    winreg.DeleteValue(registry_key, value_name)
+        winreg.DeleteKeyEx(
+            winreg.HKEY_LOCAL_MACHINE,
+            _FRESH_HIDHIDE_INSTALL_RECEIPT_REGISTRY_KEY,
+            winreg.KEY_WOW64_64KEY,
+            0,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _LOGGER.warning("Could not clear the consumed HidHide install receipt: %s", exc)
 
 
 def _write_managed_hidhide_configuration(
@@ -1515,6 +1694,15 @@ def _normalized_device_id(value: object) -> str | None:
     return normalized if normalized else None
 
 
+def _hidhide_binary_candidates(root: Path, name: str) -> tuple[Path, ...]:
+    return (
+        root / name,
+        root / "x64" / name,
+        root / "bin" / name,
+        root / "bin" / "x64" / name,
+    )
+
+
 def _fresh_install_cli_command(
     cli_path: Path,
     application_path: Path,
@@ -1594,6 +1782,7 @@ __all__ = [
     "UnsupportedControllerIsolationBackend",
     "WindowsHidHideBackend",
     "consume_fresh_hidhide_install_marker",
+    "consume_platform_fresh_hidhide_install_receipt",
     "create_platform_controller_isolation_service",
     "run_controller_isolation_watchdog",
 ]

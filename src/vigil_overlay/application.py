@@ -42,7 +42,7 @@ from vigil_overlay.services.controller import (
 )
 from vigil_overlay.services.controller_isolation import (
     ControllerIsolationService,
-    consume_fresh_hidhide_install_marker,
+    consume_platform_fresh_hidhide_install_receipt,
     create_platform_controller_isolation_service,
 )
 from vigil_overlay.services.controller_shortcuts import ControllerShortcutService
@@ -1515,7 +1515,7 @@ def run_gui(
     fresh_hidhide = (
         None
         if read_only_config
-        else consume_fresh_hidhide_install_marker(
+        else consume_platform_fresh_hidhide_install_receipt(
             controller_isolation_service,
             paths.install_root,
         )
