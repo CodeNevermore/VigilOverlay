@@ -41,6 +41,7 @@ from vigil_overlay.services.controller import (
     create_platform_controller_service,
 )
 from vigil_overlay.services.controller_isolation import (
+    ControllerIsolationPhase,
     ControllerIsolationService,
     consume_platform_fresh_hidhide_install_receipt,
     create_platform_controller_isolation_service,
@@ -236,9 +237,16 @@ class VigilApplication:
             )
         )
         self._focus_preserving_input_active = False
+        self._pending_overlay_show = False
         self._controller_isolation_health_timer = QTimer()
-        self._controller_isolation_health_timer.setInterval(500)
+        self._controller_isolation_health_timer.setInterval(250)
         self._controller_isolation_health_timer.timeout.connect(self._maintain_controller_isolation)
+        self._controller_isolation_notice_timer = QTimer()
+        self._controller_isolation_notice_timer.setSingleShot(True)
+        self._controller_isolation_notice_timer.setInterval(1_000)
+        self._controller_isolation_notice_timer.timeout.connect(
+            self._show_controller_isolation_preparing_notice
+        )
         self._input_containment_service = (
             input_containment_service or create_platform_input_containment_service()
         )
@@ -334,8 +342,10 @@ class VigilApplication:
         self.window.setWindowIcon(self._application_icon)
         self.window.set_integration_statuses(self._integration_manager.initial_statuses())
 
-        self._hotkey_service.activated.connect(self.toggle_overlay)
-        self._controller_shortcut_service.activated.connect(self.toggle_overlay)
+        self._hotkey_service.activated.connect(self._toggle_overlay_from_hotkey)
+        self._controller_shortcut_service.activated.connect(
+            self._toggle_overlay_from_controller_shortcut
+        )
         self._controller_shortcut_service.capture_ready.connect(
             self.window.deliver_controller_shortcut
         )
@@ -772,7 +782,9 @@ class VigilApplication:
 
         menu = QMenu(self.window)
         toggle_action = QAction("Hide Vigil Overlay", menu)
-        toggle_action.triggered.connect(self.toggle_overlay)
+        toggle_action.triggered.connect(
+            lambda _checked=False: self.toggle_overlay(source="tray-menu")
+        )
         reset_action = QAction("Reset Window Position", menu)
         reset_action.triggered.connect(self.reset_window_position)
         quit_action = QAction("Exit Vigil Overlay", menu)
@@ -799,7 +811,7 @@ class VigilApplication:
         # emit both Trigger and DoubleClick for one double-click, which would toggle
         # twice and leave the overlay in its original state.
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self.toggle_overlay()
+            self.toggle_overlay(source="tray-icon")
 
     def _handle_controller_connection_changed(
         self,
@@ -1010,10 +1022,14 @@ class VigilApplication:
     def _release_visible_input_control(self, reason: str) -> None:
         """Drop all process/global containment state before hiding or shutdown."""
 
+        self._set_fps_game_focus_preserved(False)
         had_lease_state = self._foreground_claim_pending or self._foreground_verified
         had_controller_isolation = (
-            self._focus_preserving_input_active or self._controller_isolation_service.active
+            self._focus_preserving_input_active
+            or self._controller_isolation_service.release_required
         )
+        self._pending_overlay_show = False
+        self._controller_isolation_notice_timer.stop()
         self._controller_isolation_health_timer.stop()
         self._foreground_ownership_timer.stop()
         self._foreground_ownership_service.release()
@@ -1042,15 +1058,47 @@ class VigilApplication:
     def _maintain_controller_isolation(self) -> None:
         """Hide immediately if the fail-safe HidHide lease stops being trustworthy."""
 
+        phase = self._controller_isolation_service.poll()
+        if self._pending_overlay_show:
+            if phase is ControllerIsolationPhase.PREPARING:
+                return
+            self._pending_overlay_show = False
+            self._controller_isolation_notice_timer.stop()
+            if phase is ControllerIsolationPhase.ACTIVE:
+                self._present_overlay(isolated=True)
+            elif phase is ControllerIsolationPhase.FAILED_SAFE:
+                _LOGGER.warning(
+                    "Focus-preserving controller isolation was unavailable; using "
+                    "foreground ownership instead: %s",
+                    self._controller_isolation_service.detail,
+                )
+                self._present_overlay(isolated=False)
+            else:
+                _LOGGER.critical(
+                    "HidHide pass-through is uncertain after preparation: %s",
+                    self._controller_isolation_service.detail,
+                )
+                self._show_controller_isolation_critical_warning()
+                if not self._controller_isolation_service.release_required:
+                    self._controller_isolation_health_timer.stop()
+            self._sync_tray_action()
+            return
+
         if not self._focus_preserving_input_active:
-            if not self._controller_isolation_service.active:
+            if not self._controller_isolation_service.release_required:
                 self._controller_isolation_health_timer.stop()
                 return
-            if self._controller_isolation_service.deactivate(timeout_seconds=0.1):
-                _LOGGER.warning("Recovered uncertain HidHide state and restored pass-through")
+            if phase is ControllerIsolationPhase.ACTIVE:
+                if self._controller_isolation_service.deactivate(timeout_seconds=0.1):
+                    _LOGGER.warning("Cancelled controller isolation and restored pass-through")
+                    self._controller_isolation_health_timer.stop()
+            elif phase in {
+                ControllerIsolationPhase.OFF,
+                ControllerIsolationPhase.FAILED_SAFE,
+            }:
                 self._controller_isolation_health_timer.stop()
             return
-        if self._controller_isolation_service.maintain():
+        if phase is ControllerIsolationPhase.ACTIVE:
             return
         _LOGGER.critical(
             "Focus-preserving controller isolation was lost: %s",
@@ -1059,6 +1107,31 @@ class VigilApplication:
         self._release_visible_input_control("controller isolation health check failed")
         self.window.request_hide()
         self._sync_tray_action()
+
+    def _show_controller_isolation_preparing_notice(self) -> None:
+        if (
+            not self._pending_overlay_show
+            or self._controller_isolation_service.phase is not ControllerIsolationPhase.PREPARING
+        ):
+            return
+        tray = self._tray
+        if tray is not None:
+            tray.showMessage(
+                "Preparing controller isolation",
+                "Vigil will open when controller isolation is ready.",
+                QSystemTrayIcon.MessageIcon.Information,
+                4_000,
+            )
+
+    def _show_controller_isolation_critical_warning(self) -> None:
+        tray = self._tray
+        if tray is not None:
+            tray.showMessage(
+                "Controller isolation needs attention",
+                "Open HidHide and turn off Enable device hiding.",
+                QSystemTrayIcon.MessageIcon.Critical,
+                8_000,
+            )
 
     def _log_input_control_status(self, reason: str) -> None:
         status = self.input_control_diagnostics
@@ -1082,16 +1155,28 @@ class VigilApplication:
             status.mode is OverlayInputMode.CONTROLLER_PRIMARY
             and not status.gameinput_exclusivity_active
         ):
-            _LOGGER.warning(
-                "Controller-primary is using the XInput compatibility route; GameInput "
-                "exclusivity is unavailable and background controller consumers may react"
-            )
+            if self._focus_preserving_input_active:
+                _LOGGER.info(
+                    "Controller-primary navigation is using XInput while the HidHide "
+                    "watchdog provides background isolation; GameInput Guide delivery "
+                    "remains independent"
+                )
+            else:
+                _LOGGER.warning(
+                    "Controller-primary is using the XInput compatibility route; GameInput "
+                    "exclusivity is unavailable and background controller consumers may react"
+                )
 
-    def _handle_controller_command(self, command: NavigationCommand) -> None:
+    def _handle_controller_command(
+        self,
+        command: NavigationCommand,
+        *,
+        toggle_source: str = "controller-command",
+    ) -> None:
         """Route controller input through the same command boundary as keyboard input."""
 
         if command is NavigationCommand.TOGGLE_OVERLAY:
-            self.toggle_overlay()
+            self.toggle_overlay(source=toggle_source)
             return
         if not self.window.isVisible():
             return
@@ -1114,7 +1199,7 @@ class VigilApplication:
             return
         if not self._config.controller.guide_button_enabled:
             return
-        self._handle_controller_command(command)
+        self._handle_controller_command(command, toggle_source="gameinput-guide")
 
     def _handle_guide_availability_changed(self, active: bool, detail: str) -> None:
         """Recompute hidden-instance recovery whenever Guide capture changes."""
@@ -1145,6 +1230,9 @@ class VigilApplication:
             _LOGGER.error("Ignored invalid game library payload: %r", type(library))
             return
         self._current_game_library = library
+        set_known_games = getattr(self._fps_service, "set_known_games", None)
+        if callable(set_known_games):
+            set_known_games(library.all_provider_games)
         recent = select_recent_games(library, limit=6)
         self._recent_games = recent
         self._refresh_home_games()
@@ -1236,8 +1324,25 @@ class VigilApplication:
         )
         self.window.request_hide()
 
-    def toggle_overlay(self) -> None:
-        if self.window.isVisible():
+    def _toggle_overlay_from_hotkey(self) -> None:
+        self.toggle_overlay(source="global-hotkey")
+
+    def _toggle_overlay_from_controller_shortcut(self) -> None:
+        self.toggle_overlay(source="controller-shortcut")
+
+    def toggle_overlay(self, *, source: str = "direct") -> None:
+        _LOGGER.info(
+            "Overlay toggle requested: source=%s visible=%s",
+            source,
+            self.window.isVisible(),
+        )
+        if self._pending_overlay_show:
+            self._pending_overlay_show = False
+            self._controller_isolation_notice_timer.stop()
+            self._controller_isolation_service.cancel_pending_activation()
+            self._controller_isolation_health_timer.start()
+            _LOGGER.info("Pending overlay show cancelled before HidHide activation")
+        elif self.window.isVisible():
             self._release_visible_input_control("overlay toggle requested hide")
             self.window.request_hide()
         else:
@@ -1245,13 +1350,11 @@ class VigilApplication:
         self._sync_tray_action()
 
     def _show_overlay(self) -> None:
-        self._fps_service.set_overlay_visible(True)
+        if self._pending_overlay_show:
+            return
         self._refresh_home_games()
         self._request_home_library_refresh()
-        target_found = self._prepare_fps_target()
         self._show_overlay_with_safe_input_mode()
-        if not target_found:
-            QTimer.singleShot(0, self._prepare_fps_target)
 
     def _show_overlay_with_safe_input_mode(self) -> None:
         """Preserve game focus only after a verified HidHide lease is active."""
@@ -1262,34 +1365,29 @@ class VigilApplication:
             and self._controller_connected_state
             and not self._config.controller.allow_mouse_navigation_while_controller_connected
         )
-        isolated = requested and self._controller_isolation_service.activate()
-        self._focus_preserving_input_active = isolated
-        self.window.show_overlay(preserve_foreground=isolated)
-        if isolated:
-            self._controller_isolation_health_timer.start()
-            self._foreground_ownership_timer.stop()
-            self._foreground_ownership_service.release()
-            self._foreground_claim_pending = False
-            self._foreground_loss_confirming = False
-            self._foreground_verified = False
-            self._sync_input_policy(overlay_visible=True)
-            self._log_input_control_status("focus-preserving controller isolation acquired")
-            return
-        if requested and self._controller_isolation_service.active:
-            self._controller_isolation_health_timer.start()
-            _LOGGER.critical(
-                "HidHide pass-through is uncertain after a failed activation: %s",
-                self._controller_isolation_service.detail,
-            )
-            tray = self._tray
-            if tray is not None:
-                tray.showMessage(
-                    "Controller isolation needs attention",
-                    "Open HidHide and turn off Enable device hiding.",
-                    QSystemTrayIcon.MessageIcon.Critical,
-                    8_000,
-                )
         if requested:
+            phase = self._controller_isolation_service.begin_activation()
+            if phase is ControllerIsolationPhase.PREPARING:
+                self._pending_overlay_show = True
+                self._controller_isolation_notice_timer.start()
+                self._controller_isolation_health_timer.start()
+                self._fps_service.set_overlay_visible(False)
+                self._sync_input_policy(overlay_visible=False)
+                return
+            if phase is ControllerIsolationPhase.ACTIVE:
+                self._present_overlay(isolated=True)
+                return
+            if phase is ControllerIsolationPhase.FAILED_UNCERTAIN:
+                self._fps_service.set_overlay_visible(False)
+                self._sync_input_policy(overlay_visible=False)
+                if self._controller_isolation_service.release_required:
+                    self._controller_isolation_health_timer.start()
+                _LOGGER.critical(
+                    "HidHide pass-through is uncertain after a failed activation: %s",
+                    self._controller_isolation_service.detail,
+                )
+                self._show_controller_isolation_critical_warning()
+                return
             _LOGGER.warning(
                 "Focus-preserving controller isolation was unavailable; using foreground "
                 "ownership instead: %s",
@@ -1306,7 +1404,34 @@ class VigilApplication:
                 "Focus-preserving controller isolation deferred because no controller "
                 "is currently connected"
             )
+        self._present_overlay(isolated=False)
+
+    def _present_overlay(self, *, isolated: bool) -> None:
+        """Publish visibility only after the selected input mode is ready."""
+
+        self._focus_preserving_input_active = isolated
+        self._set_fps_game_focus_preserved(isolated)
+        self.window.show_overlay(preserve_foreground=isolated)
+        self._fps_service.set_overlay_visible(True)
+        target_found = self._prepare_fps_target()
+        if not target_found:
+            QTimer.singleShot(0, self._prepare_fps_target)
+        if isolated:
+            self._controller_isolation_health_timer.start()
+            self._foreground_ownership_timer.stop()
+            self._foreground_ownership_service.release()
+            self._foreground_claim_pending = False
+            self._foreground_loss_confirming = False
+            self._foreground_verified = False
+            self._sync_input_policy(overlay_visible=True)
+            self._log_input_control_status("focus-preserving controller isolation acquired")
+            return
         self._begin_foreground_input_lease()
+
+    def _set_fps_game_focus_preserved(self, preserved: bool) -> None:
+        callback = getattr(self._fps_service, "set_game_focus_preserved", None)
+        if callable(callback):
+            callback(preserved)
 
     def _consume_instance_activation(self) -> None:
         guard = self._single_instance_guard
@@ -1319,9 +1444,12 @@ class VigilApplication:
     def _prepare_fps_target(self) -> bool:
         target = capture_foreground_fps_target()
         if target is None:
+            request_discovery = getattr(self._fps_service, "request_discovery", None)
+            if callable(request_discovery):
+                request_discovery()
             _LOGGER.debug(
-                "No eligible foreground or underlay FPS target was found; "
-                "preserving any active FPS session"
+                "No eligible foreground or underlay FPS seed was found; "
+                "provider/GPU discovery remains active"
             )
             return False
         self._fps_service.set_target(target)
@@ -1356,12 +1484,9 @@ class VigilApplication:
         return True, "Overlay position reset to the primary display."
 
     def reset_window_position(self) -> None:
-        self._fps_service.set_overlay_visible(True)
-        target_found = self._prepare_fps_target()
         self.window.reset_position()
-        self._show_overlay_with_safe_input_mode()
-        if not target_found:
-            QTimer.singleShot(0, self._prepare_fps_target)
+        if not self.window.isVisible() and not self._pending_overlay_show:
+            self._show_overlay()
         self._sync_tray_action()
         _LOGGER.info("Overlay window position reset")
 
@@ -1375,7 +1500,12 @@ class VigilApplication:
         action = self._tray_toggle_action
         if action is None:
             return
-        action.setText("Hide Vigil Overlay" if self.window.isVisible() else "Show Vigil Overlay")
+        if self._pending_overlay_show:
+            action.setText("Cancel Showing Vigil Overlay")
+        else:
+            action.setText(
+                "Hide Vigil Overlay" if self.window.isVisible() else "Show Vigil Overlay"
+            )
 
     def _teardown_hotkey(self) -> None:
         self._hotkey_probe_service.stop()
@@ -1408,6 +1538,7 @@ class VigilApplication:
     def quit(self) -> None:
         self._quitting = True
         self._instance_activation_timer.stop()
+        self._controller_isolation_notice_timer.stop()
         self._controller_isolation_health_timer.stop()
         self._input_containment_health_timer.stop()
         self._release_visible_input_control("application quit")
@@ -1440,7 +1571,7 @@ class VigilApplication:
         self._integration_status_service.request(self._current_game_library)
         self._telemetry_service.start()
         self._fps_service.start()
-        self._fps_service.set_overlay_visible(True)
+        self._fps_service.set_overlay_visible(False)
         self._controller_service.start()
         self._raw_controller_service.start()
         if (
@@ -1448,13 +1579,10 @@ class VigilApplication:
             or "gameinput:guide" in self._config.controller.shortcut_controls
         ):
             self._guide_button_service.start()
-        target_found = self._prepare_fps_target()
-        self._show_overlay_with_safe_input_mode()
+        self._show_overlay()
         if self._startup_hotkey_failure is not None:
             QTimer.singleShot(0, self._show_startup_hotkey_failure)
         QTimer.singleShot(1_500, self._update_check_service.check)
-        if not target_found:
-            QTimer.singleShot(0, self._prepare_fps_target)
         return self.qt_app.exec()
 
     def _show_startup_hotkey_failure(self) -> None:
@@ -1469,6 +1597,7 @@ class VigilApplication:
 
     def _before_quit(self) -> None:
         self._instance_activation_timer.stop()
+        self._controller_isolation_notice_timer.stop()
         self._controller_isolation_health_timer.stop()
         self._input_containment_health_timer.stop()
         self._release_visible_input_control("Qt application shutdown")

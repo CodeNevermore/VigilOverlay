@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,17 +16,22 @@ class FpsTarget:
     process_id: int
     executable_name: str
     process_started_at_100ns: int | None = None
+    executable_path: str | None = None
+    gpu_usage_percent: float | None = None
 
     def __post_init__(self) -> None:
         if self.process_id <= 0:
             raise ValueError("process_id must be positive")
         if not self.executable_name.strip():
             raise ValueError("executable_name must not be empty")
-        if (
-            self.process_started_at_100ns is not None
-            and self.process_started_at_100ns <= 0
-        ):
+        if self.process_started_at_100ns is not None and self.process_started_at_100ns <= 0:
             raise ValueError("process_started_at_100ns must be positive when provided")
+        if self.executable_path is not None and not self.executable_path.strip():
+            raise ValueError("executable_path must not be empty when provided")
+        if self.gpu_usage_percent is not None and (
+            not math.isfinite(self.gpu_usage_percent) or self.gpu_usage_percent < 0.0
+        ):
+            raise ValueError("gpu_usage_percent must be finite and non-negative when provided")
 
     @property
     def identity_key(self) -> tuple[int, int | str]:

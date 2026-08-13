@@ -11,7 +11,7 @@
   #error HidHideInstaller must point to the approved official HidHide installer.
 #endif
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.2.4"
+  #define MyAppVersion "0.1.3.0"
 #endif
 
 #define MyAppName "Vigil Overlay"

@@ -40,9 +40,7 @@ class GameProviderRegistration:
             raise ValueError("allowed_uri_schemes must not contain duplicates")
         for scheme in normalized:
             if not scheme or any(character.isspace() for character in scheme):
-                raise ValueError(
-                    "allowed URI schemes must be non-empty and contain no whitespace"
-                )
+                raise ValueError("allowed URI schemes must be non-empty and contain no whitespace")
         if type(self.aggregation_priority) is not int or self.aggregation_priority < 0:
             raise ValueError("aggregation_priority must be a non-negative integer")
         object.__setattr__(self, "allowed_uri_schemes", normalized)
@@ -119,6 +117,21 @@ class AggregatedGameLibrary:
     games: tuple[GameRecord, ...]
     provider_results: tuple[ProviderAggregationResult, ...]
 
+    @property
+    def all_provider_games(self) -> tuple[GameRecord, ...]:
+        """Return every retained provider record in stable aggregation order."""
+
+        provider_games = tuple(
+            game
+            for result in self.provider_results
+            if result.snapshot is not None
+            for game in result.snapshot.games
+        )
+        # Some tests and third-party callers construct the aggregate directly
+        # without provider snapshots. Keep that supported while avoiding canonical
+        # deduplication whenever provider evidence is available.
+        return provider_games or self.games
+
     def game(self, identity: GameIdentity) -> GameRecord | None:
         for game in self.games:
             if game.identity == identity:
@@ -169,11 +182,7 @@ class GameLibraryAggregator:
                 cancellation_event=cancellation_event,
             )
             previous = self._cached_results.get(current_id)
-            if (
-                result.snapshot is None
-                and previous is not None
-                and previous.snapshot is not None
-            ):
+            if result.snapshot is None and previous is not None and previous.snapshot is not None:
                 result = ProviderAggregationResult(
                     provider_id=current_id,
                     snapshot=previous.snapshot,
@@ -184,8 +193,7 @@ class GameLibraryAggregator:
         ordered_results = tuple(
             self._cached_results[current_id]
             for current_id in (
-                registration.provider.descriptor.provider_id
-                for registration in registrations
+                registration.provider.descriptor.provider_id for registration in registrations
             )
             if current_id in self._cached_results
         )
@@ -210,15 +218,11 @@ class GameLibraryAggregator:
         try:
             snapshot = provider.discover_games(context)
             if snapshot.provider.provider_id != provider_id:
-                raise ValueError(
-                    "provider returned a snapshot owned by a different provider"
-                )
+                raise ValueError("provider returned a snapshot owned by a different provider")
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             _LOGGER.warning("Game provider %s failed: %s", provider_id, message)
-            return ProviderAggregationResult(
-                provider_id=provider_id, snapshot=None, error=message
-            )
+            return ProviderAggregationResult(provider_id=provider_id, snapshot=None, error=message)
         return ProviderAggregationResult(provider_id=provider_id, snapshot=snapshot)
 
 
@@ -301,9 +305,7 @@ def _find_cross_provider_duplicate(
     install_key = _normalized_install_directory(candidate.install_directory)
     if install_key is not None:
         candidate_indexes.update(install_index.get(install_key, ()))
-    candidate_indexes.update(
-        title_index.get(_normalized_game_title(candidate.title), ())
-    )
+    candidate_indexes.update(title_index.get(_normalized_game_title(candidate.title), ()))
 
     for index in sorted(candidate_indexes):
         existing = existing_games[index]
@@ -403,9 +405,7 @@ def select_recent_games(
     eligible = [
         game
         for game in library.games
-        if game.is_available
-        and game.launch_target is not None
-        and game.recency is not None
+        if game.is_available and game.launch_target is not None and game.recency is not None
     ]
     timestamped = [
         game

@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import sys
+import time
 from collections.abc import Callable
 from typing import Any, Final, Protocol, cast
 
@@ -23,6 +24,7 @@ _LOGGER = logging.getLogger("vigil_overlay")
 _GAMEINPUT_SYSTEM_BUTTON_GUIDE: Final[int] = 0x00000001
 _GAMEINPUT_EXCLUSIVE_FOREGROUND_INPUT: Final[int] = 0x00000002
 _GAMEINPUT_ENABLE_BACKGROUND_GUIDE_BUTTON: Final[int] = 0x00000080
+_GUIDE_DUPLICATE_SUPPRESSION_SECONDS: Final[float] = 1.5
 
 # IUnknown occupies vtable slots 0-2. These are the v2 IGameInput method slots
 # from Microsoft's versioned GameInput v2 interface declaration.
@@ -80,9 +82,7 @@ class GuideButtonBackend(Protocol):
 class UnsupportedGuideButtonBackend:
     """Safe backend used where GameInput v2 Guide delivery is unavailable."""
 
-    def __init__(
-        self, detail: str = "GameInput Guide-button delivery is unavailable"
-    ) -> None:
+    def __init__(self, detail: str = "GameInput Guide-button delivery is unavailable") -> None:
         self._detail = detail
 
     @property
@@ -229,7 +229,11 @@ class GameInputGuideButtonBackend:
     @staticmethod
     def _make_system_button_callback(
         on_guide_pressed: Callable[[], None],
+        *,
+        clock: Callable[[], float] = time.monotonic,
     ) -> Callable[[int, int | None, int | None, int, int, int], None]:
+        last_emitted_press_at: float | None = None
+
         def callback(
             callback_token: int,
             context: int | None,
@@ -238,11 +242,36 @@ class GameInputGuideButtonBackend:
             current_buttons: int,
             previous_buttons: int,
         ) -> None:
-            del callback_token, context, device, timestamp
+            nonlocal last_emitted_press_at
+            del context
             pressed_now = bool(current_buttons & _GAMEINPUT_SYSTEM_BUTTON_GUIDE)
             pressed_before = bool(previous_buttons & _GAMEINPUT_SYSTEM_BUTTON_GUIDE)
-            if pressed_now and not pressed_before:
-                on_guide_pressed()
+            if pressed_now != pressed_before:
+                _LOGGER.info(
+                    "GameInput Guide transition: edge=%s callback_token=%d device=%r "
+                    "timestamp=%d current=0x%08X previous=0x%08X",
+                    "pressed" if pressed_now else "released",
+                    callback_token,
+                    device,
+                    timestamp,
+                    current_buttons,
+                    previous_buttons,
+                )
+            if not pressed_now or pressed_before:
+                return
+            observed_at = clock()
+            if (
+                last_emitted_press_at is not None
+                and observed_at - last_emitted_press_at < _GUIDE_DUPLICATE_SUPPRESSION_SECONDS
+            ):
+                _LOGGER.warning(
+                    "Suppressed duplicate GameInput Guide press after %.3f seconds; "
+                    "HidHide device re-enumeration may have replayed the held button state",
+                    observed_at - last_emitted_press_at,
+                )
+                return
+            last_emitted_press_at = observed_at
+            on_guide_pressed()
 
         return callback
 
@@ -267,9 +296,7 @@ class GameInputGuideButtonBackend:
         interface = ctypes.c_void_p()
         result = int(create(ctypes.byref(interface)))
         if _hresult_failed(result) or not interface.value:
-            raise OSError(
-                f"GameInputCreate failed with HRESULT 0x{result & 0xFFFFFFFF:08X}"
-            )
+            raise OSError(f"GameInputCreate failed with HRESULT 0x{result & 0xFFFFFFFF:08X}")
         return interface
 
     @classmethod
@@ -370,9 +397,7 @@ class ControllerInputOwnershipBackend(Protocol):
 class UnsupportedControllerInputOwnershipBackend:
     """Fail-open controller-ownership backend for unsupported environments."""
 
-    def __init__(
-        self, detail: str = "GameInput controller ownership is unavailable"
-    ) -> None:
+    def __init__(self, detail: str = "GameInput controller ownership is unavailable") -> None:
         self._detail = detail
 
     @property
@@ -411,15 +436,12 @@ class GameInputControllerInputOwnershipBackend:
         library = GameInputGuideButtonBackend._load_library()
         base_interface = GameInputGuideButtonBackend._create_base_interface(library)
         try:
-            v2_interface = GameInputGuideButtonBackend._query_v2_interface(
-                base_interface
-            )
+            v2_interface = GameInputGuideButtonBackend._query_v2_interface(base_interface)
         finally:
             GameInputGuideButtonBackend._release_interface(base_interface)
         if v2_interface is None:
             self._detail = (
-                "Installed GameInput runtime does not expose the v2 "
-                "focus-policy interface"
+                "Installed GameInput runtime does not expose the v2 focus-policy interface"
             )
             _LOGGER.warning(self._detail)
             return False
@@ -483,14 +505,10 @@ class ControllerInputOwnershipService:
             self.set_background_guide_enabled(background_guide_enabled)
             return
         try:
-            self._active = self._backend.start(
-                background_guide_enabled=background_guide_enabled
-            )
+            self._active = self._backend.start(background_guide_enabled=background_guide_enabled)
         except Exception:
             self._active = False
-            _LOGGER.exception(
-                "GameInput exclusive foreground controller ownership could not start"
-            )
+            _LOGGER.exception("GameInput exclusive foreground controller ownership could not start")
 
     def deactivate(self) -> None:
         if self._closed or not self._active:
@@ -507,9 +525,7 @@ class ControllerInputOwnershipService:
         try:
             self._backend.set_background_guide_enabled(enabled)
         except Exception:
-            _LOGGER.exception(
-                "GameInput controller ownership policy could not be updated"
-            )
+            _LOGGER.exception("GameInput controller ownership policy could not be updated")
 
     def stop(self) -> None:
         if self._closed:
@@ -518,15 +534,11 @@ class ControllerInputOwnershipService:
         self._closed = True
 
 
-def create_platform_controller_input_ownership_service() -> (
-    ControllerInputOwnershipService
-):
+def create_platform_controller_input_ownership_service() -> ControllerInputOwnershipService:
     """Create the GameInput ownership service appropriate for this platform."""
 
     if sys.platform == "win32":
-        return ControllerInputOwnershipService(
-            GameInputControllerInputOwnershipBackend()
-        )
+        return ControllerInputOwnershipService(GameInputControllerInputOwnershipBackend())
     return ControllerInputOwnershipService(
         UnsupportedControllerInputOwnershipBackend(
             "GameInput exclusive foreground controller ownership requires Windows"
@@ -540,9 +552,7 @@ class GuideButtonInputService(QObject):
     command_ready = Signal(object)
     availability_changed = Signal(bool, str)
 
-    def __init__(
-        self, backend: GuideButtonBackend, parent: QObject | None = None
-    ) -> None:
+    def __init__(self, backend: GuideButtonBackend, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._backend = backend
         self._active = False
@@ -606,9 +616,7 @@ def create_platform_guide_button_service() -> GuideButtonInputService:
     if sys.platform == "win32":
         return GuideButtonInputService(GameInputGuideButtonBackend())
     return GuideButtonInputService(
-        UnsupportedGuideButtonBackend(
-            "GameInput Guide-button delivery requires Windows"
-        )
+        UnsupportedGuideButtonBackend("GameInput Guide-button delivery requires Windows")
     )
 
 

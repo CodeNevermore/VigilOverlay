@@ -21,6 +21,7 @@ import ctypes
 import hashlib
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from collections.abc import Callable, Sequence
 from contextlib import contextmanager, suppress
 from ctypes import wintypes
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
@@ -89,7 +91,11 @@ _FRESH_HIDHIDE_INSTALL_RECEIPT_VALUE_NAMES: Final = (
     "State",
 )
 _MAX_AUTOMATIC_DEVICE_IDS: Final = 32
-_WATCHDOG_DEVICE_REFRESH_SECONDS: Final = 1.0
+_LEASE_SCHEMA: Final = 3
+_STATUS_SCHEMA: Final = 2
+_WATCHDOG_DEVICE_REFRESH_SECONDS: Final = 5.0
+_WATCHDOG_HEARTBEAT_TIMEOUT_SECONDS: Final = 15.0
+_WATCHDOG_HEARTBEAT_FUTURE_TOLERANCE_SECONDS: Final = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +129,16 @@ class ControllerIsolationReadiness:
     configured_device_count: int = 0
 
 
+class ControllerIsolationPhase(StrEnum):
+    """One externally observable phase of the fail-safe HidHide lease."""
+
+    OFF = "off"
+    PREPARING = "preparing"
+    ACTIVE = "active"
+    FAILED_SAFE = "failed_safe"
+    FAILED_UNCERTAIN = "failed_uncertain"
+
+
 @dataclass(frozen=True, slots=True)
 class FreshHidHideConfigurationOutcome:
     """Result of consuming a trusted fresh-install configuration marker."""
@@ -149,6 +165,15 @@ class _ManagedHidHideSyncOutcome:
     state: HidHideState
     verified_device_ids: frozenset[str]
     changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedHidHideLease:
+    """Verified pre-activation state produced by the sole watchdog client."""
+
+    readiness: ControllerIsolationReadiness
+    state: HidHideState | None = None
+    managed_configuration: bool = False
 
 
 class ControllerIsolationBackend(Protocol):
@@ -618,12 +643,24 @@ class ControllerIsolationService:
         self._lease_path: Path | None = None
         self._watchdog: subprocess.Popen[bytes] | None = None
         self._configuration_fingerprint: str | None = None
-        self._active = False
+        self._managed_configuration = False
+        self._phase = ControllerIsolationPhase.OFF
+        self._activation_started_at: float | None = None
         self._detail = "Controller isolation is off"
 
     @property
     def active(self) -> bool:
-        return self._active
+        return self._phase is ControllerIsolationPhase.ACTIVE
+
+    @property
+    def phase(self) -> ControllerIsolationPhase:
+        return self._phase
+
+    @property
+    def release_required(self) -> bool:
+        """Return whether a helper or uncertain global switch still needs release."""
+
+        return self._lease_path is not None
 
     @property
     def available(self) -> bool:
@@ -745,6 +782,11 @@ class ControllerIsolationService:
         )
 
     def readiness(self) -> ControllerIsolationReadiness:
+        if self.release_required:
+            return ControllerIsolationReadiness(
+                self._phase is ControllerIsolationPhase.ACTIVE,
+                self._detail,
+            )
         if not self._backend.supported:
             return ControllerIsolationReadiness(
                 False,
@@ -753,190 +795,203 @@ class ControllerIsolationService:
                 "restart Windows if requested.",
             )
         try:
-            managed_sync = _synchronize_owned_hidhide_configuration(
-                self._backend,
-                self._ownership_path,
-            )
-            if managed_sync is None:
-                state = self._backend.snapshot()
-                gaming_ids = self._backend.verified_gaming_device_ids()
-            else:
-                state = managed_sync.state
-                gaming_ids = managed_sync.verified_device_ids
+            return _prepare_hidhide_lease(self._backend, self._ownership_path).readiness
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return ControllerIsolationReadiness(False, str(exc))
-        if state.active:
-            return ControllerIsolationReadiness(
-                False,
-                "Turn off 'Enable device hiding' in HidHide before Vigil takes a lease.",
-            )
-        if state.inverse:
-            return ControllerIsolationReadiness(
-                False,
-                "HidHide inverse application mode is not safe for Vigil controller isolation.",
-            )
-        if not state.blocked_device_ids:
-            return ControllerIsolationReadiness(
-                False,
-                "Select only the controller to hide in the official HidHide client.",
-            )
-        application = self._backend.application_full_image_name
-        allowed = {value.casefold() for value in state.allowed_application_paths}
-        if application is None or application.casefold() not in allowed:
-            return ControllerIsolationReadiness(
-                False,
-                "Add the installed VigilOverlay.exe to HidHide's Applications list.",
-            )
-        configured = {value.casefold() for value in state.blocked_device_ids}
-        verified = {value.casefold() for value in gaming_ids}
-        unverified = sorted(configured - verified)
-        if unverified and managed_sync is None:
-            return ControllerIsolationReadiness(
-                False,
-                "HidHide includes an absent or non-gaming input. Remove it before enabling "
-                "Vigil isolation.",
-            )
-        return ControllerIsolationReadiness(
-            True,
-            (
-                "HidHide is safely managed by Vigil; new controllers are added automatically."
-                if managed_sync is not None
-                else "HidHide is safely configured for focus-preserving controller isolation."
-            ),
-            len(configured),
-        )
 
-    def activate(self, *, timeout_seconds: float = 3.0) -> bool:
-        if self._active:
-            if self.maintain():
-                return True
-            self.deactivate(timeout_seconds=min(timeout_seconds, 0.5))
-            return False
-        readiness = self.readiness()
-        self._detail = readiness.detail
-        if not readiness.ready:
-            return False
-        state = self._backend.snapshot()
-        self._lease_root.mkdir(parents=True, exist_ok=True)
+    def begin_activation(self) -> ControllerIsolationPhase:
+        """Start a watchdog-owned activation without blocking the caller."""
+
+        if self._phase is ControllerIsolationPhase.PREPARING:
+            return self._phase
+        if self._phase is ControllerIsolationPhase.ACTIVE:
+            return self.poll()
+        if self.release_required and not self.deactivate(timeout_seconds=0.5):
+            return self._phase
+        if not self._backend.supported:
+            self._phase = ControllerIsolationPhase.FAILED_UNCERTAIN
+            self._detail = (
+                self._backend.availability_detail
+                + " Install HidHide with Vigil Setup or the official package, and restart "
+                "Windows if requested. HidHide pass-through could not be verified."
+            )
+            return self._phase
+
         lease_path = self._lease_root / f"{_LEASE_PREFIX}{uuid.uuid4().hex}{_LEASE_SUFFIX}"
         try:
-            managed_configuration = _state_matches_managed_hidhide_configuration(
-                self._backend,
-                self._ownership_path,
-                state,
+            self._lease_root.mkdir(parents=True, exist_ok=True)
+            _write_lease(
+                lease_path,
+                {
+                    "schema": _LEASE_SCHEMA,
+                    "owner_pid": os.getpid(),
+                    "activation_authorized": False,
+                },
             )
-        except OSError:
-            managed_configuration = False
-        payload = {
-            "schema": 2,
-            "owner_pid": os.getpid(),
-            "configuration_fingerprint": state.configuration_fingerprint,
-            "managed_configuration": managed_configuration,
-        }
-        atomic_write_text(
-            lease_path,
-            json.dumps(payload, sort_keys=True) + "\n",
-            temporary_suffix=".tmp",
-            fsync=True,
-        )
-        try:
+            if not _write_status(
+                lease_path,
+                "preparing",
+                "Waiting for the controller-isolation watchdog.",
+                clock=self._clock,
+            ):
+                raise OSError("could not initialize watchdog status")
             watchdog = self._process_launcher(_watchdog_command(lease_path))
-        except OSError as exc:
-            _safe_unlink(lease_path)
-            self._detail = f"Controller isolation watchdog could not start: {exc}"
-            return False
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            _cleanup_lease_files(lease_path)
+            self._phase = ControllerIsolationPhase.FAILED_UNCERTAIN
+            self._detail = (
+                f"Controller isolation watchdog could not start: {exc}. HidHide "
+                "pass-through could not be verified."
+            )
+            return self._phase
 
         self._lease_path = lease_path
         self._watchdog = watchdog
-        status = _wait_for_status(
-            _status_path(lease_path),
-            expected={"active", "error"},
-            timeout_seconds=timeout_seconds,
-            clock=self._clock,
-        )
-        if status.get("state") != "active":
-            failure_detail = str(
-                status.get("detail", "Controller isolation watchdog did not become ready")
+        self._configuration_fingerprint = None
+        self._managed_configuration = False
+        self._activation_started_at = self._clock()
+        self._phase = ControllerIsolationPhase.PREPARING
+        self._detail = "Preparing controller isolation."
+        return self._phase
+
+    def activate(self, *, timeout_seconds: float = 3.0) -> bool:
+        """Compatibility wrapper for non-Qt callers that need a bounded wait."""
+
+        phase = self.begin_activation()
+        deadline = self._clock() + timeout_seconds
+        while phase is ControllerIsolationPhase.PREPARING and self._clock() < deadline:
+            time.sleep(0.05)
+            phase = self.poll()
+        if phase is ControllerIsolationPhase.PREPARING:
+            self.cancel_pending_activation()
+            self.deactivate(timeout_seconds=min(timeout_seconds, 0.5))
+        return self._phase is ControllerIsolationPhase.ACTIVE
+
+    def poll(self) -> ControllerIsolationPhase:
+        """Consume the helper's atomic state without opening HidHide's driver."""
+
+        if not self.release_required:
+            return self._phase
+        lease_path = self._lease_path
+        watchdog = self._watchdog
+        if lease_path is None:
+            self._phase = ControllerIsolationPhase.FAILED_UNCERTAIN
+            self._detail = "Controller isolation lease was lost unexpectedly."
+            return self._phase
+
+        status = _read_status(_status_path(lease_path))
+        status_state = status.get("state")
+        now = self._clock()
+        if not status:
+            return self._recover_failed_watchdog(
+                "Controller isolation watchdog did not publish a fresh status."
             )
-            self._request_watchdog_release()
-            self._stop_watchdog_if_running()
-            if self._force_pass_through():
+        if not _status_heartbeat_is_fresh(status, now=now):
+            return self._recover_failed_watchdog(
+                "Controller isolation watchdog heartbeat became stale."
+            )
+        if watchdog is None or watchdog.poll() is not None:
+            if _status_confirms_pass_through(status):
+                detail = str(status.get("detail", "Controller isolation released safely."))
                 _cleanup_lease_files(lease_path)
-                self._clear_lease_state()
-                self._detail = failure_detail
-            else:
-                self._active = True
-                self._detail = (
-                    f"{failure_detail} HidHide pass-through could not be verified; "
-                    "open its Configuration Client and turn off Enable device hiding."
+                self._clear_lease_state(phase=ControllerIsolationPhase.FAILED_SAFE)
+                self._detail = detail
+                return self._phase
+            return self._recover_failed_watchdog(
+                str(status.get("detail", "Controller isolation watchdog exited unexpectedly."))
+            )
+
+        if status_state == "error":
+            if _status_confirms_pass_through(status):
+                detail = str(status.get("detail", "Controller isolation was not available."))
+                self._request_watchdog_release()
+                self._stop_watchdog_if_running()
+                _cleanup_lease_files(lease_path)
+                self._clear_lease_state(phase=ControllerIsolationPhase.FAILED_SAFE)
+                self._detail = detail
+                return self._phase
+            return self._recover_failed_watchdog(
+                str(status.get("detail", "Controller isolation watchdog reported an error."))
+            )
+        if status_state == "released":
+            if not _status_confirms_pass_through(status):
+                return self._recover_failed_watchdog(
+                    "Controller isolation watchdog did not verify pass-through."
                 )
-            return False
-        self._active = True
-        self._configuration_fingerprint = state.configuration_fingerprint
-        self._detail = str(status.get("detail", readiness.detail))
-        return True
+            detail = str(status.get("detail", "Controller isolation released safely."))
+            self._stop_watchdog_if_running()
+            _cleanup_lease_files(lease_path)
+            self._clear_lease_state()
+            self._detail = detail
+            return self._phase
+        if status_state in {"preparing", "syncing"}:
+            self._detail = str(status.get("detail", "Preparing controller isolation."))
+            if self._phase is ControllerIsolationPhase.ACTIVE:
+                status_fingerprint = status.get("configuration_fingerprint")
+                if status_fingerprint != self._configuration_fingerprint:
+                    return self._recover_failed_watchdog(
+                        "Controller isolation watchdog reported an invalid refresh state."
+                    )
+            return self._phase
+        if status_state != "active":
+            return self._recover_failed_watchdog(
+                "Controller isolation watchdog reported an invalid state."
+            )
+
+        status_fingerprint = status.get("configuration_fingerprint")
+        status_managed = status.get("managed_configuration")
+        if not isinstance(status_fingerprint, str) or type(status_managed) is not bool:
+            return self._recover_failed_watchdog(
+                "Controller isolation watchdog omitted its verified configuration."
+            )
+        if self._phase is ControllerIsolationPhase.PREPARING:
+            try:
+                journal = _read_lease(lease_path)
+                journal_authorized = _lease_activation_authorized(journal)
+                journal_fingerprint = _lease_fingerprint(journal)
+                journal_managed = _lease_managed_configuration(journal)
+            except (OSError, ValueError, json.JSONDecodeError):
+                return self._recover_failed_watchdog(
+                    "Controller isolation activation journal could not be verified."
+                )
+            if (
+                not journal_authorized
+                or journal_fingerprint != status_fingerprint
+                or journal_managed != status_managed
+            ):
+                return self._recover_failed_watchdog(
+                    "Controller isolation activation journal did not match watchdog status."
+                )
+        if (
+            self._phase is ControllerIsolationPhase.ACTIVE
+            and status_fingerprint != self._configuration_fingerprint
+            and not self._managed_configuration
+        ):
+            return self._recover_failed_watchdog(
+                "HidHide configuration changed during controller isolation."
+            )
+        self._configuration_fingerprint = status_fingerprint
+        self._managed_configuration = status_managed
+        self._phase = ControllerIsolationPhase.ACTIVE
+        self._detail = str(status.get("detail", "Controller isolation is active."))
+        return self._phase
 
     def maintain(self) -> bool:
-        """Verify that the watchdog and exact HidHide lease remain intact."""
+        """Compatibility health predicate for existing non-Qt callers."""
 
-        if not self._active:
-            return True
-        watchdog = self._watchdog
-        lease_path = self._lease_path
-        if lease_path is None:
-            self._detail = "Controller isolation lease was lost unexpectedly."
-            return False
-        if watchdog is None or watchdog.poll() is not None:
-            status = _read_status(_status_path(lease_path))
-            self._detail = str(
-                status.get("detail", "Controller isolation watchdog exited unexpectedly.")
-            )
-            return False
-        try:
-            state = self._backend.snapshot()
-        except OSError as exc:
-            self._detail = f"Controller isolation could not be verified: {exc}"
-            return False
-        if not state.active:
-            self._detail = "HidHide controller isolation was turned off unexpectedly."
-            self._active = False
-            return False
-        if state.configuration_fingerprint != self._configuration_fingerprint:
-            status = _read_status(_status_path(lease_path))
-            if (
-                status.get("state") == "syncing"
-                and status.get("configuration_fingerprint") == self._configuration_fingerprint
-            ):
-                return True
-            try:
-                owned_refresh = _state_matches_managed_hidhide_configuration(
-                    self._backend,
-                    self._ownership_path,
-                    state,
-                )
-            except OSError:
-                owned_refresh = False
-            if (
-                status.get("state") == "active"
-                and status.get("configuration_fingerprint") == state.configuration_fingerprint
-                and owned_refresh
-            ):
-                self._configuration_fingerprint = state.configuration_fingerprint
-                self._detail = str(
-                    status.get(
-                        "detail",
-                        "Controller isolation updated for a newly connected controller.",
-                    )
-                )
-                return True
-            self._detail = "HidHide configuration changed during controller isolation."
-            return False
-        return True
+        phase = self.poll()
+        return phase not in {ControllerIsolationPhase.FAILED_UNCERTAIN}
+
+    def cancel_pending_activation(self) -> None:
+        if self._phase is not ControllerIsolationPhase.PREPARING:
+            return
+        self._detail = "Cancelling controller isolation preparation."
+        self._request_watchdog_release()
 
     def deactivate(self, *, timeout_seconds: float = 3.0) -> bool:
         lease_path = self._lease_path
         if lease_path is None:
-            self._active = False
+            self._phase = ControllerIsolationPhase.OFF
             return True
         self._request_watchdog_release()
         status = _wait_for_status(
@@ -945,7 +1000,9 @@ class ControllerIsolationService:
             timeout_seconds=timeout_seconds,
             clock=self._clock,
         )
-        released = status.get("state") == "released"
+        released = _status_confirms_pass_through(status) and _status_heartbeat_is_fresh(
+            status, now=self._clock()
+        )
         if not released:
             # The released HidHide API persists the switch globally. If the helper
             # failed, stop our own process before forcing pass-through so it cannot
@@ -953,6 +1010,7 @@ class ControllerIsolationService:
             self._stop_watchdog_if_running()
             released = self._force_pass_through()
         if released:
+            self._stop_watchdog_if_running()
             self._detail = str(status.get("detail", "Controller isolation released"))
             _cleanup_lease_files(lease_path)
             self._clear_lease_state()
@@ -963,9 +1021,7 @@ class ControllerIsolationService:
                 "HidHide did not return to pass-through; open its Configuration Client.",
             )
         )
-        # True here means hiding may still be active. Keep retrying release and never
-        # allow a later activation attempt to mistake this uncertain state for a lease.
-        self._active = True
+        self._phase = ControllerIsolationPhase.FAILED_UNCERTAIN
         return False
 
     def stop(self) -> None:
@@ -974,12 +1030,48 @@ class ControllerIsolationService:
     def configuration_client_path(self) -> Path | None:
         return self._backend.configuration_client_path()
 
+    def _recover_failed_watchdog(self, detail: str) -> ControllerIsolationPhase:
+        """Stop the sole driver client, then verify pass-through in this process."""
+
+        lease_path = self._lease_path
+        activation_authorized = False
+        if lease_path is not None:
+            try:
+                activation_authorized = _lease_activation_authorized(_read_lease(lease_path))
+            except (OSError, ValueError, json.JSONDecodeError):
+                # A damaged journal cannot prove that Vigil ever enabled hiding.
+                # Preserve the user's pre-existing HidHide state in that case.
+                activation_authorized = False
+        self._request_watchdog_release()
+        self._stop_watchdog_if_running()
+        if not activation_authorized:
+            if lease_path is not None:
+                _cleanup_lease_files(lease_path)
+            self._clear_lease_state(phase=ControllerIsolationPhase.FAILED_UNCERTAIN)
+            self._detail = (
+                f"{detail} Vigil had not authorized device hiding, so the existing "
+                "HidHide state was left unchanged and could not be verified."
+            )
+            return self._phase
+        if self._force_pass_through():
+            if lease_path is not None:
+                _cleanup_lease_files(lease_path)
+            self._clear_lease_state(phase=ControllerIsolationPhase.FAILED_SAFE)
+            self._detail = detail
+            return self._phase
+        self._phase = ControllerIsolationPhase.FAILED_UNCERTAIN
+        self._detail = (
+            f"{detail} HidHide pass-through could not be verified; open its Configuration "
+            "Client and turn off Enable device hiding."
+        )
+        return self._phase
+
     def _force_pass_through(self) -> bool:
         try:
             if self._backend.snapshot().active:
                 self._backend.set_active(False)
             return not self._backend.snapshot().active
-        except OSError:
+        except (OSError, ValueError, subprocess.SubprocessError):
             _LOGGER.exception("Could not force HidHide back to pass-through")
             return False
 
@@ -1019,7 +1111,11 @@ class ControllerIsolationService:
         except OSError:
             _LOGGER.exception("Could not request controller-isolation release")
 
-    def _clear_lease_state(self) -> None:
+    def _clear_lease_state(
+        self,
+        *,
+        phase: ControllerIsolationPhase = ControllerIsolationPhase.OFF,
+    ) -> None:
         watchdog = self._watchdog
         if watchdog is not None:
             with suppress(OSError):
@@ -1027,7 +1123,9 @@ class ControllerIsolationService:
         self._lease_path = None
         self._watchdog = None
         self._configuration_fingerprint = None
-        self._active = False
+        self._managed_configuration = False
+        self._activation_started_at = None
+        self._phase = phase
 
 
 def create_platform_controller_isolation_service(
@@ -1307,12 +1405,15 @@ def _synchronize_owned_hidhide_configuration(
     ownership_path: Path,
     *,
     require_managed: bool = False,
+    heartbeat: Callable[[str], None] | None = None,
 ) -> _ManagedHidHideSyncOutcome | None:
     configuration = _read_managed_hidhide_configuration(ownership_path)
     if configuration is None:
         if require_managed:
             raise OSError("Vigil's HidHide ownership record is unavailable")
         return None
+    if heartbeat is not None:
+        heartbeat("Verifying Vigil's managed HidHide configuration.")
     before = backend.snapshot()
     if not _managed_hidhide_configuration_matches(backend, configuration, before):
         _safe_unlink(ownership_path)
@@ -1324,6 +1425,8 @@ def _synchronize_owned_hidhide_configuration(
         _LOGGER.warning("Relinquished automatic HidHide management after shared settings changed")
         return None
 
+    if heartbeat is not None:
+        heartbeat("Checking for connected gaming controllers.")
     verified = backend.verified_gaming_device_ids()
     known = {value.casefold() for value in configuration.managed_device_ids}
     additions = frozenset(value for value in verified if value.casefold() not in known)
@@ -1333,7 +1436,11 @@ def _synchronize_owned_hidhide_configuration(
     if len({value.casefold() for value in expected_device_ids}) > _MAX_AUTOMATIC_DEVICE_IDS:
         raise OSError("HidHide reported too many gaming-device paths for safe automatic refresh")
 
+    if heartbeat is not None:
+        heartbeat("Adding a newly connected verified gaming controller.")
     backend.add_verified_gaming_devices(additions)
+    if heartbeat is not None:
+        heartbeat("Verifying the refreshed HidHide configuration.")
     after = backend.snapshot()
     expected = {value.casefold() for value in expected_device_ids}
     configured = {value.casefold() for value in after.blocked_device_ids}
@@ -1364,12 +1471,85 @@ def _synchronize_owned_hidhide_configuration(
     return _ManagedHidHideSyncOutcome(after, verified, True)
 
 
+def _prepare_hidhide_lease(
+    backend: ControllerIsolationBackend,
+    ownership_path: Path,
+    *,
+    heartbeat: Callable[[str], None] | None = None,
+) -> _PreparedHidHideLease:
+    """Validate one inactive lease while preserving user-owned configurations."""
+
+    managed_sync = _synchronize_owned_hidhide_configuration(
+        backend,
+        ownership_path,
+        heartbeat=heartbeat,
+    )
+    if managed_sync is None:
+        if heartbeat is not None:
+            heartbeat("Inspecting HidHide's shared configuration.")
+        state = backend.snapshot()
+        if heartbeat is not None:
+            heartbeat("Checking configured gaming controllers.")
+        gaming_ids = backend.verified_gaming_device_ids()
+    else:
+        state = managed_sync.state
+        gaming_ids = managed_sync.verified_device_ids
+
+    if state.active:
+        readiness = ControllerIsolationReadiness(
+            False,
+            "Turn off 'Enable device hiding' in HidHide before Vigil takes a lease.",
+        )
+    elif state.inverse:
+        readiness = ControllerIsolationReadiness(
+            False,
+            "HidHide inverse application mode is not safe for Vigil controller isolation.",
+        )
+    elif not state.blocked_device_ids:
+        readiness = ControllerIsolationReadiness(
+            False,
+            "Select only the controller to hide in the official HidHide client.",
+        )
+    else:
+        application = backend.application_full_image_name
+        allowed = {value.casefold() for value in state.allowed_application_paths}
+        configured = {value.casefold() for value in state.blocked_device_ids}
+        verified = {value.casefold() for value in gaming_ids}
+        unverified = sorted(configured - verified)
+        if application is None or application.casefold() not in allowed:
+            readiness = ControllerIsolationReadiness(
+                False,
+                "Add the installed VigilOverlay.exe to HidHide's Applications list.",
+            )
+        elif unverified and managed_sync is None:
+            readiness = ControllerIsolationReadiness(
+                False,
+                "HidHide includes an absent or non-gaming input. Remove it before enabling "
+                "Vigil isolation.",
+            )
+        else:
+            readiness = ControllerIsolationReadiness(
+                True,
+                (
+                    "HidHide is safely managed by Vigil; new controllers are added automatically."
+                    if managed_sync is not None
+                    else "HidHide is safely configured for focus-preserving controller isolation."
+                ),
+                len(configured),
+            )
+    return _PreparedHidHideLease(
+        readiness,
+        state,
+        managed_configuration=managed_sync is not None,
+    )
+
+
 def run_controller_isolation_watchdog(
     lease_path: Path,
     cache_root: Path,
     ownership_root: Path | None = None,
 ) -> int:
-    """Own one HidHide lease and refresh Vigil-managed controller IDs."""
+    """Prepare, own, verify, and release one HidHide lease."""
 
     expected_root = (cache_root / _LEASE_DIRECTORY_NAME).resolve()
     resolved_lease = lease_path.expanduser().resolve()
@@ -1382,48 +1562,152 @@ def run_controller_isolation_watchdog(
     try:
         payload = _read_lease(resolved_lease)
         owner_pid = _lease_owner_pid(payload)
-        fingerprint = _lease_fingerprint(payload)
-        managed_configuration = _lease_managed_configuration(payload)
         backend = WindowsHidHideBackend()
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
-        _write_status(resolved_lease, "error", f"Invalid isolation lease: {exc}")
+        _write_status(
+            resolved_lease,
+            "error",
+            f"Invalid isolation lease: {exc}",
+            pass_through_verified=False,
+        )
         return 1
 
     kernel32 = backend._kernel32
     owner_handle = kernel32.OpenProcess(_SYNCHRONIZE, False, owner_pid)
     if not owner_handle:
-        _restore_pass_through(backend, resolved_lease, fingerprint)
+        if _lease_activation_authorized(payload):
+            try:
+                recovery_fingerprint = _lease_fingerprint(payload)
+            except ValueError:
+                _write_status(
+                    resolved_lease,
+                    "error",
+                    "Could not recover an authorized controller-isolation lease.",
+                    pass_through_verified=False,
+                )
+                return 1
+            _restore_pass_through(backend, resolved_lease, recovery_fingerprint)
+        else:
+            _write_status(
+                resolved_lease,
+                "released",
+                "Controller isolation preparation ended before activation.",
+                pass_through_verified=True,
+            )
         return 0
+
+    fingerprint: str | None = None
+    managed_configuration = False
+    activation_authorized = _lease_activation_authorized(payload)
     try:
-        state = backend.snapshot()
-        if state.active:
-            _write_status(
-                resolved_lease,
-                "error",
-                "HidHide was already active; Vigil refused to take ownership.",
-            )
-            return 1
-        if state.configuration_fingerprint != fingerprint:
-            _write_status(
-                resolved_lease,
-                "error",
-                "HidHide configuration changed before controller isolation started.",
-            )
-            return 1
         ownership_path = (
             (ownership_root or cache_root) / _LEASE_DIRECTORY_NAME / _HIDHIDE_OWNERSHIP_FILENAME
         )
-        if managed_configuration and not _state_matches_managed_hidhide_configuration(
-            backend,
-            ownership_path,
-            state,
-        ):
+
+        if payload.get("schema") == _LEASE_SCHEMA:
             _write_status(
                 resolved_lease,
-                "error",
-                "Vigil's managed HidHide configuration could not be verified.",
+                "preparing",
+                "Preparing controller isolation.",
             )
-            return 1
+
+            def preparation_heartbeat(detail: str) -> None:
+                _write_status(resolved_lease, "preparing", detail)
+
+            prepared = _prepare_hidhide_lease(
+                backend,
+                ownership_path,
+                heartbeat=preparation_heartbeat,
+            )
+            state = prepared.state
+            if state is None or not prepared.readiness.ready:
+                _write_status(
+                    resolved_lease,
+                    "error",
+                    prepared.readiness.detail,
+                    pass_through_verified=bool(state is not None and not state.active),
+                )
+                return 1
+            fingerprint = state.configuration_fingerprint
+            managed_configuration = prepared.managed_configuration
+            if _release_path(resolved_lease).exists():
+                _write_status(
+                    resolved_lease,
+                    "released",
+                    "Controller isolation preparation was cancelled safely.",
+                    pass_through_verified=True,
+                )
+                return 0
+            payload = {
+                "schema": _LEASE_SCHEMA,
+                "owner_pid": owner_pid,
+                "activation_authorized": True,
+                "configuration_fingerprint": fingerprint,
+                "managed_configuration": managed_configuration,
+            }
+            _write_lease(resolved_lease, payload)
+            activation_authorized = True
+            if _release_path(resolved_lease).exists():
+                _write_status(
+                    resolved_lease,
+                    "released",
+                    "Controller isolation preparation was cancelled safely.",
+                    configuration_fingerprint=fingerprint,
+                    managed_configuration=managed_configuration,
+                    pass_through_verified=True,
+                )
+                return 0
+        else:
+            fingerprint = _lease_fingerprint(payload)
+            managed_configuration = _lease_managed_configuration(payload)
+            state = backend.snapshot()
+            if state.active:
+                _write_status(
+                    resolved_lease,
+                    "error",
+                    "HidHide was already active; Vigil refused to take ownership.",
+                    pass_through_verified=False,
+                )
+                return 1
+            if state.configuration_fingerprint != fingerprint:
+                _write_status(
+                    resolved_lease,
+                    "error",
+                    "HidHide configuration changed before controller isolation started.",
+                    pass_through_verified=True,
+                )
+                return 1
+            if managed_configuration and not _state_matches_managed_hidhide_configuration(
+                backend,
+                ownership_path,
+                state,
+            ):
+                _write_status(
+                    resolved_lease,
+                    "error",
+                    "Vigil's managed HidHide configuration could not be verified.",
+                    pass_through_verified=True,
+                )
+                return 1
+
+        assert fingerprint is not None
+        _write_status(
+            resolved_lease,
+            "preparing",
+            "Enabling verified controller isolation.",
+            configuration_fingerprint=fingerprint,
+            managed_configuration=managed_configuration,
+        )
+        if _release_path(resolved_lease).exists():
+            _write_status(
+                resolved_lease,
+                "released",
+                "Controller isolation preparation was cancelled safely.",
+                configuration_fingerprint=fingerprint,
+                managed_configuration=managed_configuration,
+                pass_through_verified=True,
+            )
+            return 0
         backend.set_active(True)
         active_state = backend.snapshot()
         if not active_state.active or active_state.configuration_fingerprint != fingerprint:
@@ -1433,6 +1717,7 @@ def run_controller_isolation_watchdog(
                 resolved_lease,
                 "error",
                 "HidHide could not verify the requested controller-only lease.",
+                pass_through_verified=not backend.snapshot().active,
             )
             return 1
         _write_status(
@@ -1440,6 +1725,7 @@ def run_controller_isolation_watchdog(
             "active",
             "Controller isolated; the game remains the foreground window.",
             configuration_fingerprint=fingerprint,
+            managed_configuration=managed_configuration,
         )
 
         next_device_refresh = time.monotonic() + _WATCHDOG_DEVICE_REFRESH_SECONDS
@@ -1452,55 +1738,133 @@ def run_controller_isolation_watchdog(
                 break
             if wait_result != _WAIT_TIMEOUT:
                 break
-            if not managed_configuration or time.monotonic() < next_device_refresh:
+            if time.monotonic() < next_device_refresh:
                 continue
             next_device_refresh = time.monotonic() + _WATCHDOG_DEVICE_REFRESH_SECONDS
-            _write_status(
-                resolved_lease,
-                "syncing",
-                "Checking for newly connected controllers.",
-                configuration_fingerprint=fingerprint,
-            )
             try:
-                sync = _synchronize_owned_hidhide_configuration(
+
+                def refresh_heartbeat(
+                    detail: str,
+                    current_fingerprint: str = cast(str, fingerprint),
+                ) -> None:
+                    _write_status(
+                        resolved_lease,
+                        "syncing",
+                        detail,
+                        configuration_fingerprint=current_fingerprint,
+                        managed_configuration=managed_configuration,
+                    )
+
+                refresh_heartbeat("Checking controller-isolation health.")
+                refreshed_state, changed = _refresh_watchdog_hidhide_lease(
                     backend,
                     ownership_path,
-                    require_managed=True,
+                    managed_configuration=managed_configuration,
+                    expected_fingerprint=fingerprint,
+                    heartbeat=refresh_heartbeat,
                 )
-                if sync is None:
-                    raise OSError("Vigil's managed HidHide configuration was lost")
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                failure_detail = f"Automatic HidHide controller refresh failed: {exc}"
+                failure_detail = f"Controller isolation watchdog verification failed: {exc}"
                 break
-            fingerprint = sync.state.configuration_fingerprint
+            fingerprint = refreshed_state.configuration_fingerprint
             _write_status(
                 resolved_lease,
                 "active",
                 (
                     "Controller isolation updated for a newly connected controller."
-                    if sync.changed
-                    else "Controller isolated; watching for newly connected controllers."
+                    if changed
+                    else (
+                        "Controller isolated; watching for newly connected controllers."
+                        if managed_configuration
+                        else "Controller isolated; watchdog verification is active."
+                    )
                 ),
                 configuration_fingerprint=fingerprint,
+                managed_configuration=managed_configuration,
             )
-        released = _restore_pass_through(backend, resolved_lease, fingerprint)
+        released = _restore_pass_through(
+            backend,
+            resolved_lease,
+            fingerprint,
+            publish_status=failure_detail is None,
+        )
         if failure_detail is not None:
-            _write_status(resolved_lease, "error", failure_detail)
+            _write_status(
+                resolved_lease,
+                "error",
+                failure_detail,
+                configuration_fingerprint=fingerprint,
+                managed_configuration=managed_configuration,
+                pass_through_verified=released,
+            )
             return 1
         return 0 if released else 1
-    except OSError as exc:
-        with suppress(OSError):
-            backend.set_active(False)
-        _write_status(resolved_lease, "error", f"Controller isolation failed: {exc}")
+    except Exception as exc:
+        pass_through_verified = False
+        if activation_authorized:
+            try:
+                if backend.snapshot().active:
+                    backend.set_active(False)
+                pass_through_verified = not backend.snapshot().active
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass_through_verified = False
+        else:
+            try:
+                pass_through_verified = not backend.snapshot().active
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass_through_verified = False
+        _write_status(
+            resolved_lease,
+            "error",
+            f"Controller isolation failed: {exc}",
+            configuration_fingerprint=fingerprint,
+            managed_configuration=managed_configuration,
+            pass_through_verified=pass_through_verified,
+        )
         return 1
     finally:
         kernel32.CloseHandle(owner_handle)
+
+
+def _refresh_watchdog_hidhide_lease(
+    backend: ControllerIsolationBackend,
+    ownership_path: Path,
+    *,
+    managed_configuration: bool,
+    expected_fingerprint: str,
+    heartbeat: Callable[[str], None] | None = None,
+) -> tuple[HidHideState, bool]:
+    """Verify one active lease without introducing a second HidHide client."""
+
+    if managed_configuration:
+        sync = _synchronize_owned_hidhide_configuration(
+            backend,
+            ownership_path,
+            require_managed=True,
+            heartbeat=heartbeat,
+        )
+        if sync is None:
+            raise OSError("Vigil's managed HidHide configuration was lost")
+        state = sync.state
+        changed = sync.changed
+    else:
+        if heartbeat is not None:
+            heartbeat("Verifying controller-isolation configuration.")
+        state = backend.snapshot()
+        changed = False
+        if state.configuration_fingerprint != expected_fingerprint:
+            raise OSError("HidHide configuration changed during controller isolation")
+    if not state.active:
+        raise OSError("HidHide controller isolation was turned off unexpectedly")
+    return state, changed
 
 
 def _restore_pass_through(
     backend: ControllerIsolationBackend,
     lease_path: Path,
     fingerprint: str,
+    *,
+    publish_status: bool = True,
 ) -> bool:
     try:
         before = backend.snapshot()
@@ -1513,14 +1877,22 @@ def _restore_pass_through(
         after = backend.snapshot()
         if after.active:
             raise OSError("HidHide still reports device hiding active")
-    except OSError as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if publish_status:
+            _write_status(
+                lease_path,
+                "error",
+                f"Could not restore HidHide pass-through: {exc}",
+                pass_through_verified=False,
+            )
+        return False
+    if publish_status:
         _write_status(
             lease_path,
-            "error",
-            f"Could not restore HidHide pass-through: {exc}",
+            "released",
+            "Controller isolation released safely.",
+            pass_through_verified=True,
         )
-        return False
-    _write_status(lease_path, "released", "Controller isolation released safely.")
     return True
 
 
@@ -1534,10 +1906,18 @@ def _recover_stale_leases(
         try:
             payload = _read_lease(lease_path)
             owner_pid = _lease_owner_pid(payload)
+            activation_authorized = _lease_activation_authorized(payload)
         except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
             _cleanup_lease_files(lease_path)
             continue
         if _process_is_running(owner_pid):
+            continue
+        if not activation_authorized:
+            _cleanup_lease_files(lease_path)
+            _LOGGER.warning(
+                "Discarded incomplete controller-isolation preparation from PID %d",
+                owner_pid,
+            )
             continue
         try:
             state = backend.snapshot()
@@ -1545,7 +1925,7 @@ def _recover_stale_leases(
                 backend.set_active(False)
             if backend.snapshot().active:
                 raise OSError("HidHide still reports device hiding active")
-        except OSError:
+        except (OSError, ValueError, subprocess.SubprocessError):
             _LOGGER.exception("Could not recover a stale controller-isolation lease")
             continue
         _cleanup_lease_files(lease_path)
@@ -1616,10 +1996,22 @@ def _write_status(
     detail: str,
     *,
     configuration_fingerprint: str | None = None,
-) -> None:
-    payload = {"state": state, "detail": detail}
+    managed_configuration: bool | None = None,
+    pass_through_verified: bool | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    payload: dict[str, object] = {
+        "schema": _STATUS_SCHEMA,
+        "state": state,
+        "detail": detail,
+        "heartbeat_monotonic": clock(),
+    }
     if configuration_fingerprint is not None:
         payload["configuration_fingerprint"] = configuration_fingerprint
+    if managed_configuration is not None:
+        payload["managed_configuration"] = managed_configuration
+    if pass_through_verified is not None:
+        payload["pass_through_verified"] = pass_through_verified
     try:
         atomic_write_text(
             _status_path(lease_path),
@@ -1629,6 +2021,8 @@ def _write_status(
         )
     except OSError:
         _LOGGER.exception("Could not write controller-isolation watchdog status")
+        return False
+    return True
 
 
 def _read_status(path: Path | None) -> dict[str, object]:
@@ -1643,9 +2037,52 @@ def _read_status(path: Path | None) -> dict[str, object]:
 
 def _read_lease(path: Path) -> dict[str, object]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("schema") not in {1, 2}:
+    if not isinstance(payload, dict) or payload.get("schema") not in {1, 2, 3}:
         raise ValueError("unsupported controller-isolation lease")
     return payload
+
+
+def _write_lease(path: Path, payload: dict[str, object]) -> None:
+    atomic_write_text(
+        path,
+        json.dumps(payload, sort_keys=True) + "\n",
+        temporary_suffix=".tmp",
+        fsync=True,
+    )
+
+
+def _lease_activation_authorized(payload: dict[str, object]) -> bool:
+    if payload.get("schema") in {1, 2}:
+        # Legacy leases were written only after the complete configuration was
+        # verified, immediately before the watchdog enabled hiding.
+        return True
+    value = payload.get("activation_authorized")
+    if type(value) is not bool:
+        raise ValueError("invalid controller-isolation activation journal")
+    return value
+
+
+def _status_confirms_pass_through(status: dict[str, object]) -> bool:
+    return status.get("pass_through_verified") is True
+
+
+def _status_heartbeat_is_fresh(
+    status: dict[str, object],
+    *,
+    now: float,
+) -> bool:
+    if status.get("schema") != _STATUS_SCHEMA:
+        return False
+    heartbeat = status.get("heartbeat_monotonic")
+    if isinstance(heartbeat, bool) or not isinstance(heartbeat, (int, float)):
+        return False
+    heartbeat_value = float(heartbeat)
+    if not math.isfinite(heartbeat_value):
+        return False
+    age = now - heartbeat_value
+    return (
+        -_WATCHDOG_HEARTBEAT_FUTURE_TOLERANCE_SECONDS <= age <= _WATCHDOG_HEARTBEAT_TIMEOUT_SECONDS
+    )
 
 
 def _lease_owner_pid(payload: dict[str, object]) -> int:
@@ -1775,6 +2212,7 @@ def _verified_ids_from_hidhide_groups(groups: list[object]) -> frozenset[str]:
 __all__ = [
     "FRESH_HIDHIDE_INSTALL_MARKER",
     "ControllerIsolationBackend",
+    "ControllerIsolationPhase",
     "ControllerIsolationReadiness",
     "ControllerIsolationService",
     "FreshHidHideConfigurationOutcome",

@@ -9,7 +9,9 @@ separate service boundaries.
 
 - Compact controller-navigable Home, Performance, Audio, Wi-Fi, Display,
   Integrations, Settings, and Widgets surfaces.
-- Native Windows CPU, GPU, VRAM, RAM, and cross-vendor FPS telemetry.
+- Native Windows CPU, GPU, VRAM, RAM, and cross-vendor FPS telemetry, with
+  provider-aware game matching, sustained-GPU fallback selection, PID-scoped
+  PresentMon capture, and bounded collector recovery.
 - Volume, microphone, default-device, and per-application audio controls.
 - Saved-profile Wi-Fi controls that do not require Windows Location access.
 - Display projection, resolution, and refresh-rate controls with Keep/Revert safety.
@@ -61,8 +63,15 @@ shared HidHide configuration still exactly matches the fresh configuration Vigil
 recorded; it never removes device IDs. If the user or another controller utility changes
 the shared lists or mode, Vigil permanently stops automatic management and leaves those
 settings untouched. A separate watchdog restores pass-through if Vigil exits
-unexpectedly. HidHide's own client tools may maintain their own allowlist entries. If
-any check fails, Vigil uses its existing foreground mode instead.
+unexpectedly. From preparation through release, that watchdog is the only Vigil
+process that opens HidHide's single-client control interface; the overlay process
+reads its atomic verified status and heartbeat instead. Vigil remains hidden while
+preparation runs. The watchdog checks for newly connected controllers every five
+seconds, rechecks both Vigil-managed and manually configured leases, and restores
+pass-through if hiding or the shared configuration changes. HidHide's own client tools
+may maintain their own allowlist entries. Vigil uses its existing foreground mode only
+after pass-through is verified; if the shared state cannot be verified, Vigil stays
+hidden and directs the user to turn off device hiding.
 
 Focus-preserving mode is intended for borderless or windowed games. A separate desktop
 window cannot be guaranteed to render above every true exclusive-fullscreen game.

@@ -6,6 +6,7 @@ import ctypes
 import logging
 import os
 from ctypes import wintypes
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -15,6 +16,12 @@ from vigil_overlay.services.windows_telemetry import sample_process_gpu_usage
 _LOGGER = logging.getLogger("vigil_overlay")
 _GW_HWNDNEXT: Final[int] = 2
 _MAX_Z_ORDER_SCAN: Final[int] = 64
+_FPS_GPU_SCAN_MULTIPLIER: Final[int] = 4
+_MIN_GPU_SCAN_CANDIDATES: Final[int] = 16
+_GPU_CANDIDATE_LOG_LIMIT: Final[int] = 8
+_PROCESS_QUERY_LIMITED_INFORMATION: Final[int] = 0x1000
+_SYNCHRONIZE: Final[int] = 0x00100000
+_WAIT_TIMEOUT: Final[int] = 0x00000102
 
 
 class _FileTime(ctypes.Structure):
@@ -44,6 +51,15 @@ _EXCLUDED_PROCESS_NAMES = frozenset(
         "powershell.exe",
         "pwsh.exe",
         "windowsterminal.exe",
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "brave.exe",
+        "opera.exe",
+        "discord.exe",
+        "ms-teams.exe",
+        "spotify.exe",
+        "vlc.exe",
         "steam.exe",
         "epicgameslauncher.exe",
         "eadesktop.exe",
@@ -75,9 +91,7 @@ def capture_foreground_fps_target() -> FpsTarget | None:
     return targets[0] if targets else None
 
 
-def capture_foreground_fps_targets(
-    *, max_candidates: int = 64
-) -> tuple[FpsTarget, ...]:
+def capture_foreground_fps_targets(*, max_candidates: int = 64) -> tuple[FpsTarget, ...]:
     """Resolve visible eligible processes from foreground toward the desktop.
 
     Z-order gives the FPS broker a conservative candidate set tied to what the user can
@@ -161,23 +175,30 @@ def capture_ranked_fps_targets(
     worker thread and may wait briefly between PDH rate samples.
     """
 
-    candidates = capture_foreground_fps_targets(max_candidates=max(max_candidates, 1))
+    scan_limit = max(
+        max_candidates * _FPS_GPU_SCAN_MULTIPLIER,
+        _MIN_GPU_SCAN_CANDIDATES,
+    )
+    candidates = capture_foreground_fps_targets(max_candidates=scan_limit)
     if not candidates:
         return ()
     try:
-        gpu_usage = sample_process_gpu_usage(
-            sample_interval_seconds=sample_interval_seconds
-        )
+        gpu_usage = sample_process_gpu_usage(sample_interval_seconds=sample_interval_seconds)
     except OSError:
-        _LOGGER.exception(
-            "Per-process GPU counters unavailable; using FPS Z-order candidates"
-        )
+        _LOGGER.exception("Per-process GPU counters unavailable; using FPS Z-order candidates")
         return candidates[:max_candidates]
-    ranked = rank_fps_targets_by_gpu(candidates, gpu_usage)
+    scored = tuple(
+        replace(
+            target,
+            gpu_usage_percent=max(gpu_usage.get(target.process_id, 0.0), 0.0),
+        )
+        for target in candidates
+    )
+    ranked = rank_fps_targets_by_gpu(scored, gpu_usage)
     if ranked:
         summary = ", ".join(
             f"{target.executable_name}:{gpu_usage.get(target.process_id, 0.0):.1f}%"
-            for target in ranked[:max_candidates]
+            for target in ranked[: min(max_candidates, _GPU_CANDIDATE_LOG_LIMIT)]
         )
         _LOGGER.info("FPS GPU-ranked process candidates: %s", summary)
     return ranked[:max_candidates]
@@ -194,7 +215,7 @@ def _target_from_window(user32: Any, kernel32: Any, hwnd: Any) -> FpsTarget | No
     if pid <= 0 or pid == os.getpid():
         return None
 
-    process_name, process_started_at_100ns = _query_process_details(kernel32, pid)
+    process_name, executable_path, process_started_at_100ns = _query_process_details(kernel32, pid)
     if process_name and is_excluded_process_name(process_name):
         return None
 
@@ -205,11 +226,14 @@ def _target_from_window(user32: Any, kernel32: Any, hwnd: Any) -> FpsTarget | No
         pid,
         process_name or f"pid-{pid}.exe",
         process_started_at_100ns=process_started_at_100ns,
+        executable_path=executable_path or None,
     )
 
 
-def _query_process_details(kernel32: Any, process_id: int) -> tuple[str, int | None]:
-    process_query_limited_information = 0x1000
+def _query_process_details(
+    kernel32: Any,
+    process_id: int,
+) -> tuple[str, str, int | None]:
     open_process = kernel32.OpenProcess
     open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     open_process.restype = wintypes.HANDLE
@@ -235,15 +259,17 @@ def _query_process_details(kernel32: Any, process_id: int) -> tuple[str, int | N
         )
         get_process_times.restype = wintypes.BOOL
 
-    handle = open_process(process_query_limited_information, False, process_id)
+    handle = open_process(_PROCESS_QUERY_LIMITED_INFORMATION, False, process_id)
     if not handle:
-        return ("", None)
+        return ("", "", None)
     try:
         process_name = ""
+        executable_path = ""
         capacity = wintypes.DWORD(32768)
         buffer = ctypes.create_unicode_buffer(capacity.value)
         if query_name(handle, 0, buffer, ctypes.byref(capacity)):
-            process_name = Path(buffer.value).name
+            executable_path = buffer.value
+            process_name = Path(executable_path).name
 
         process_started_at_100ns: int | None = None
         if get_process_times is not None:
@@ -262,6 +288,45 @@ def _query_process_details(kernel32: Any, process_id: int) -> tuple[str, int | N
                     creation.dwLowDateTime
                 )
 
-        return (process_name, process_started_at_100ns)
+        return (process_name, executable_path, process_started_at_100ns)
     finally:
         close_handle(handle)
+
+
+def is_fps_target_alive(target: FpsTarget) -> bool:
+    """Return whether a PID still names the same live process, failing open on denial."""
+
+    if os.name != "nt":
+        return False
+    windll_type = cast(Any, ctypes).WinDLL
+    kernel32 = windll_type("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    wait_for_single_object.restype = wintypes.DWORD
+
+    handle = open_process(
+        _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE,
+        False,
+        target.process_id,
+    )
+    if not handle:
+        # Protected games can deny inspection while still presenting normally. Do not
+        # tear down a working FPS session merely because liveness could not be queried.
+        return ctypes.get_last_error() == 5
+    try:
+        if int(wait_for_single_object(handle, 0)) != _WAIT_TIMEOUT:
+            return False
+    finally:
+        close_handle(handle)
+
+    expected_started_at = target.process_started_at_100ns
+    if expected_started_at is None:
+        return True
+    _name, _path, observed_started_at = _query_process_details(kernel32, target.process_id)
+    return observed_started_at is None or observed_started_at == expected_started_at
