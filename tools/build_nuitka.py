@@ -24,6 +24,7 @@ from vigil_overlay.core.version import __version__
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ENTRY = PROJECT_ROOT / "src" / "vigil_overlay"
 OUTPUT_ROOT = PROJECT_ROOT / "build" / "nuitka"
+_RETIRED_HIDHIDE_LICENSE_DIR = Path("licenses/third_party/Nefarius.HidHide")
 APPLICATION_ICON_RESOURCE = (
     PROJECT_ROOT / "src" / "vigil_overlay" / "resources" / "icons" / "vigil_overlay.ico"
 )
@@ -66,7 +67,6 @@ REQUIRED_THIRD_PARTY_LICENSE_FILES = (
     Path("psutil/LICENSE.txt"),
     Path("PyWinRT/LICENSE.txt"),
     Path("Microsoft.GameInput/LICENSE.txt"),
-    Path("Nefarius.HidHide/LICENSE.txt"),
     Path("PlayniteSDK/LICENSE.txt"),
     Path("Inno_Setup/LICENSE.txt"),
 )
@@ -448,6 +448,13 @@ def validate_legal_materials() -> None:
 def validate_packaged_legal_materials(dist_root: Path) -> None:
     """Require the standalone distribution to preserve all release legal files."""
 
+    retired_hidhide = dist_root / _RETIRED_HIDHIDE_LICENSE_DIR
+    if retired_hidhide.exists():
+        raise FileNotFoundError(
+            "Completed Nuitka distribution still contains retired HidHide legal material: "
+            f"{retired_hidhide}"
+        )
+
     for source, destination in LEGAL_DISTRIBUTION_FILES:
         packaged = dist_root / destination
         if not packaged.is_file():
@@ -609,6 +616,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    for existing_dist in OUTPUT_ROOT.glob("*.dist"):
+        retired_hidhide = existing_dist / _RETIRED_HIDHIDE_LICENSE_DIR
+        if retired_hidhide.is_dir():
+            shutil.rmtree(retired_hidhide)
     result = subprocess.call(command, cwd=PROJECT_ROOT)
     if result != 0:
         return result

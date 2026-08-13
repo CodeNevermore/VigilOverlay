@@ -452,8 +452,6 @@ class NavigationShell(QWidget):
         visible_widget_ids: tuple[str, ...] | None = None,
         guide_button_enabled: bool = True,
         controller_shortcut_binding: ControllerShortcutBinding | None = None,
-        focus_preserving_controller_isolation_enabled: bool = False,
-        focus_preserving_controller_isolation_available: bool = True,
         allow_mouse_navigation_while_controller_connected: bool = False,
         hotkey_combination: str = "Ctrl+Alt+Shift+G",
         start_with_windows_enabled: bool = True,
@@ -503,12 +501,6 @@ class NavigationShell(QWidget):
         self._guide_button_enabled = guide_button_enabled
         self._controller_shortcut_binding = (
             controller_shortcut_binding or ControllerShortcutBinding()
-        )
-        self._focus_preserving_controller_isolation_enabled = (
-            focus_preserving_controller_isolation_enabled
-        )
-        self._focus_preserving_controller_isolation_available = (
-            focus_preserving_controller_isolation_available
         )
         self._allow_mouse_navigation_while_controller_connected = (
             allow_mouse_navigation_while_controller_connected
@@ -1186,10 +1178,12 @@ class NavigationShell(QWidget):
         )
         indicator.setAccessibleName(accessible_name)
         indicator.setToolTip(accessible_name)
-        indicator.clicked.connect(
-            lambda checked=False, slots=scroll_slots: self._strip_scroller.scroll_widget_slots(
-                slots
-            )
+        # Page on press so an overlay activation/topmost reconciliation between
+        # press and release cannot discard the mouse action before ``clicked``.
+        # These arrows are mouse-only, non-focusable controls, so there is no
+        # keyboard or controller activation contract tied to button release.
+        indicator.pressed.connect(
+            lambda slots=scroll_slots: self._strip_scroller.scroll_widget_slots(slots)
         )
         return indicator
 
@@ -1310,12 +1304,6 @@ class NavigationShell(QWidget):
                 self._stack,
                 guide_button_enabled=self._guide_button_enabled,
                 controller_shortcut_binding=self._controller_shortcut_binding,
-                focus_preserving_controller_isolation_enabled=(
-                    self._focus_preserving_controller_isolation_enabled
-                ),
-                focus_preserving_controller_isolation_available=(
-                    self._focus_preserving_controller_isolation_available
-                ),
                 allow_mouse_navigation_while_controller_connected=(
                     self._allow_mouse_navigation_while_controller_connected
                 ),

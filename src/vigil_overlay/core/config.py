@@ -65,8 +65,6 @@ class ControllerSettings:
 
     guide_button_enabled: bool = True
     allow_mouse_navigation_while_controller_connected: bool = False
-    focus_preserving_controller_isolation_enabled: bool = False
-    focus_preserving_controller_isolation_preference_initialized: bool = False
     shortcut_controls: list[str] = field(default_factory=list)
 
 
@@ -186,8 +184,6 @@ class AppConfig:
             {
                 "guide_button_enabled",
                 "allow_mouse_navigation_while_controller_connected",
-                "focus_preserving_controller_isolation_enabled",
-                "focus_preserving_controller_isolation_preference_initialized",
                 "shortcut_controls",
             },
             "controller",
@@ -206,14 +202,6 @@ class AppConfig:
             allow_mouse_navigation_while_controller_connected=_require_bool(
                 controller_raw["allow_mouse_navigation_while_controller_connected"],
                 "controller.allow_mouse_navigation_while_controller_connected",
-            ),
-            focus_preserving_controller_isolation_enabled=_require_bool(
-                controller_raw["focus_preserving_controller_isolation_enabled"],
-                "controller.focus_preserving_controller_isolation_enabled",
-            ),
-            focus_preserving_controller_isolation_preference_initialized=_require_bool(
-                controller_raw["focus_preserving_controller_isolation_preference_initialized"],
-                "controller.focus_preserving_controller_isolation_preference_initialized",
             ),
             shortcut_controls=list(shortcut_binding.controls),
         )
@@ -484,6 +472,19 @@ def _migrate_v15_to_v16(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _migrate_v16_to_v17(raw: dict[str, Any]) -> dict[str, Any]:
+    """Retire the removed HidHide preferences without resetting other controller choices."""
+
+    controller = raw.get("controller")
+    if not isinstance(controller, dict):
+        controller = {}
+        raw["controller"] = controller
+    controller.pop("focus_preserving_controller_isolation_enabled", None)
+    controller.pop("focus_preserving_controller_isolation_preference_initialized", None)
+    raw["schema_version"] = 17
+    return raw
+
+
 _MIGRATIONS: dict[int, Migration] = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
@@ -500,25 +501,8 @@ _MIGRATIONS: dict[int, Migration] = {
     13: _migrate_v13_to_v14,
     14: _migrate_v14_to_v15,
     15: _migrate_v15_to_v16,
+    16: _migrate_v16_to_v17,
 }
-
-
-def apply_controller_isolation_install_default(
-    config: AppConfig,
-    *,
-    hidhide_available: bool,
-) -> bool:
-    """Enable the one-time default after an installed build detects HidHide."""
-
-    controller = config.controller
-    if (
-        not hidhide_available
-        or controller.focus_preserving_controller_isolation_preference_initialized
-    ):
-        return False
-    controller.focus_preserving_controller_isolation_enabled = True
-    controller.focus_preserving_controller_isolation_preference_initialized = True
-    return True
 
 
 def load_config(path: Path) -> AppConfig:

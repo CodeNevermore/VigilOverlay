@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Last updated: August 10, 2026
+Last updated: August 13, 2026
 
 Vigil Overlay includes or redistributes the components listed below. Each component
 remains governed by its own license or terms. The Vigil Overlay MIT License applies
@@ -23,7 +23,6 @@ kept beside its staged executable under
 | PyWinRT runtime and projections | 3.2.1 | MIT | Microsoft Corporation; David Lechner and contributors | Windows Runtime networking and connectivity projections |
 | PresentMon | 2.5.1 | MIT, plus upstream notices | Copyright (c) 2017-2024 Intel Corporation and identified upstream contributors | Bundled, checksum-verified FPS collector |
 | Microsoft GameInput Redistributable | Official signed release MSI supplied from `Microsoft.GameInput`; the release build records the exact MSI identity | Microsoft GameInput Redistributable Software License Terms | Microsoft Corporation | Installer prerequisite |
-| HidHide | 1.5.230 | MIT | Copyright (c) 2020 Eric Korff de Gidts; copyright (c) 2021-2023 Benjamin Höglinger-Stelzer | Optional installer prerequisite for controller isolation |
 
 ### Qt for Python / LGPL notice
 
@@ -70,24 +69,6 @@ License.
 
 Official package: https://www.nuget.org/packages/Microsoft.GameInput/
 
-### HidHide notice
-
-The Windows installer embeds the unmodified official, Nefarius-signed
-`HidHide_1.5.230_x64.exe` release asset and verifies SHA-256
-`f4bbbcb82e6258641b887c74bc81c4c5f66e4aa811808dfc304347687b7605f6`
-before packaging. Its MIT license is reproduced at
-`third_party_licenses/Nefarius.HidHide/LICENSE.txt`.
-
-HidHide is offered as a selected-by-default optional component only when no existing
-installation is detected; users may clear that selection. Installation does not enable
-device hiding. Only when that Setup installed a fresh HidHide may Vigil perform a
-one-time extension of the clean configuration with its executable and device IDs that
-HidHide reports as connected gaming input. Existing configurations are not changed.
-Vigil's uninstaller leaves HidHide installed so it cannot break another application
-that also uses the driver.
-
-Official release: https://github.com/nefarius/HidHide/releases/tag/v1.5.230.0
-
 ## Optional integration dependency
 
 The Vigil Overlay Bridge is Vigil-owned MIT-licensed code. It is compiled against
@@ -117,9 +98,8 @@ https://jrsoftware.org/isinfo.php
 ## Platform APIs and third-party services
 
 Vigil calls Windows, XInput, GameInput, Core Audio, WLAN, display, and other operating
-system APIs. Except for the separately redistributed GameInput and optional HidHide
-installers described above, those operating-system components are not copied into
-this repository.
+system APIs. Except for the separately redistributed GameInput installer described
+above, those operating-system components are not copied into this repository.
 
 Steam, Xbox / Microsoft Store, Epic Games, Battle.net, EA app, Ubisoft Connect, GOG,
 and Playnite names and local data formats are used only for interoperability. Vigil

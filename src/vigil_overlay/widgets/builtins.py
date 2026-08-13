@@ -215,12 +215,6 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
                     "controls",
                 ),
                 WidgetItemDefinition(
-                    "focus_preserving_controller_isolation",
-                    "Keep the game focused",
-                    "Keep game active while using HidHide.",
-                    "controls",
-                ),
-                WidgetItemDefinition(
                     "allow_mouse_navigation_while_controller_connected",
                     "Switch to mouse",
                     "Use mouse navigation in Vigil; switch off to return to controller.",

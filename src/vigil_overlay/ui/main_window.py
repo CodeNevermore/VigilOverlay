@@ -94,7 +94,6 @@ HotkeyCaptureCallback = Callable[[bool], None]
 HotkeyProbeCallback = Callable[[str], tuple[bool, str]]
 ControllerShortcutChangeCallback = Callable[[ControllerShortcutBinding], tuple[bool, str]]
 ControllerShortcutCaptureCallback = Callable[[bool], None]
-ControllerIsolationChangeCallback = Callable[[bool], tuple[bool, str]]
 StartupChangeCallback = Callable[[bool], tuple[bool, str]]
 BackgroundChangeCallback = Callable[[bool], tuple[bool, str]]
 RecoveryActionCallback = Callable[[], tuple[bool, str]]
@@ -143,7 +142,6 @@ class OverlayWindow(QWidget):
         hotkey_probe_callback: HotkeyProbeCallback | None = None,
         controller_shortcut_change_callback: (ControllerShortcutChangeCallback | None) = None,
         controller_shortcut_capture_callback: (ControllerShortcutCaptureCallback | None) = None,
-        controller_isolation_change_callback: (ControllerIsolationChangeCallback | None) = None,
         power_capabilities_callback: PowerCapabilitiesCallback | None = None,
         power_action_callback: PowerActionCallback | None = None,
         startup_change_callback: StartupChangeCallback | None = None,
@@ -166,12 +164,12 @@ class OverlayWindow(QWidget):
         self._hotkey_probe_callback = hotkey_probe_callback
         self._controller_shortcut_change_callback = controller_shortcut_change_callback
         self._controller_shortcut_capture_callback = controller_shortcut_capture_callback
-        self._controller_isolation_change_callback = controller_isolation_change_callback
         self._power_capabilities_callback = power_capabilities_callback
         self._power_action_callback = power_action_callback
         self._power_dialog: PowerMenuDialog | None = None
         self._update_dialog: UpdateAvailableDialog | None = None
         self._fps_failure_dialog: VigilMessageDialog | None = None
+        self._startup_safety_dialog: VigilMessageDialog | None = None
         self._next_power_input_source = ModalInputSource.UNKNOWN
         self._startup_change_callback = startup_change_callback
         self._startup_available = startup_available
@@ -192,7 +190,6 @@ class OverlayWindow(QWidget):
         self._backdrop = DimBackdropWindow()
         self._allow_close = False
         self._input_release_announced = False
-        self._preserve_foreground = False
         self._home_games_by_item_id: dict[str, GameRecord] = {}
         self._home_recent_games: tuple[GameRecord, ...] = ()
         self._home_closable_game_identities: frozenset[GameIdentity] = frozenset()
@@ -329,12 +326,6 @@ class OverlayWindow(QWidget):
             ),
             allow_mouse_navigation_while_controller_connected=(
                 self._config.controller.allow_mouse_navigation_while_controller_connected
-            ),
-            focus_preserving_controller_isolation_enabled=(
-                self._config.controller.focus_preserving_controller_isolation_enabled
-            ),
-            focus_preserving_controller_isolation_available=(
-                self._controller_isolation_change_callback is not None
             ),
             hotkey_combination=self._config.hotkey.combination,
             start_with_windows_enabled=self._config.startup.start_with_windows,
@@ -939,26 +930,6 @@ class OverlayWindow(QWidget):
         ):
             self._toggle_mouse_navigation_setting()
             return
-        if widget_id == "settings" and item_id == "focus_preserving_controller_isolation":
-            settings_view = self._navigation.settings_view
-            callback = self._controller_isolation_change_callback
-            if settings_view is None or callback is None:
-                self._action_status.setText(
-                    "Focus-preserving controller isolation is unavailable in this build."
-                )
-                return
-            target = not self._config.controller.focus_preserving_controller_isolation_enabled
-            success, detail = callback(target)
-            self._action_status.setText(detail)
-            settings_view.set_focus_preserving_controller_isolation_enabled(
-                self._config.controller.focus_preserving_controller_isolation_enabled
-            )
-            if success:
-                _LOGGER.info(
-                    "Focus-preserving controller isolation %s",
-                    "enabled" if target else "disabled",
-                )
-            return
         if widget_id == "settings" and item_id == "global_hotkey":
             settings_view = self._navigation.settings_view
             if settings_view is not None and self._hotkey_change_callback is not None:
@@ -1425,9 +1396,7 @@ class OverlayWindow(QWidget):
         dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
         release_page_opened = False
         try:
-            release_page_opened = (
-                dialog.exec() == QDialog.DialogCode.Accepted
-            )
+            release_page_opened = dialog.exec() == QDialog.DialogCode.Accepted
         finally:
             self._update_dialog = None
             self._navigation.restore_focus()
@@ -1449,31 +1418,42 @@ class OverlayWindow(QWidget):
             self._fps_failure_dialog = None
             self._navigation.restore_focus()
 
+    def show_startup_safety_warning(self, detail: str) -> None:
+        """Show one controller-dismissible warning for uncertain upgrade recovery."""
+
+        if self._startup_safety_dialog is not None:
+            return
+        dialog = VigilMessageDialog("Controller pass-through needs attention", detail, self)
+        dialog.setObjectName("startupSafetyWarningDialog")
+        dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
+        self._startup_safety_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._startup_safety_dialog = None
+            self._navigation.restore_focus()
+
     def reset_position(self) -> None:
         target = self._target_screen_geometry(force_primary=True)
         self.setGeometry(target)
         self._persist_geometry()
 
-    def show_overlay(self, *, preserve_foreground: bool = False) -> None:
+    def show_overlay(self) -> None:
         self._input_release_announced = False
-        self._preserve_foreground = preserve_foreground
         self._install_controller_mouse_event_filter()
         target = self._target_screen_geometry()
         self._backdrop.show_backdrop(target)
         self.setGeometry(target)
         self._apply_panel_geometry()
         self._update_clock()
-        configure_native_overlay_window(
-            int(self.winId()),
-            no_activate=self._preserve_foreground,
-        )
+        configure_native_overlay_window(int(self.winId()))
         self.show()
         self._configure_native_window()
         self._reassert_topmost()
-        if (
-            not self._preserve_foreground
-            and QGuiApplication.platformName() not in {"offscreen", "minimal"}
-        ):
+        if QGuiApplication.platformName() not in {
+            "offscreen",
+            "minimal",
+        }:
             self.raise_()
             self.activateWindow()
         display_view = self._navigation.display_view
@@ -1485,9 +1465,8 @@ class OverlayWindow(QWidget):
         wifi_view = self._navigation.wifi_view
         if wifi_view is not None and self._navigation.selected_widget_id == "wifi":
             wifi_view.refresh()
-        if not self._preserve_foreground:
-            self._navigation.restore_focus()
-            self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self._navigation.restore_focus()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
         self._sync_controller_mouse_cursor()
 
     def request_hide(self) -> None:
@@ -1579,11 +1558,7 @@ class OverlayWindow(QWidget):
         if event.type() is QEvent.Type.WinIdChange:
             QTimer.singleShot(0, self._configure_native_window)
             QTimer.singleShot(0, self._reassert_topmost)
-        elif (
-            event.type() is QEvent.Type.ActivationChange
-            and self.isVisible()
-            and not self._preserve_foreground
-        ):
+        elif event.type() is QEvent.Type.ActivationChange and self.isVisible():
             QTimer.singleShot(0, self._reassert_topmost)
             self.foreground_reconciliation_requested.emit()
         elif event.type() in {
@@ -1601,10 +1576,7 @@ class OverlayWindow(QWidget):
         event_type: QByteArray | bytes | bytearray | memoryview[int],
         message: int,
     ) -> tuple[bool, int]:
-        result = native_overlay_message(
-            int(message),
-            no_activate=self._preserve_foreground,
-        )
+        result = native_overlay_message(int(message))
         if result is not None:
             return result
         if is_native_display_change(int(message)):
@@ -1615,10 +1587,7 @@ class OverlayWindow(QWidget):
         if not self.isVisible():
             return
         self._backdrop.configure_native_state()
-        configure_native_overlay_window(
-            int(self.winId()),
-            no_activate=self._preserve_foreground,
-        )
+        configure_native_overlay_window(int(self.winId()))
 
     def _reassert_topmost(self) -> None:
         if not self.isVisible() or not self._config.window.always_on_top:

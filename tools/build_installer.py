@@ -25,12 +25,6 @@ INSTALLER_SCRIPT = INSTALLER_ROOT / "VigilOverlay.iss"
 DEFAULT_GAMEINPUT_MSI = (
     PROJECT_ROOT / "vendor" / "Microsoft.GameInput" / "redist" / "GameInputRedist.msi"
 )
-HIDHIDE_VERSION = "1.5.230"
-HIDHIDE_FILENAME = f"HidHide_{HIDHIDE_VERSION}_x64.exe"
-HIDHIDE_SHA256 = "f4bbbcb82e6258641b887c74bc81c4c5f66e4aa811808dfc304347687b7605f6"
-DEFAULT_HIDHIDE_INSTALLER = (
-    PROJECT_ROOT / "vendor" / "Nefarius.HidHide" / "redist" / HIDHIDE_FILENAME
-)
 OUTPUT_ROOT = PROJECT_ROOT / "build" / "installer"
 PRESENTMON_FILENAME = "PresentMon-2.5.1-x64.exe"
 PRESENTMON_SHA256 = "9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191"
@@ -44,10 +38,8 @@ REQUIRED_LEGAL_DISTRIBUTION_FILES = (
     Path("licenses/third_party/Qt_for_Python/LGPL-3.0.txt"),
     Path("licenses/third_party/Qt_for_Python/GPL-3.0.txt"),
     Path("licenses/third_party/Microsoft.GameInput/LICENSE.txt"),
-    Path("licenses/third_party/Nefarius.HidHide/LICENSE.txt"),
 )
 _MICROSOFT_PUBLISHER = "microsoft corporation"
-_NEFARIUS_PUBLISHER = "nefarius software solutions e.u."
 _GAMEINPUT_PRODUCT_NAMES = {
     "gameinput redistributable",
     "microsoft gameinput",
@@ -71,21 +63,6 @@ class GameInputMsiIdentity:
     product_name: str
     manufacturer: str
     product_code: str
-    product_version: str
-    sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class HidHideInstallerIdentity:
-    """Authenticode and file-version identity for the approved HidHide setup."""
-
-    path: Path
-    signature_status: str
-    signer_subject: str
-    signer_thumbprint: str
-    product_name: str
-    company_name: str
-    file_version: str
     product_version: str
     sha256: str
 
@@ -306,127 +283,17 @@ def validate_gameinput_msi(
     return identity
 
 
-def inspect_hidhide_installer(path: Path) -> HidHideInstallerIdentity:
-    """Read Authenticode and version-resource identity on the release machine."""
-
-    if os.name != "nt":
-        raise ValueError("HidHide installer trust verification must run on Windows")
-    powershell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
-    if powershell is None:
-        raise ValueError("PowerShell is required for HidHide Authenticode verification")
-    environment = os.environ.copy()
-    environment["VIGIL_HIDHIDE_INSTALLER"] = str(path)
-    script = (
-        "$ErrorActionPreference = 'Stop'; "
-        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-        "$installerPath = $env:VIGIL_HIDHIDE_INSTALLER; "
-        "$file = Get-Item -LiteralPath $installerPath; "
-        "$signature = Get-AuthenticodeSignature -LiteralPath $installerPath; "
-        "if ($null -eq $signature) { throw 'Signature inspection returned no result' }; "
-        "$subject = if ($null -eq $signature.SignerCertificate) { '' } else { "
-        "$signature.SignerCertificate.Subject }; "
-        "$thumbprint = if ($null -eq $signature.SignerCertificate) { '' } else { "
-        "$signature.SignerCertificate.Thumbprint }; "
-        "[PSCustomObject]@{ status = [string]$signature.Status; subject = $subject; "
-        "thumbprint = $thumbprint; product_name = [string]$file.VersionInfo.ProductName; "
-        "company_name = [string]$file.VersionInfo.CompanyName; "
-        "file_version = [string]$file.VersionInfo.FileVersion; "
-        "product_version = [string]$file.VersionInfo.ProductVersion } | "
-        "ConvertTo-Json -Compress"
-    )
-    result = subprocess.run(
-        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        check=False,
-        env=environment,
-    )
-    if result.returncode != 0:
-        raise ValueError(
-            "Could not inspect the HidHide installer trust and product metadata: "
-            + (result.stderr.strip() or f"PowerShell exit code {result.returncode}")
-        )
-    try:
-        inspection: object = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise ValueError("HidHide installer inspection returned invalid data") from exc
-    if not isinstance(inspection, dict):
-        raise ValueError("HidHide installer inspection returned an invalid object")
-
-    def required(name: str) -> str:
-        value = inspection.get(name)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"HidHide installer inspection returned an empty field: {name}")
-        return value.strip()
-
-    return HidHideInstallerIdentity(
-        path=path,
-        signature_status=str(inspection.get("status", "")).strip(),
-        signer_subject=str(inspection.get("subject", "")).strip(),
-        signer_thumbprint=str(inspection.get("thumbprint", "")).strip(),
-        product_name=required("product_name"),
-        company_name=required("company_name"),
-        file_version=required("file_version"),
-        product_version=required("product_version"),
-        sha256=sha256_file(path),
-    )
-
-
-def validate_hidhide_installer(
-    path: Path,
-    *,
-    inspector: Callable[[Path], HidHideInstallerIdentity] | None = None,
-) -> HidHideInstallerIdentity:
-    """Require the exact approved official HidHide release asset."""
-
-    resolved = path.expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(
-            "Official HidHide installer is required. Stage it at "
-            f"{DEFAULT_HIDHIDE_INSTALLER} or pass --hidhide-installer."
-        )
-    if resolved.name.casefold() != HIDHIDE_FILENAME.casefold():
-        raise ValueError(f"HidHide prerequisite must be named {HIDHIDE_FILENAME}")
-    if resolved.stat().st_size < 1024 * 1024:
-        raise ValueError(f"{HIDHIDE_FILENAME} is unexpectedly small")
-    identity = (inspector or inspect_hidhide_installer)(resolved)
-    if identity.path.resolve() != resolved:
-        raise ValueError("HidHide installer inspector returned a different file identity")
-    if identity.signature_status.casefold() != "valid":
-        raise ValueError("HidHide installer does not have a valid Authenticode signature")
-    if _NEFARIUS_PUBLISHER not in identity.signer_subject.casefold():
-        raise ValueError("HidHide installer is not signed by Nefarius Software Solutions")
-    if not identity.signer_thumbprint.strip():
-        raise ValueError("HidHide installer signer certificate has no thumbprint")
-    if identity.product_name.casefold() != "hidhide":
-        raise ValueError(f"Unexpected HidHide product name: {identity.product_name}")
-    if _NEFARIUS_PUBLISHER not in identity.company_name.casefold():
-        raise ValueError(f"Unexpected HidHide company name: {identity.company_name}")
-    if identity.file_version != HIDHIDE_VERSION:
-        raise ValueError(f"Unexpected HidHide file version: {identity.file_version}")
-    if identity.product_version != HIDHIDE_VERSION:
-        raise ValueError(f"Unexpected HidHide product version: {identity.product_version}")
-    if identity.sha256.casefold() != HIDHIDE_SHA256:
-        raise ValueError("HidHide installer does not match the release-approved SHA-256")
-    return identity
-
-
 def build_command(
     *,
     iscc: Path,
     app_source_dir: Path,
     gameinput_msi: Path,
-    hidhide_installer: Path,
     output_dir: Path,
 ) -> list[str]:
     return [
         str(iscc),
         f"/DAppSourceDir={app_source_dir}",
         f"/DGameInputMsi={gameinput_msi}",
-        f"/DHidHideInstaller={hidhide_installer}",
         f"/DMyAppVersion={__version__}",
         f"/O{output_dir}",
         str(INSTALLER_SCRIPT),
@@ -447,29 +314,9 @@ def write_prerequisite_manifest(gameinput: GameInputMsiIdentity, output_dir: Pat
     return destination
 
 
-def write_hidhide_prerequisite_manifest(
-    hidhide: HidHideInstallerIdentity, output_dir: Path
-) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
-        "name": "HidHide",
-        "filename": hidhide.path.name,
-        "identity": {key: value for key, value in asdict(hidhide).items() if key != "path"},
-        "source_release": "nefarius/HidHide v1.5.230.0",
-        "install_mode": "bundled-optional-exe-when-missing",
-        "selection_default": "selected-by-default-when-missing",
-        "configuration_mode": "vigil-first-run-fresh-install-only",
-        "uninstall_mode": "shared-dependency-left-installed",
-    }
-    destination = output_dir / "hidhide_prerequisite.json"
-    destination.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return destination
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gameinput-msi", type=Path, default=DEFAULT_GAMEINPUT_MSI)
-    parser.add_argument("--hidhide-installer", type=Path, default=DEFAULT_HIDHIDE_INSTALLER)
     parser.add_argument("--nuitka-dist", type=Path)
     parser.add_argument("--iscc", type=Path)
     parser.add_argument(
@@ -484,7 +331,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.gameinput_msi,
             approved_sha256=args.approved_gameinput_sha256,
         )
-        hidhide = validate_hidhide_installer(args.hidhide_installer)
         app_source_dir = (
             args.nuitka_dist.expanduser().resolve()
             if args.nuitka_dist is not None
@@ -506,7 +352,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         iscc=iscc,
         app_source_dir=app_source_dir,
         gameinput_msi=gameinput.path,
-        hidhide_installer=hidhide.path,
         output_dir=OUTPUT_ROOT,
     )
     print(subprocess.list2cmdline(command))
@@ -520,8 +365,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_ROOT / "hidhide_prerequisite.json").unlink(missing_ok=True)
     write_prerequisite_manifest(gameinput, OUTPUT_ROOT)
-    write_hidhide_prerequisite_manifest(hidhide, OUTPUT_ROOT)
     return subprocess.call(command, cwd=PROJECT_ROOT)
 
 

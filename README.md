@@ -11,7 +11,7 @@ separate service boundaries.
   Integrations, Settings, and Widgets surfaces.
 - Native Windows CPU, GPU, VRAM, RAM, and cross-vendor FPS telemetry, with
   provider-aware game matching, sustained-GPU fallback selection, PID-scoped
-  PresentMon capture, and bounded collector recovery.
+  PresentMon capture, continuous background sampling, and bounded collector recovery.
 - Volume, microphone, default-device, and per-application audio controls.
 - Saved-profile Wi-Fi controls that do not require Windows Location access.
 - Display projection, resolution, and refresh-rate controls with Keep/Revert safety.
@@ -23,71 +23,30 @@ separate service boundaries.
   errors, and confirmations, with controller-safe focus and activation handling.
 - Verified foreground ownership and fail-open mouse/keyboard containment while the
   overlay is visible.
-- Optional focus-preserving controller isolation through the official HidHide package
-  offered by Vigil Setup or an existing installation.
+- Ordinary foreground-owned controller routing while Vigil is visible. Programs that
+  independently poll XInput or Raw Input may still see the physical controller; Vigil
+  does not claim universal controller isolation.
 
-Vigil Setup selects a pinned, verified official HidHide package for installation by
-default when HidHide is absent; the user may clear that optional component. Setup does
-not enable hiding, replace an existing HidHide version, or remove the driver when Vigil
-is uninstalled. Setup accepts the prerequisite only after HidHide's official version
-and path registrations and its command-line client are present. Before launching that
-package, Setup writes an administrator-protected `installing` receipt and promotes it
-to `pending` only after those postconditions pass. This lets a later Vigil installation
-resume the one-time safe handoff if Setup is interrupted after installing HidHide.
-Setup never creates the receipt merely because it finds an existing installation.
-When Vigil consumes a valid pending receipt, it may add its installed executable and
-only connected inputs that HidHide itself identifies as gaming devices. Vigil records
-the exact configuration it created; its watchdog then adds newly connected
-HidHide-verified controllers automatically, so a replacement or additional controller
-does not require another trip through the HidHide client. Existing HidHide
-installations are never automatically configured. Without the optional HidHide
-integration, applications that independently poll XInput or subscribe to Raw Input can
-still observe the physical controller while the overlay is open. Input containment is
-released before Vigil hides or exits.
+FPS discovery and one selected game's PresentMon capture continue while Vigil runs in
+the background. Accepted frames update current FPS and the session average. If opening
+Vigil causes that verified game to pause, Performance keeps the last current value,
+labels it **LAST FPS**, and freezes the existing average. A game that keeps presenting
+continues to show live values. The FPS session resets when the target changes or exits.
 
-The **Keep the game focused** setting defaults on once an installed Windows build
-detects HidHide. An explicit user choice is preserved. On a fresh HidHide installation,
-Vigil completes the initial configuration automatically when at least one controller is
-connected, then verifies that device hiding remains off. Previously approved controller
-IDs remain managed across disconnects, and new connected controllers are added only
-after HidHide identifies them as gaming devices. If no controller is connected,
-automatic setup waits for a later Vigil launch. If HidHide was already installed or its
-configuration is no longer clean, configure it manually: add the installed
-`VigilOverlay.exe` to Applications, select only the connected gaming controller to
-hide, leave inverse mode off, and turn **Enable device hiding** off.
-For a composite device, expand it and select only children identified as a gamepad or
-joystick. Do not select a keyboard, mouse, keypad, pointer, or a broad composite row
-that contains any non-gaming child; Vigil rejects that configuration.
-Vigil verifies that setup before each lease. It may add controller IDs only while the
-shared HidHide configuration still exactly matches the fresh configuration Vigil
-recorded; it never removes device IDs. If the user or another controller utility changes
-the shared lists or mode, Vigil permanently stops automatic management and leaves those
-settings untouched. A separate watchdog restores pass-through if Vigil exits
-unexpectedly. From preparation through release, that watchdog is the only Vigil
-process that opens HidHide's single-client control interface; the overlay process
-reads its atomic verified status and heartbeat instead. Vigil remains hidden while
-preparation runs. The watchdog checks for newly connected controllers every five
-seconds, rechecks both Vigil-managed and manually configured leases, and restores
-pass-through if hiding or the shared configuration changes. HidHide's own client tools
-may maintain their own allowlist entries. Vigil uses its existing foreground mode only
-after pass-through is verified; if the shared state cannot be verified, Vigil stays
-hidden and directs the user to turn off device hiding.
-
-Focus-preserving mode is intended for borderless or windowed games. A separate desktop
-window cannot be guaranteed to render above every true exclusive-fullscreen game.
+Vigil 0.1.4.0 no longer installs or uses HidHide for active controller handling. An
+upgrade never uninstalls a user-owned package or rewrites its application and device lists.
+If an older Vigil-authored recovery journal proves that hiding may still be active,
+Vigil performs a one-time pass-through check before removing only its own legacy state.
 
 ## Requirements
 
 - 64-bit Windows 10 or Windows 11
 - Python 3.11 or newer when running from source
 - PySide6 6.7 or newer
-- Optional: the official HidHide package for **Keep the game focused** controller
-  isolation
 
 End users should install Vigil with the packaged Windows installer. The installer
-includes the required GameInput runtime, selects HidHide by default when absent unless
-the user clears that optional component, and does not require a separate Python
-installation.
+includes the required GameInput runtime and does not require a separate Python
+installation. It does not install or modify HidHide.
 
 Production Windows builds request administrator approval when Vigil starts so
 PresentMon can capture FPS telemetry reliably. Start with Windows uses an elevated
@@ -128,34 +87,22 @@ The build validates all required WinRT projections, the pinned PresentMon execut
 and the Playnite bridge before producing a distribution. Missing native assets are
 rejected rather than silently omitted.
 
-After staging the official Microsoft GameInput MSI and the pinned official HidHide
-installer, create the installer with:
+After staging the official Microsoft GameInput MSI, create the installer with:
 
 ```powershell
 python tools/build_installer.py `
-  --gameinput-msi C:\path\to\GameInputRedist.msi `
-  --hidhide-installer C:\path\to\HidHide_1.5.230_x64.exe
+  --gameinput-msi C:\path\to\GameInputRedist.msi
 ```
 
-The installer builder verifies both publishers, product metadata, versions, and
-approved hashes before invoking Inno Setup. HidHide is selected by default as an
-optional component when no existing HidHide installation is detected, and the user
-may clear that selection. Setup reads HidHide's 64-bit machine registration and
-verifies its version, path, and command-line client after installation; a success exit
-code without those postconditions is rejected with restart and rerun guidance. Setup
-never enables device hiding. Only a fresh HidHide installed by that Setup receives the
-protected pending receipt that permits Vigil's one-time, gaming-device-only initial
-configuration; existing configurations remain untouched. The receipt survives an
-interrupted install, is consumed after a terminal configuration decision, and is
-removed with Vigil without removing HidHide itself.
+The installer builder verifies Microsoft's signature, MSI identity, and optional
+release hash pin before invoking Inno Setup.
 
 ## Data and privacy
 
 Vigil reads local launcher metadata to discover installed games. It does not write its
 own game-launch history. Hardware and FPS history are bounded in memory and are not
-persisted. PresentMon, GameInput, and the optional HidHide installer are validated
-during packaging; Vigil does not download or replace any of them while the
-application is running.
+persisted. PresentMon and GameInput are validated during packaging; Vigil does not
+download or replace either one while the application is running.
 
 Shortly after startup, Vigil makes one HTTPS request to GitHub's public latest-release
 endpoint. This check only displays an update notice; Vigil does not download or install

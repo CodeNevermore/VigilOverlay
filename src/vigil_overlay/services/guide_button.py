@@ -11,7 +11,6 @@ from __future__ import annotations
 import ctypes
 import logging
 import sys
-import time
 from collections.abc import Callable
 from typing import Any, Final, Protocol, cast
 
@@ -24,7 +23,6 @@ _LOGGER = logging.getLogger("vigil_overlay")
 _GAMEINPUT_SYSTEM_BUTTON_GUIDE: Final[int] = 0x00000001
 _GAMEINPUT_EXCLUSIVE_FOREGROUND_INPUT: Final[int] = 0x00000002
 _GAMEINPUT_ENABLE_BACKGROUND_GUIDE_BUTTON: Final[int] = 0x00000080
-_GUIDE_DUPLICATE_SUPPRESSION_SECONDS: Final[float] = 1.5
 
 # IUnknown occupies vtable slots 0-2. These are the v2 IGameInput method slots
 # from Microsoft's versioned GameInput v2 interface declaration.
@@ -229,11 +227,7 @@ class GameInputGuideButtonBackend:
     @staticmethod
     def _make_system_button_callback(
         on_guide_pressed: Callable[[], None],
-        *,
-        clock: Callable[[], float] = time.monotonic,
     ) -> Callable[[int, int | None, int | None, int, int, int], None]:
-        last_emitted_press_at: float | None = None
-
         def callback(
             callback_token: int,
             context: int | None,
@@ -242,7 +236,6 @@ class GameInputGuideButtonBackend:
             current_buttons: int,
             previous_buttons: int,
         ) -> None:
-            nonlocal last_emitted_press_at
             del context
             pressed_now = bool(current_buttons & _GAMEINPUT_SYSTEM_BUTTON_GUIDE)
             pressed_before = bool(previous_buttons & _GAMEINPUT_SYSTEM_BUTTON_GUIDE)
@@ -259,18 +252,6 @@ class GameInputGuideButtonBackend:
                 )
             if not pressed_now or pressed_before:
                 return
-            observed_at = clock()
-            if (
-                last_emitted_press_at is not None
-                and observed_at - last_emitted_press_at < _GUIDE_DUPLICATE_SUPPRESSION_SECONDS
-            ):
-                _LOGGER.warning(
-                    "Suppressed duplicate GameInput Guide press after %.3f seconds; "
-                    "HidHide device re-enumeration may have replayed the held button state",
-                    observed_at - last_emitted_press_at,
-                )
-                return
-            last_emitted_press_at = observed_at
             on_guide_pressed()
 
         return callback

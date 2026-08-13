@@ -592,7 +592,6 @@ class SettingsWidgetView(QWidget):
             (
                 "guide_button",
                 "controller_shortcut",
-                "focus_preserving_controller_isolation",
                 "allow_mouse_navigation_while_controller_connected",
                 "global_hotkey",
             ),
@@ -609,8 +608,6 @@ class SettingsWidgetView(QWidget):
         *,
         guide_button_enabled: bool,
         controller_shortcut_binding: ControllerShortcutBinding | None = None,
-        focus_preserving_controller_isolation_enabled: bool = False,
-        focus_preserving_controller_isolation_available: bool = True,
         allow_mouse_navigation_while_controller_connected: bool = False,
         hotkey_combination: str,
         start_with_windows_enabled: bool = True,
@@ -640,12 +637,6 @@ class SettingsWidgetView(QWidget):
             HotkeyEditorDialog | HotkeyFailureDialog | ControllerShortcutEditorDialog | None
         ) = None
         self._next_input_source = ModalInputSource.UNKNOWN
-        self._focus_preserving_controller_isolation_enabled = (
-            focus_preserving_controller_isolation_enabled
-        )
-        self._focus_preserving_controller_isolation_available = (
-            focus_preserving_controller_isolation_available
-        )
         self._allow_mouse_navigation_while_controller_connected = (
             allow_mouse_navigation_while_controller_connected
         )
@@ -680,21 +671,6 @@ class SettingsWidgetView(QWidget):
         row = self._buttons_by_item["allow_mouse_navigation_while_controller_connected"]
         row.set_toggle_checked(enabled)
         row.update()
-
-    @property
-    def focus_preserving_controller_isolation_enabled(self) -> bool:
-        return self._focus_preserving_controller_isolation_enabled
-
-    def set_focus_preserving_controller_isolation_enabled(self, enabled: bool) -> None:
-        self._focus_preserving_controller_isolation_enabled = enabled
-        row = self._buttons_by_item["focus_preserving_controller_isolation"]
-        row.set_toggle_checked(enabled)
-        row.update()
-
-    def set_focus_preserving_controller_isolation_available(self, available: bool) -> None:
-        self._focus_preserving_controller_isolation_available = available
-        row = self._buttons_by_item["focus_preserving_controller_isolation"]
-        row.setEnabled(available)
 
     def set_start_with_windows_enabled(self, enabled: bool) -> None:
         self._start_with_windows_enabled = enabled
@@ -880,12 +856,6 @@ class SettingsWidgetView(QWidget):
 
         layout.addStretch(1)
         self.set_guide_button_enabled(self._guide_button_enabled)
-        self.set_focus_preserving_controller_isolation_enabled(
-            self._focus_preserving_controller_isolation_enabled
-        )
-        self.set_focus_preserving_controller_isolation_available(
-            self._focus_preserving_controller_isolation_available
-        )
         self.set_allow_mouse_navigation_while_controller_connected(
             self._allow_mouse_navigation_while_controller_connected
         )
@@ -905,8 +875,6 @@ class SettingsWidgetView(QWidget):
                 self,
                 trailing_text=self._controller_shortcut_binding.display_label,
             )
-        if item.item_id == "focus_preserving_controller_isolation":
-            return SettingsRowButton(item, self, toggle=True)
         if item.item_id == "allow_mouse_navigation_while_controller_connected":
             return SettingsRowButton(item, self, toggle=True)
         if item.item_id == "global_hotkey":
