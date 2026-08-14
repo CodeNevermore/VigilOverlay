@@ -10,8 +10,8 @@ separate service boundaries.
 - Compact controller-navigable Home, Performance, Audio, Wi-Fi, Display,
   Integrations, Settings, and Widgets surfaces.
 - Native Windows CPU, GPU, VRAM, RAM, and cross-vendor FPS telemetry, with
-  provider-aware game matching, sustained-GPU fallback selection, PID-scoped
-  PresentMon capture, continuous background sampling, and bounded collector recovery.
+  foreground-assisted provider matching, learned verified game executables,
+  PID-scoped PresentMon capture, and bounded collector recovery.
 - Volume, microphone, default-device, and per-application audio controls.
 - Saved-profile Wi-Fi controls that do not require Windows Location access.
 - Display projection, resolution, and refresh-rate controls with Keep/Revert safety.
@@ -27,13 +27,32 @@ separate service boundaries.
   independently poll XInput or Raw Input may still see the physical controller; Vigil
   does not claim universal controller isolation.
 
-FPS discovery and one selected game's PresentMon capture continue while Vigil runs in
-the background. Accepted frames update current FPS and the session average. If opening
-Vigil causes that verified game to pause, Performance keeps the last current value,
-labels it **LAST FPS**, and freezes the existing average. A game that keeps presenting
-continues to show live values. The FPS session resets when the target changes or exits.
+If Windows temporarily refuses or revokes foreground ownership, Vigil stays visible
+and retries activation instead of hiding itself. Vigil remains controller-navigable
+through its shared compatibility route, so the game may receive the same controller
+presses until foreground ownership is verified and GameInput ownership activates.
 
-Vigil 0.1.4.0 no longer installs or uses HidHide for active controller handling. An
+FPS discovery captures the foreground game before Vigil opens. Exact executables
+learned from earlier frame-verified sessions rank first, followed by the foreground
+installed-provider match and other visible provider matches. If none match, only the
+eligible foreground executable can enter a provisional probe: two sustained,
+low-frequency GPU-activity samples wake it, with a 2-minute safety probe for CPU-bound
+games or unavailable GPU counters. Vigil never searches for the globally busiest GPU
+process.
+
+Every new candidate remains provisional until three usable PresentMon frames verify
+its current process. Vigil then learns that executable and keeps one collector through
+later absent or stale frames until the process exits. A provisional candidate that
+produces no usable frames is stopped and parked instead of leaving PresentMon running;
+retries back off from 5 seconds to 30 seconds and then 2 minutes, while renewed
+foreground activity, sustained GPU activity, provider changes, or process relaunch can
+wake it sooner. Once a target verifies, candidate scanning and GPU wake checks pause.
+Accepted frames update current FPS and the session average. If opening Vigil causes a
+verified game to pause, Performance keeps the last current value, labels it **LAST
+FPS**, and freezes the existing average. A game that keeps presenting continues to
+show live values. The FPS session resets when the verified target exits.
+
+Vigil 0.1.4.1 no longer installs or uses HidHide for active controller handling. An
 upgrade never uninstalls a user-owned package or rewrites its application and device lists.
 If an older Vigil-authored recovery journal proves that hiding may still be active,
 Vigil performs a one-time pass-through check before removing only its own legacy state.
@@ -100,9 +119,14 @@ release hash pin before invoking Inno Setup.
 ## Data and privacy
 
 Vigil reads local launcher metadata to discover installed games. It does not write its
-own game-launch history. Hardware and FPS history are bounded in memory and are not
-persisted. PresentMon and GameInput are validated during packaging; Vigil does not
-download or replace either one while the application is running.
+own game-launch history. Hardware measurements and FPS samples are bounded in memory
+and are not persisted. After a process produces valid frames, Vigil stores its local
+executable path, including provider identity when available, to improve future FPS
+matching. Valid unique mappings do not expire or get count-evicted during normal use;
+the file has only a defensive size guard against unreasonable local data. Process IDs,
+verification times or counts, and performance samples are not stored. PresentMon and
+GameInput are validated during packaging; Vigil does not download or replace either one
+while the application is running.
 
 Shortly after startup, Vigil makes one HTTPS request to GitHub's public latest-release
 endpoint. This check only displays an update notice; Vigil does not download or install

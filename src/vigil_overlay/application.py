@@ -48,6 +48,7 @@ from vigil_overlay.services.foreground_ownership import (
     ForegroundOwnershipService,
     create_platform_foreground_ownership_service,
 )
+from vigil_overlay.services.fps import FpsTarget
 from vigil_overlay.services.fps_runtime import (
     PresentMonFpsService,
     UnavailableFpsService,
@@ -146,6 +147,7 @@ class VigilApplication:
         foreground_ownership_service: ForegroundOwnershipService | None = None,
         foreground_clock: Callable[[], float] = time.monotonic,
         foreground_claim_timeout_seconds: float = _FOREGROUND_CLAIM_TIMEOUT_SECONDS,
+        fps_foreground_target_provider: Callable[[], FpsTarget | None] | None = None,
         game_library_refresh_clock: Callable[[], float] = time.monotonic,
         game_provider_registry: GameProviderRegistry | None = None,
         game_library_service: GameLibraryService | None = None,
@@ -244,6 +246,9 @@ class VigilApplication:
         self._foreground_claim_pending = False
         self._foreground_loss_confirming = False
         self._foreground_verified = False
+        self._fps_foreground_target_provider = (
+            fps_foreground_target_provider or capture_foreground_fps_target
+        )
         self._foreground_ownership_timer = QTimer()
         self._foreground_ownership_timer.setInterval(_FOREGROUND_LEASE_POLL_MILLISECONDS)
         self._foreground_ownership_timer.timeout.connect(self._reconcile_foreground_ownership)
@@ -383,9 +388,7 @@ class VigilApplication:
 
         return InputControlDiagnostics(
             mode=self._input_policy.mode,
-            foreground_verification_required=(
-                self._foreground_ownership_service.required
-            ),
+            foreground_verification_required=(self._foreground_ownership_service.required),
             foreground_verification_supported=self._foreground_ownership_service.supported,
             foreground_verified=self._foreground_verified,
             gameinput_exclusivity_active=self._controller_input_ownership_service.active,
@@ -800,17 +803,17 @@ class VigilApplication:
             self._apply_runtime_input_policy(policy)
             return policy
 
-        entering_controller_primary = (
-            policy.mode is OverlayInputMode.CONTROLLER_PRIMARY
-            and previous.mode is not OverlayInputMode.CONTROLLER_PRIMARY
+        entering_native_controller_route = (
+            policy.route_native_controller_commands
+            and not previous.route_native_controller_commands
         )
-        if entering_controller_primary:
-            # Disarm before publishing controller-primary mode. Any controller signal
-            # already queued from mouse-primary mode is rejected until the worker
+        if entering_native_controller_route:
+            # Disarm before publishing a native controller route. Any signal already
+            # queued before the visible route opened is rejected until the worker
             # reports a fully neutral controller state.
             self._controller_commands_ready = False
             self._controller_service.require_neutral_before_commands()
-        elif policy.mode is not OverlayInputMode.CONTROLLER_PRIMARY:
+        elif not policy.route_native_controller_commands:
             self._controller_commands_ready = True
 
         self._input_policy = policy
@@ -867,7 +870,7 @@ class VigilApplication:
         self._reconcile_foreground_ownership()
 
     def _reconcile_foreground_ownership(self) -> None:
-        """Acquire, monitor, or fail-open the visible-overlay foreground lease."""
+        """Acquire or monitor foreground without automatically hiding the overlay."""
 
         service = self._foreground_ownership_service
         if not service.required:
@@ -908,7 +911,7 @@ class VigilApplication:
         ):
             confirmed_loss = self._foreground_loss_confirming
             _LOGGER.warning(
-                "%s; input stayed suspended and the overlay will hide: %s",
+                "%s; input remains suspended and the visible overlay will retry activation: %s",
                 (
                     "Vigil foreground loss was confirmed"
                     if confirmed_loss
@@ -916,10 +919,10 @@ class VigilApplication:
                 ),
                 service.detail,
             )
-            self._release_visible_input_control(
-                "foreground ownership lost" if confirmed_loss else "foreground claim timed out"
+            self._foreground_claim_deadline = (
+                self._foreground_clock() + self._foreground_claim_timeout_seconds
             )
-            self.window.request_hide()
+            service.request(int(self.window.winId()))
 
     def _suspend_input_for_foreground_recheck(self) -> None:
         """Release containment immediately while tolerating a transient HWND handoff."""
@@ -931,7 +934,6 @@ class VigilApplication:
         self._foreground_claim_deadline = (
             self._foreground_clock() + _FOREGROUND_LOSS_CONFIRM_SECONDS
         )
-        self._controller_commands_ready = False
         self._sync_input_policy(overlay_visible=True)
         self._log_input_control_status("foreground transition suspended")
 
@@ -1159,11 +1161,10 @@ class VigilApplication:
     def _present_overlay(self) -> None:
         """Show the ordinary foreground-owned overlay and begin its input lease."""
 
+        foreground_target = self._fps_foreground_target_provider()
         self.window.show_overlay()
         self._fps_service.set_overlay_visible(True)
-        target_found = self._prepare_fps_target()
-        if not target_found:
-            QTimer.singleShot(0, self._prepare_fps_target)
+        self._prepare_fps_target(foreground_target)
         self._begin_foreground_input_lease()
 
     def _consume_instance_activation(self) -> None:
@@ -1174,24 +1175,29 @@ class VigilApplication:
         self._sync_tray_action()
         _LOGGER.info("Existing Vigil instance activated by a repeated launch")
 
-    def _prepare_fps_target(self) -> bool:
-        target = capture_foreground_fps_target()
-        if target is None:
-            request_discovery = getattr(self._fps_service, "request_discovery", None)
-            if callable(request_discovery):
-                request_discovery()
+    def _prepare_fps_target(self, preferred_target: FpsTarget | None = None) -> bool:
+        """Request learned/provider discovery with a pre-overlay foreground hint."""
+
+        request_discovery = getattr(self._fps_service, "request_discovery", None)
+        if callable(request_discovery):
+            request_discovery(preferred_target)
+        target = getattr(self._fps_service, "target", None)
+        if isinstance(target, FpsTarget):
             _LOGGER.debug(
-                "No eligible foreground or underlay FPS seed was found; "
-                "provider/GPU discovery remains active"
+                "FPS provider target remains owned: %s (pid=%d)",
+                target.executable_name,
+                target.process_id,
             )
-            return False
-        self._fps_service.set_target(target)
-        _LOGGER.info(
-            "FPS target selected from foreground/underlay window: %s (pid=%d)",
-            target.executable_name,
-            target.process_id,
-        )
-        return True
+            return True
+        if preferred_target is None:
+            _LOGGER.debug("Provider-only FPS discovery remains active without a foreground hint")
+        else:
+            _LOGGER.info(
+                "FPS foreground starting hint captured before overlay activation: %s (pid=%d)",
+                preferred_target.executable_name,
+                preferred_target.process_id,
+            )
+        return False
 
     def _restart_in_safe_mode(self) -> tuple[bool, str]:
         if self._safe_mode:
@@ -1233,9 +1239,7 @@ class VigilApplication:
         action = self._tray_toggle_action
         if action is None:
             return
-        action.setText(
-            "Hide Vigil Overlay" if self.window.isVisible() else "Show Vigil Overlay"
-        )
+        action.setText("Hide Vigil Overlay" if self.window.isVisible() else "Show Vigil Overlay")
 
     def _teardown_hotkey(self) -> None:
         self._hotkey_probe_service.stop()

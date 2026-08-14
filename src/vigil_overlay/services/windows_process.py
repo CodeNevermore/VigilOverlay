@@ -3,29 +3,41 @@
 from __future__ import annotations
 
 import ctypes
-import logging
 import os
 from ctypes import wintypes
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final, cast
 
 from vigil_overlay.services.fps import FpsTarget
-from vigil_overlay.services.windows_telemetry import sample_process_gpu_usage
 
-_LOGGER = logging.getLogger("vigil_overlay")
 _GW_HWNDNEXT: Final[int] = 2
 _MAX_Z_ORDER_SCAN: Final[int] = 64
-_FPS_GPU_SCAN_MULTIPLIER: Final[int] = 4
-_MIN_GPU_SCAN_CANDIDATES: Final[int] = 16
-_GPU_CANDIDATE_LOG_LIMIT: Final[int] = 8
 _PROCESS_QUERY_LIMITED_INFORMATION: Final[int] = 0x1000
+_TH32CS_SNAPPROCESS: Final[int] = 0x00000002
+_MAX_PATH: Final[int] = 260
+_INVALID_HANDLE_VALUE: Final[int] = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
 _SYNCHRONIZE: Final[int] = 0x00100000
 _WAIT_TIMEOUT: Final[int] = 0x00000102
+_WAIT_OBJECT_0: Final[int] = 0x00000000
 
 
 class _FileTime(ctypes.Structure):
     _fields_ = (("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD))
+
+
+class _ProcessEntry32W(ctypes.Structure):
+    _fields_ = (
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * _MAX_PATH),
+    )
 
 
 _EXCLUDED_PROCESS_NAMES = frozenset(
@@ -36,6 +48,7 @@ _EXCLUDED_PROCESS_NAMES = frozenset(
         "explorer.exe",
         "dwm.exe",
         "searchhost.exe",
+        "systemsettings.exe",
         "shellexperiencehost.exe",
         "startmenuexperiencehost.exe",
         "applicationframehost.exe",
@@ -51,6 +64,7 @@ _EXCLUDED_PROCESS_NAMES = frozenset(
         "powershell.exe",
         "pwsh.exe",
         "windowsterminal.exe",
+        "taskmgr.exe",
         "chrome.exe",
         "msedge.exe",
         "firefox.exe",
@@ -144,66 +158,6 @@ def capture_foreground_fps_targets(*, max_candidates: int = 64) -> tuple[FpsTarg
     return tuple(targets)
 
 
-def rank_fps_targets_by_gpu(
-    targets: tuple[FpsTarget, ...],
-    gpu_usage_by_pid: dict[int, float],
-) -> tuple[FpsTarget, ...]:
-    """Rank visible candidates by current process GPU activity, preserving Z-order ties."""
-
-    indexed = tuple(enumerate(targets))
-    return tuple(
-        target
-        for _index, target in sorted(
-            indexed,
-            key=lambda item: (
-                -max(gpu_usage_by_pid.get(item[1].process_id, 0.0), 0.0),
-                item[0],
-            ),
-        )
-    )
-
-
-def capture_ranked_fps_targets(
-    *,
-    sample_interval_seconds: float = 0.25,
-    max_candidates: int = 8,
-) -> tuple[FpsTarget, ...]:
-    """Return visible FPS candidates ordered by busiest current GPU process first.
-
-    GPU counter collection is best-effort. If PDH counters are unavailable, the original
-    foreground/underlay Z-order is preserved. This function is intended for the FPS broker
-    worker thread and may wait briefly between PDH rate samples.
-    """
-
-    scan_limit = max(
-        max_candidates * _FPS_GPU_SCAN_MULTIPLIER,
-        _MIN_GPU_SCAN_CANDIDATES,
-    )
-    candidates = capture_foreground_fps_targets(max_candidates=scan_limit)
-    if not candidates:
-        return ()
-    try:
-        gpu_usage = sample_process_gpu_usage(sample_interval_seconds=sample_interval_seconds)
-    except OSError:
-        _LOGGER.exception("Per-process GPU counters unavailable; using FPS Z-order candidates")
-        return candidates[:max_candidates]
-    scored = tuple(
-        replace(
-            target,
-            gpu_usage_percent=max(gpu_usage.get(target.process_id, 0.0), 0.0),
-        )
-        for target in candidates
-    )
-    ranked = rank_fps_targets_by_gpu(scored, gpu_usage)
-    if ranked:
-        summary = ", ".join(
-            f"{target.executable_name}:{gpu_usage.get(target.process_id, 0.0):.1f}%"
-            for target in ranked[: min(max_candidates, _GPU_CANDIDATE_LOG_LIMIT)]
-        )
-        _LOGGER.info("FPS GPU-ranked process candidates: %s", summary)
-    return ranked[:max_candidates]
-
-
 def _target_from_window(user32: Any, kernel32: Any, hwnd: Any) -> FpsTarget | None:
     get_pid = user32.GetWindowThreadProcessId
     get_pid.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
@@ -261,7 +215,7 @@ def _query_process_details(
 
     handle = open_process(_PROCESS_QUERY_LIMITED_INFORMATION, False, process_id)
     if not handle:
-        return ("", "", None)
+        return (_query_process_snapshot_name(kernel32, process_id), "", None)
     try:
         process_name = ""
         executable_path = ""
@@ -270,6 +224,8 @@ def _query_process_details(
         if query_name(handle, 0, buffer, ctypes.byref(capacity)):
             executable_path = buffer.value
             process_name = Path(executable_path).name
+        else:
+            process_name = _query_process_snapshot_name(kernel32, process_id)
 
         process_started_at_100ns: int | None = None
         if get_process_times is not None:
@@ -291,6 +247,46 @@ def _query_process_details(
         return (process_name, executable_path, process_started_at_100ns)
     finally:
         close_handle(handle)
+
+
+def _query_process_snapshot_name(kernel32: Any, process_id: int) -> str:
+    """Resolve an executable name without requiring a process query handle."""
+
+    create_snapshot = getattr(kernel32, "CreateToolhelp32Snapshot", None)
+    process_first = getattr(kernel32, "Process32FirstW", None)
+    process_next = getattr(kernel32, "Process32NextW", None)
+    close_handle = getattr(kernel32, "CloseHandle", None)
+    if (
+        create_snapshot is None
+        or process_first is None
+        or process_next is None
+        or close_handle is None
+    ):
+        return ""
+
+    create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    create_snapshot.restype = wintypes.HANDLE
+    process_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W))
+    process_first.restype = wintypes.BOOL
+    process_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W))
+    process_next.restype = wintypes.BOOL
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    snapshot = create_snapshot(_TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot in {-1, _INVALID_HANDLE_VALUE}:
+        return ""
+    try:
+        entry = _ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32W)
+        has_entry = bool(process_first(snapshot, ctypes.byref(entry)))
+        while has_entry:
+            if int(entry.th32ProcessID) == process_id:
+                return Path(entry.szExeFile).name
+            has_entry = bool(process_next(snapshot, ctypes.byref(entry)))
+    finally:
+        close_handle(snapshot)
+    return ""
 
 
 def is_fps_target_alive(target: FpsTarget) -> bool:
@@ -316,12 +312,16 @@ def is_fps_target_alive(target: FpsTarget) -> bool:
         target.process_id,
     )
     if not handle:
-        # Protected games can deny inspection while still presenting normally. Do not
-        # tear down a working FPS session merely because liveness could not be queried.
-        return ctypes.get_last_error() == 5
+        # PresentMon is already configured to terminate when the target exits. A transient,
+        # protected-process, or otherwise unavailable liveness handle must not tear down a
+        # provider-owned trace session and start a replacement loop.
+        return True
     try:
-        if int(wait_for_single_object(handle, 0)) != _WAIT_TIMEOUT:
+        wait_result = int(wait_for_single_object(handle, 0))
+        if wait_result == _WAIT_OBJECT_0:
             return False
+        if wait_result != _WAIT_TIMEOUT:
+            return True
     finally:
         close_handle(handle)
 

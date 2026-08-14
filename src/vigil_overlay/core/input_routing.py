@@ -52,13 +52,13 @@ class InputControlDiagnostics:
 
 
 def foreground_pending_input_policy() -> OverlayInputPolicy:
-    """Suspend visible-overlay navigation until Windows grants foreground ownership."""
+    """Allow shared controller navigation while foreground ownership is pending."""
 
     return OverlayInputPolicy(
         mode=OverlayInputMode.FOREGROUND_PENDING,
-        route_native_controller_commands=False,
+        route_native_controller_commands=True,
         allow_mouse_events_in_vigil=False,
-        use_controller_correlated_mouse_guard=False,
+        use_controller_correlated_mouse_guard=True,
         hold_gameinput_ownership=False,
     )
 

@@ -1,6 +1,6 @@
 """Application version metadata."""
 
-__version__ = "0.1.4.0"
+__version__ = "0.1.4.1"
 CONFIG_SCHEMA_VERSION = 17
 WIDGET_API_VERSION = "1.0"
 COMPONENT_API_VERSION = "1.0"

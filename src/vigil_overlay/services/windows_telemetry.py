@@ -11,7 +11,6 @@ import logging
 import os
 import re
 import sys
-import time
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -75,13 +74,9 @@ class WindowsTelemetrySampler:
         self._memory: _MemorySampler = _MemorySampler()
         self._frequency: _CpuFrequencySampler = _CpuFrequencySampler()
         try:
-            self._gpu: _GpuTelemetrySampler | _UnavailableGpuSampler = (
-                _GpuTelemetrySampler()
-            )
+            self._gpu: _GpuTelemetrySampler | _UnavailableGpuSampler = _GpuTelemetrySampler()
         except OSError:
-            _LOGGER.exception(
-                "Windows GPU counters are unavailable; CPU and RAM remain active"
-            )
+            _LOGGER.exception("Windows GPU counters are unavailable; CPU and RAM remain active")
             self._gpu = _UnavailableGpuSampler()
         self._closed: bool = False
 
@@ -236,9 +231,7 @@ class _CpuUsageSampler:
         idle = _FILETIME()
         kernel = _FILETIME()
         user = _FILETIME()
-        if not self._get_system_times(
-            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
-        ):
+        if not self._get_system_times(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
             raise _win_error()
         return (_filetime_value(idle), _filetime_value(kernel), _filetime_value(user))
 
@@ -318,9 +311,7 @@ class _GpuTelemetrySampler:
         engine_items, memory_items = self._query.collect()
         utilization_by_adapter = aggregate_gpu_engine_usage(engine_items)
         memory_by_adapter = aggregate_adapter_memory(memory_items)
-        selected = select_gpu_adapter(
-            self._adapters, utilization_by_adapter, memory_by_adapter
-        )
+        selected = select_gpu_adapter(self._adapters, utilization_by_adapter, memory_by_adapter)
         if selected is None:
             return GpuReading()
         utilization = utilization_by_adapter.get(selected.luid)
@@ -361,18 +352,18 @@ class _PdhGpuQuery:
 
     def collect(
         self,
+        *,
+        include_memory: bool = True,
     ) -> tuple[tuple[tuple[str, float], ...], tuple[tuple[str, float], ...]]:
         if self._closed:
             return (), ()
         status = int(self._pdh.PdhCollectQueryData(self._query))
         if status != _ERROR_SUCCESS:
-            _LOGGER.debug(
-                "PdhCollectQueryData unavailable: 0x%08X", status & 0xFFFFFFFF
-            )
+            _LOGGER.debug("PdhCollectQueryData unavailable: 0x%08X", status & 0xFFFFFFFF)
             return (), ()
         return (
             self._formatted_array(self._engine_counter),
-            self._formatted_array(self._memory_counter),
+            self._formatted_array(self._memory_counter) if include_memory else (),
         )
 
     def close(self) -> None:
@@ -420,13 +411,9 @@ class _PdhGpuQuery:
             )
         )
         if status != _ERROR_SUCCESS:
-            raise OSError(
-                f"PdhAddEnglishCounterW({path}) failed: 0x{status & 0xFFFFFFFF:08X}"
-            )
+            raise OSError(f"PdhAddEnglishCounterW({path}) failed: 0x{status & 0xFFFFFFFF:08X}")
 
-    def _formatted_array(
-        self, counter: ctypes.c_void_p
-    ) -> tuple[tuple[str, float], ...]:
+    def _formatted_array(self, counter: ctypes.c_void_p) -> tuple[tuple[str, float], ...]:
         buffer_size = wintypes.DWORD(0)
         item_count = wintypes.DWORD(0)
         status = int(
@@ -464,6 +451,32 @@ class _PdhGpuQuery:
             name = item.szName or ""
             result.append((name, float(item.FmtValue.doubleValue)))
         return tuple(result)
+
+
+class ProcessGpuUsageSampler:
+    """Low-duty persistent PDH sampler for a specific set of candidate PIDs."""
+
+    def __init__(self, query: _PdhGpuQuery | None = None) -> None:
+        if sys.platform != "win32" and query is None:
+            raise OSError("ProcessGpuUsageSampler is only available on Windows")
+        self._query = query or _PdhGpuQuery()
+        self._closed = False
+
+    def sample(self, process_ids: frozenset[int]) -> dict[int, float]:
+        if self._closed:
+            raise RuntimeError("process GPU sampler is closed")
+        requested = {process_id for process_id in process_ids if process_id > 0}
+        if not requested:
+            return {}
+        engine_items, _memory_items = self._query.collect(include_memory=False)
+        usage = aggregate_process_gpu_engine_usage(engine_items)
+        return {process_id: value for process_id, value in usage.items() if process_id in requested}
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._query.close()
+        self._closed = True
 
 
 def calculate_cpu_percent(
@@ -523,31 +536,6 @@ def aggregate_process_gpu_engine_usage(
     for (pid, _luid, _phys, _engine, _type), value in engines.items():
         by_process[pid] = max(by_process.get(pid, 0.0), _clamp_percent(value))
     return by_process
-
-
-def sample_process_gpu_usage(
-    *,
-    sample_interval_seconds: float = 0.25,
-) -> dict[int, float]:
-    """Sample per-process Windows GPU activity for FPS target ranking.
-
-    PDH rate counters need a priming collection and a later collection. The sleep runs
-    on the FPS broker worker, never on the Qt UI thread. Missing counters degrade to an
-    empty ranking so foreground/z-order targeting remains available.
-    """
-
-    if sample_interval_seconds < 0:
-        raise ValueError("sample_interval_seconds must not be negative")
-    if sys.platform != "win32":
-        return {}
-    query = _PdhGpuQuery()
-    try:
-        if sample_interval_seconds:
-            time.sleep(sample_interval_seconds)
-        engine_items, _memory_items = query.collect()
-        return aggregate_process_gpu_engine_usage(engine_items)
-    finally:
-        query.close()
 
 
 def aggregate_gpu_engine_usage(
@@ -703,9 +691,7 @@ def _com_function(
     restype: Any,
     *argtypes: Any,
 ) -> Any:
-    vtable = ctypes.cast(
-        pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
-    ).contents
+    vtable = ctypes.cast(pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
     address = vtable[index]
     factory = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
     function_type = factory(restype, ctypes.c_void_p, *argtypes)

@@ -16,14 +16,15 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
-from typing import Final, TextIO
+from pathlib import Path, PureWindowsPath
+from typing import Final, Protocol, TextIO
 
 from PySide6.QtCore import QObject, Signal
 
 from vigil_overlay.contracts.games import GameRecord
 from vigil_overlay.core.paths import ApplicationPaths
 from vigil_overlay.services.fps import FpsMetricUpdate, FpsTarget, PresentMonFrame
+from vigil_overlay.services.fps_learning import LearnedFpsGameCache
 from vigil_overlay.services.fps_targeting import FpsCandidateSelector
 from vigil_overlay.services.presentmon_runtime import (
     PresentMonRuntimeError,
@@ -39,8 +40,13 @@ _STALE_AFTER_SECONDS: Final[float] = 1.5
 _FPS_HISTORY_LIMIT: Final[int] = 240
 _DEFAULT_NO_FRAME_TIMEOUT_SECONDS: Final[float] = 4.0
 _DEFAULT_FRAME_STALL_TIMEOUT_SECONDS: Final[float] = 5.0
-_DEFAULT_TARGET_RETRY_DELAY_SECONDS: Final[float] = 1.5
+_DEFAULT_TARGET_RETRY_DELAY_SECONDS: Final[float] = 5.0
 _DEFAULT_REJECTED_RESCAN_DELAY_SECONDS: Final[float] = 5.0
+_REJECTED_RESCAN_DELAY_MULTIPLIERS: Final[tuple[float, ...]] = (1.0, 6.0, 24.0)
+_DEFAULT_GPU_PROBE_INTERVAL_SECONDS: Final[float] = 10.0
+_DEFAULT_GPU_ACTIVITY_THRESHOLD_PERCENT: Final[float] = 5.0
+_DEFAULT_GPU_SAFETY_RETRY_SECONDS: Final[float] = 120.0
+_GPU_ACTIVITY_SAMPLE_COUNT: Final[int] = 2
 _DEFAULT_MAX_STALL_RESTARTS: Final[int] = 3
 _DEFAULT_UNEXPECTED_FAILURE_RETRY_DELAYS_SECONDS: Final[tuple[float, ...]] = (
     0.5,
@@ -48,10 +54,25 @@ _DEFAULT_UNEXPECTED_FAILURE_RETRY_DELAYS_SECONDS: Final[tuple[float, ...]] = (
     2.0,
 )
 _MAX_DISCOVERED_TARGETS: Final[int] = 8
-_RAW_GPU_CANDIDATE_LIMIT: Final[int] = 32
+_RAW_PROVIDER_CANDIDATE_LIMIT: Final[int] = 32
+_VERIFICATION_FRAME_COUNT: Final[int] = 3
 _TARGET_LIVENESS_POLL_SECONDS: Final[float] = 1.0
 _STDERR_TAIL_LINES: Final[int] = 32
 _STDERR_LINE_LIMIT: Final[int] = 1_000
+
+
+class ProcessGpuUsageProbe(Protocol):
+    """Low-duty process-scoped GPU activity source used only to wake parked targets."""
+
+    def sample(self, process_ids: frozenset[int]) -> dict[int, float]: ...
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateSnapshot:
+    candidates: tuple[FpsTarget, ...]
+    visible_identities: frozenset[tuple[int, int | str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,10 +258,7 @@ class FpsWindowAccumulator:
         allow_stale: bool = False,
     ) -> TelemetryMetricSnapshot:
         wall = time.monotonic() if now is None else now
-        stale = (
-            self._last_event_wall is None
-            or wall - self._last_event_wall > _STALE_AFTER_SECONDS
-        )
+        stale = self._last_event_wall is None or wall - self._last_event_wall > _STALE_AFTER_SECONDS
         if stale and not allow_stale:
             if append_history:
                 self._history.append(None)
@@ -258,8 +276,10 @@ class FpsWindowAccumulator:
         scale_max = _fps_scale_max(current, history)
         average_text = "" if average is None else f"AVG FPS {round(average):d}"
         secondary = (
-            "LAST FPS" if not average_text else f"LAST FPS · {average_text}"
-        ) if stale else average_text
+            ("LAST FPS" if not average_text else f"LAST FPS · {average_text}")
+            if stale
+            else average_text
+        )
         return TelemetryMetricSnapshot(
             metric=PerformanceMetric.FPS,
             display_value=f"{round(current):d}",
@@ -348,7 +368,7 @@ class _CaptureOutcome(StrEnum):
 
 
 class PresentMonFpsService(QObject):
-    """Run PresentMon against GPU-ranked candidate processes until frames are found."""
+    """Own one frame-verified game's persistent PresentMon capture."""
 
     metric_ready = Signal(object)
     failure_ready = Signal(str)
@@ -369,6 +389,10 @@ class PresentMonFpsService(QObject):
         candidate_provider: Callable[[], Sequence[FpsTarget]] | None = None,
         candidate_selector: FpsCandidateSelector | None = None,
         target_liveness_probe: Callable[[FpsTarget], bool] | None = None,
+        gpu_usage_sampler: ProcessGpuUsageProbe | None = None,
+        gpu_probe_interval_seconds: float = _DEFAULT_GPU_PROBE_INTERVAL_SECONDS,
+        gpu_activity_threshold_percent: float = (_DEFAULT_GPU_ACTIVITY_THRESHOLD_PERCENT),
+        gpu_safety_retry_seconds: float = _DEFAULT_GPU_SAFETY_RETRY_SECONDS,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -382,6 +406,12 @@ class PresentMonFpsService(QObject):
             raise ValueError("target_retry_delay_seconds must be positive")
         if rejected_rescan_delay_seconds <= 0:
             raise ValueError("rejected_rescan_delay_seconds must be positive")
+        if gpu_probe_interval_seconds <= 0:
+            raise ValueError("gpu_probe_interval_seconds must be positive")
+        if not math.isfinite(gpu_activity_threshold_percent) or gpu_activity_threshold_percent < 0:
+            raise ValueError("gpu_activity_threshold_percent must be finite and non-negative")
+        if gpu_safety_retry_seconds <= 0:
+            raise ValueError("gpu_safety_retry_seconds must be positive")
         if max_stall_restarts < 0:
             raise ValueError("max_stall_restarts cannot be negative")
         if len(unexpected_failure_retry_delays_seconds) != 3 or any(
@@ -402,6 +432,10 @@ class PresentMonFpsService(QObject):
         self._candidate_provider = candidate_provider
         self._candidate_selector = candidate_selector
         self._target_liveness_probe = target_liveness_probe
+        self._gpu_usage_sampler = gpu_usage_sampler
+        self._gpu_probe_interval_seconds = gpu_probe_interval_seconds
+        self._gpu_activity_threshold_percent = gpu_activity_threshold_percent
+        self._gpu_safety_retry_seconds = gpu_safety_retry_seconds
         self._lock = threading.Lock()
         self._target: FpsTarget | None = None
         self._generation = 0
@@ -410,6 +444,12 @@ class PresentMonFpsService(QObject):
         self._process: subprocess.Popen[str] | None = None
         self._last_capture_diagnostics: PresentMonCaptureDiagnostics | None = None
         self._stream_identity: tuple[int, int | str] | None = None
+        self._verified_target_identity: tuple[int, int | str] | None = None
+        self._preferred_target: FpsTarget | None = None
+        self._pending_foreground_hint: tuple[int, FpsTarget] | None = None
+        self._foreground_hint_revision = 0
+        self._provider_evidence_loaded = False
+        self._provider_evidence_revision = 0
         self._stream_selector = FpsStreamSelector()
         self._overlay_visible = False
         self._discovery_active = threading.Event()
@@ -457,6 +497,12 @@ class PresentMonFpsService(QObject):
         self._started = False
         self._discovery_active.set()
         self._replace_capture(None)
+        gpu_usage_sampler = self._gpu_usage_sampler
+        if gpu_usage_sampler is not None:
+            try:
+                gpu_usage_sampler.close()
+            except OSError:
+                _LOGGER.exception("Could not close the FPS GPU activity sampler")
         self._closed = True
 
     def set_target(self, target: FpsTarget | None) -> None:
@@ -483,39 +529,133 @@ class PresentMonFpsService(QObject):
         selector = self._candidate_selector
         if selector is None or self._closed:
             return
-        selector.update_known_games(games)
+        provider_evidence_changed = selector.update_known_games(games)
         with self._lock:
-            should_start_discovery = (
-                self._started
-                and self._target is None
-                and (self._capture_thread is None or not self._capture_thread.is_alive())
+            self._provider_evidence_loaded = True
+            pending_foreground_hint = self._pending_foreground_hint
+            self._pending_foreground_hint = None
+        pending_target = pending_foreground_hint[1] if pending_foreground_hint is not None else None
+        pending_match = pending_target is not None and selector.match(pending_target) is not None
+        pending_is_fallback = pending_target is not None and _eligible_local_fallback(
+            pending_target
+        )
+        promoted_pending_hint = False
+        with self._lock:
+            if (
+                pending_foreground_hint is not None
+                and self._foreground_hint_revision == pending_foreground_hint[0]
+                and (pending_match or pending_is_fallback)
+                and pending_target is not None
+                and (
+                    self._target is None or not self._retains_verified_capture_locked(self._target)
+                )
+            ):
+                self._preferred_target = pending_target
+                promoted_pending_hint = True
+            if provider_evidence_changed:
+                self._provider_evidence_revision += 1
+            target = self._target
+            should_start_discovery = self._started and (
+                target is None
+                or (promoted_pending_hint and self._process is None)
+                or (
+                    provider_evidence_changed
+                    and not self._retains_verified_capture_locked(target)
+                    and self._process is None
+                )
             )
+        if promoted_pending_hint:
+            _LOGGER.info("Deferred FPS foreground hint is ready for learned/provider targeting")
+        elif pending_foreground_hint is not None:
+            _LOGGER.debug("Discarded ineligible deferred FPS foreground hint")
         if should_start_discovery:
-            self._replace_capture(None, discover=True)
+            self._replace_capture(
+                pending_target if promoted_pending_hint else None,
+                discover=True,
+            )
 
-    def request_discovery(self) -> None:
-        """Ensure GPU/provider discovery is running when no foreground seed exists."""
+    def request_discovery(self, preferred_target: FpsTarget | None = None) -> None:
+        """Wake provider discovery and prioritize a pre-overlay foreground hint."""
 
         if self._closed or self._candidate_provider is None:
             return
+        selector = self._candidate_selector
+        preferred_is_match = (
+            preferred_target is not None
+            and selector is not None
+            and selector.match(preferred_target) is not None
+        )
+        preferred_is_fallback = preferred_target is not None and _eligible_local_fallback(
+            preferred_target
+        )
+        replace_provisional = False
+        deferred_preferred = False
         with self._lock:
             thread = self._capture_thread
             if not self._started:
                 return
             if thread is not None and thread.is_alive():
-                self._discovery_active.set()
-                return
-            target = self._target
-        self._replace_capture(target, discover=True)
+                target = self._target
+                if target is not None and self._retains_verified_capture_locked(target):
+                    return
+            else:
+                target = self._target
+            activate_preferred = False
+            if preferred_target is not None:
+                self._foreground_hint_revision += 1
+                self._pending_foreground_hint = None
+                if (
+                    selector is not None
+                    and not self._provider_evidence_loaded
+                    and not preferred_is_match
+                ):
+                    self._pending_foreground_hint = (
+                        self._foreground_hint_revision,
+                        preferred_target,
+                    )
+                    deferred_preferred = True
+                elif preferred_is_match or preferred_is_fallback:
+                    self._preferred_target = preferred_target
+                    activate_preferred = True
+            if thread is not None and thread.is_alive():
+                replace_provisional = (
+                    activate_preferred
+                    and preferred_target is not None
+                    and (
+                        self._process is None
+                        or (
+                            preferred_is_match
+                            and (
+                                target is None
+                                or target.identity_key != preferred_target.identity_key
+                            )
+                        )
+                    )
+                )
+                if not replace_provisional:
+                    self._discovery_active.set()
+                    return
+        if deferred_preferred:
+            _LOGGER.debug("Deferred FPS foreground hint until provider evidence loads")
+        elif preferred_target is not None and not (preferred_is_match or preferred_is_fallback):
+            _LOGGER.debug("Ignored FPS foreground hint without an eligible executable path")
+        if replace_provisional:
+            _LOGGER.info(
+                "FPS foreground hint woke parked or provisional discovery; restarting scan"
+            )
+            self._replace_capture(preferred_target, discover=True)
+            return
+        self._replace_capture(preferred_target if activate_preferred else None, discover=True)
 
     def set_overlay_visible(self, visible: bool) -> None:
-        """Record display policy without pausing background discovery or capture."""
+        """Record display policy without disturbing the owned capture."""
 
         if self._closed:
             return
         with self._lock:
             self._overlay_visible = visible
-        self._discovery_active.set()
+            if visible and not self._verified_target_identity:
+                self._discovery_active.set()
 
     def _replace_capture(
         self,
@@ -535,6 +675,10 @@ class PresentMonFpsService(QObject):
             self._process = None
             self._target = target
             self._last_capture_diagnostics = None
+            self._verified_target_identity = None
+            if not discover:
+                self._preferred_target = None
+                self._pending_foreground_hint = None
             if (
                 target is None
                 or previous_target is None
@@ -662,18 +806,22 @@ class PresentMonFpsService(QObject):
             )
             return
 
-        # A no-frame result starts a short in-memory cooldown. Persisting raw PIDs to disk would
-        # be unsafe because Windows reuses PIDs, and a correctly selected game can temporarily
-        # produce no trace rows during startup or a presentation-mode transition. Process creation
-        # time makes the identity robust when Windows allows us to query it. A rejected process is
-        # re-armed when its cooldown expires or after it disappears and returns. Discovery and a
-        # verified live stream continue while Vigil is hidden so the session average represents
-        # the selected game's whole observed session.
+        # Provider and durable learned matches lead discovery. An otherwise unknown
+        # foreground executable may enter only through targeted sustained-GPU activity or
+        # its bounded safety probe. Every candidate remains provisional until the current
+        # process produces usable PresentMon rows; only then does one collector own the FPS
+        # session through later no-frame/stale periods until target or collector exit.
         rejected_until: dict[tuple[int, int | str], float] = {}
+        rejection_attempts: dict[tuple[int, int | str], int] = {}
+        gpu_high_samples: dict[tuple[int, int | str], int] = {}
+        fallback_wait_started: dict[tuple[int, int | str], float] = {}
+        next_gpu_probe_at = 0.0
         previous_visible_identities: set[tuple[int, int | str]] = set()
         completed_candidate_scan = False
         first_cycle = True
         stall_restarts: dict[tuple[int, int | str], int] = {}
+        with self._lock:
+            observed_provider_evidence_revision = self._provider_evidence_revision
         while not stop_event.is_set():
             if not self._wait_for_discovery(stop_event):
                 return
@@ -681,10 +829,34 @@ class PresentMonFpsService(QObject):
             first_cycle = False
             current_visible_identities = {candidate.identity_key for candidate in discovered}
 
+            with self._lock:
+                provider_evidence_revision = self._provider_evidence_revision
+            if provider_evidence_revision != observed_provider_evidence_revision:
+                rejected_until.clear()
+                rejection_attempts.clear()
+                stall_restarts.clear()
+                gpu_high_samples.clear()
+                fallback_wait_started.clear()
+                next_gpu_probe_at = 0.0
+                previous_visible_identities.clear()
+                completed_candidate_scan = False
+                observed_provider_evidence_revision = provider_evidence_revision
+                _LOGGER.info("FPS provider evidence changed; clearing candidate backoff")
+
             if completed_candidate_scan:
                 reappeared = current_visible_identities - previous_visible_identities
                 for identity in reappeared:
-                    if rejected_until.pop(identity, None) is not None:
+                    was_backed_off = (
+                        identity in rejected_until
+                        or identity in rejection_attempts
+                        or identity in stall_restarts
+                    )
+                    rejected_until.pop(identity, None)
+                    rejection_attempts.pop(identity, None)
+                    stall_restarts.pop(identity, None)
+                    gpu_high_samples.pop(identity, None)
+                    fallback_wait_started.pop(identity, None)
+                    if was_backed_off:
                         _LOGGER.info(
                             "FPS candidate became visible again; clearing no-frame rejection: %r",
                             identity,
@@ -699,11 +871,43 @@ class PresentMonFpsService(QObject):
             completed_candidate_scan = True
             previous_visible_identities = current_visible_identities
 
-            candidates = tuple(
+            selector = self._candidate_selector
+            gpu_parked = tuple(
                 candidate
                 for candidate in discovered
-                if candidate.identity_key not in rejected_until
+                if candidate.identity_key in rejected_until
+                or (selector is not None and selector.match(candidate) is None)
             )
+            gpu_wakes: frozenset[tuple[int, int | str]] = frozenset()
+            if gpu_parked and now >= next_gpu_probe_at:
+                gpu_wakes = self._sample_gpu_wakes(gpu_parked, gpu_high_samples)
+                next_gpu_probe_at = now + self._gpu_probe_interval_seconds
+                for identity in gpu_wakes:
+                    if identity in rejected_until:
+                        rejected_until.pop(identity, None)
+                        _LOGGER.info(
+                            "Sustained GPU activity woke parked FPS candidate early: %r",
+                            identity,
+                        )
+
+            ready_candidates: list[FpsTarget] = []
+            for candidate in discovered:
+                identity = candidate.identity_key
+                if identity in rejected_until:
+                    continue
+                is_local_fallback = selector is not None and selector.match(candidate) is None
+                if is_local_fallback:
+                    wait_started = fallback_wait_started.setdefault(identity, now)
+                    safety_ready = now - wait_started >= self._gpu_safety_retry_seconds
+                    if identity not in gpu_wakes and not safety_ready:
+                        continue
+                    if safety_ready and identity not in gpu_wakes:
+                        _LOGGER.info(
+                            "FPS foreground candidate reached the safety probe interval: %r",
+                            identity,
+                        )
+                ready_candidates.append(candidate)
+            candidates = tuple(ready_candidates)
             if not candidates:
                 if self._candidate_provider is None:
                     self._complete_capture(
@@ -713,21 +917,33 @@ class PresentMonFpsService(QObject):
                     )
                     return
                 if discovered:
-                    # All currently visible processes are cooling down after a failed capture.
-                    # Keep the matched game visible in status and retry it automatically.
+                    # PresentMon is stopped while the target is parked. Low-duty GPU
+                    # sampling can wake it early; the bounded timer also supports
+                    # CPU-bound games and systems without process GPU counters.
                     self._publish_status(
                         generation,
                         self.target,
-                        "GAME FOUND - RETRYING FPS",
+                        "GAME FOUND - WAITING FOR ACTIVITY",
                     )
-                    retry_delay = min(
-                        (
-                            max(0.0, rejected_until[candidate.identity_key] - time.monotonic())
-                            for candidate in discovered
-                            if candidate.identity_key in rejected_until
-                        ),
-                        default=self._rejected_rescan_delay_seconds,
+                    retry_delays = [self._target_retry_delay_seconds]
+                    retry_delays.extend(
+                        max(0.0, rejected_until[candidate.identity_key] - now)
+                        for candidate in discovered
+                        if candidate.identity_key in rejected_until
                     )
+                    retry_delays.extend(
+                        max(
+                            0.0,
+                            fallback_wait_started[candidate.identity_key]
+                            + self._gpu_safety_retry_seconds
+                            - now,
+                        )
+                        for candidate in discovered
+                        if candidate.identity_key in fallback_wait_started
+                    )
+                    if self._gpu_usage_sampler is not None:
+                        retry_delays.append(max(0.0, next_gpu_probe_at - now))
+                    retry_delay = max(min(retry_delays), 0.01)
                     if stop_event.wait(retry_delay):
                         return
                 else:
@@ -736,8 +952,14 @@ class PresentMonFpsService(QObject):
                         self.target,
                         "RETRYING GAME DETECTION",
                     )
-                    if stop_event.wait(self._target_retry_delay_seconds):
-                        return
+                    has_parked_state = bool(
+                        rejection_attempts or stall_restarts or fallback_wait_started
+                    )
+                    if not self._overlay_is_visible() and not has_parked_state:
+                        self._discovery_active.clear()
+                    else:
+                        if stop_event.wait(self._target_retry_delay_seconds):
+                            return
                 continue
 
             retry_stalled_candidate: FpsTarget | None = None
@@ -773,6 +995,7 @@ class PresentMonFpsService(QObject):
                     with self._lock:
                         if generation == self._generation and self._process is process:
                             self._process = None
+                    self._discovery_active.set()
                 if outcome is _CaptureOutcome.CANCELLED:
                     return
                 if outcome is _CaptureOutcome.PERMISSION_REQUIRED:
@@ -843,8 +1066,16 @@ class PresentMonFpsService(QObject):
                         candidate.executable_name,
                         candidate.process_id,
                     )
-                    rejected_until[candidate.identity_key] = (
-                        time.monotonic() + self._rejected_rescan_delay_seconds
+                    rejection_attempt, retry_delay = self._reject_candidate(
+                        candidate,
+                        rejection_attempts,
+                        rejected_until,
+                    )
+                    _LOGGER.info(
+                        "FPS unstable candidate backoff attempt %d is %.1f seconds: %r",
+                        rejection_attempt,
+                        retry_delay,
+                        candidate.identity_key,
                     )
                     self._publish_status(
                         generation,
@@ -853,8 +1084,10 @@ class PresentMonFpsService(QObject):
                     )
                     continue
 
-                rejected_until[candidate.identity_key] = (
-                    time.monotonic() + self._rejected_rescan_delay_seconds
+                rejection_attempt, retry_delay = self._reject_candidate(
+                    candidate,
+                    rejection_attempts,
+                    rejected_until,
                 )
                 diagnostics = self.last_capture_diagnostics
                 status = (
@@ -863,20 +1096,27 @@ class PresentMonFpsService(QObject):
                     else "NO FPS DATA RECEIVED"
                 )
                 _LOGGER.info(
-                    "FPS candidate cooling down before retry: "
+                    "FPS candidate parked with PresentMon stopped before retry attempt %d "
+                    "for %.1f seconds: "
                     "%s (pid=%d, identity=%r, reason=%s, diagnostics=%s)",
+                    rejection_attempt,
+                    retry_delay,
                     candidate.executable_name,
                     candidate.process_id,
                     candidate.identity_key,
                     status,
                     diagnostics.summary if diagnostics is not None else "<unavailable>",
                 )
-                self._publish_status(generation, candidate, status)
+                self._publish_status(
+                    generation,
+                    candidate,
+                    "GAME FOUND - WAITING FOR ACTIVITY",
+                )
             else:
                 self._publish_status(
                     generation,
                     self.target,
-                    "GAME FOUND - RETRYING FPS",
+                    "GAME FOUND - WAITING FOR ACTIVITY",
                 )
 
             if retry_stalled_candidate is not None:
@@ -896,6 +1136,60 @@ class PresentMonFpsService(QObject):
                 return
             if stop_event.wait(self._target_retry_delay_seconds):
                 return
+
+    def _sample_gpu_wakes(
+        self,
+        candidates: tuple[FpsTarget, ...],
+        high_samples: dict[tuple[int, int | str], int],
+    ) -> frozenset[tuple[int, int | str]]:
+        sampler = self._gpu_usage_sampler
+        if sampler is None or not candidates:
+            return frozenset()
+        try:
+            usage_by_pid = sampler.sample(
+                frozenset(candidate.process_id for candidate in candidates)
+            )
+        except (OSError, RuntimeError):
+            _LOGGER.exception(
+                "Process GPU activity is unavailable; parked FPS targets will use "
+                "their safety retry"
+            )
+            with suppress(OSError, RuntimeError):
+                sampler.close()
+            self._gpu_usage_sampler = None
+            for candidate in candidates:
+                high_samples.pop(candidate.identity_key, None)
+            return frozenset()
+
+        woke: set[tuple[int, int | str]] = set()
+        for candidate in candidates:
+            identity = candidate.identity_key
+            usage = usage_by_pid.get(candidate.process_id)
+            if usage is None or usage < self._gpu_activity_threshold_percent:
+                high_samples[identity] = 0
+                continue
+            count = high_samples.get(identity, 0) + 1
+            high_samples[identity] = count
+            if count >= _GPU_ACTIVITY_SAMPLE_COUNT:
+                woke.add(identity)
+                high_samples[identity] = 0
+        return frozenset(woke)
+
+    def _reject_candidate(
+        self,
+        candidate: FpsTarget,
+        rejection_attempts: dict[tuple[int, int | str], int],
+        rejected_until: dict[tuple[int, int | str], float],
+    ) -> tuple[int, float]:
+        identity = candidate.identity_key
+        attempt = rejection_attempts.get(identity, 0) + 1
+        rejection_attempts[identity] = attempt
+        multiplier = _REJECTED_RESCAN_DELAY_MULTIPLIERS[
+            min(attempt - 1, len(_REJECTED_RESCAN_DELAY_MULTIPLIERS) - 1)
+        ]
+        retry_delay = self._rejected_rescan_delay_seconds * multiplier
+        rejected_until[identity] = time.monotonic() + retry_delay
+        return attempt, retry_delay
 
     def _wait_for_discovery(self, stop_event: threading.Event) -> bool:
         while not stop_event.is_set():
@@ -920,7 +1214,11 @@ class PresentMonFpsService(QObject):
                 return
             self._target = None
             self._stream_identity = None
+            self._verified_target_identity = None
+            self._preferred_target = None
+            self._pending_foreground_hint = None
             self._stream_selector = FpsStreamSelector()
+            self._discovery_active.set()
         self.metric_ready.emit(
             FpsMetricUpdate(
                 _unavailable_fps_metric((), "GAME CLOSED - FINDING GAME"),
@@ -930,7 +1228,16 @@ class PresentMonFpsService(QObject):
 
     def _candidate_cycle(self, seed_target: FpsTarget | None) -> tuple[FpsTarget, ...]:
         discovered: Sequence[FpsTarget] = ()
-        if self._candidate_provider is not None:
+        with self._lock:
+            preferred_target = self._preferred_target
+        selector = self._candidate_selector
+        should_scan = self._candidate_provider is not None and (
+            selector is None
+            or selector.has_targeting_evidence
+            or seed_target is not None
+            or preferred_target is not None
+        )
+        if should_scan and self._candidate_provider is not None:
             try:
                 discovered = self._candidate_provider()
             except Exception:
@@ -940,31 +1247,68 @@ class PresentMonFpsService(QObject):
         for candidate in (
             *discovered,
             *((seed_target,) if seed_target is not None else ()),
+            *((preferred_target,) if preferred_target is not None else ()),
         ):
             if candidate.process_id in seen_pids:
                 continue
             seen_pids.add(candidate.process_id)
             ordered.append(candidate)
-            if self._candidate_selector is None and len(ordered) >= _MAX_DISCOVERED_TARGETS:
+            if selector is None and len(ordered) >= _MAX_DISCOVERED_TARGETS:
                 break
-        if self._candidate_selector is not None:
-            return self._candidate_selector.select(tuple(ordered))
+        if selector is not None:
+            selected = list(
+                selector.select(
+                    tuple(ordered),
+                    preferred_target=preferred_target,
+                )
+            )
+            selected_identities = {candidate.identity_key for candidate in selected}
+            discovered_identities = {candidate.identity_key for candidate in discovered}
+            for fallback in (seed_target, preferred_target):
+                if (
+                    fallback is None
+                    or fallback.identity_key in selected_identities
+                    or selector.match(fallback) is not None
+                    or not _eligible_local_fallback(fallback)
+                    or (
+                        fallback is not seed_target
+                        and fallback.identity_key not in discovered_identities
+                    )
+                ):
+                    continue
+                selected.append(fallback)
+                selected_identities.add(fallback.identity_key)
+                break
+            return tuple(selected[:_MAX_DISCOVERED_TARGETS])
         return tuple(ordered)
 
     def _activate_candidate(self, generation: int, target: FpsTarget) -> bool:
+        selector = self._candidate_selector
+        provider_match = selector.match(target) if selector is not None else None
         with self._lock:
             if generation != self._generation:
                 return False
             self._target = target
             self._last_capture_diagnostics = None
+            self._verified_target_identity = None
+            self._pending_foreground_hint = None
+            self._discovery_active.clear()
         self.metric_ready.emit(
             FpsMetricUpdate(_unavailable_fps_metric((), "ATTACHING TO GAME"), target)
         )
-        _LOGGER.info(
-            "FPS candidate selected: %s (pid=%d)",
-            target.executable_name,
-            target.process_id,
-        )
+        if provider_match is not None:
+            _LOGGER.info(
+                "FPS provider candidate attached provisionally: %s (pid=%d, match=%s)",
+                target.executable_name,
+                target.process_id,
+                provider_match.reason,
+            )
+        else:
+            _LOGGER.info(
+                "FPS candidate selected: %s (pid=%d)",
+                target.executable_name,
+                target.process_id,
+            )
         return True
 
     def _publish_status(
@@ -996,6 +1340,9 @@ class PresentMonFpsService(QObject):
             self._capture_thread = None
             self._process = None
             self._stream_identity = None
+            self._verified_target_identity = None
+            self._preferred_target = None
+            self._pending_foreground_hint = None
             self._stream_selector = FpsStreamSelector()
         self.metric_ready.emit(
             FpsMetricUpdate(
@@ -1039,6 +1386,8 @@ class PresentMonFpsService(QObject):
         resume_probe_started_at: float | None = None
         next_publish = started_at + self._publish_interval_seconds
         saw_usable_frame = False
+        accepted_frame_count = 0
+        retain_verified_capture = self._retains_verified_capture(target)
         outcome = _CaptureOutcome.NO_FRAMES
         stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         stderr_reader: threading.Thread | None = None
@@ -1075,9 +1424,15 @@ class PresentMonFpsService(QObject):
                 frame = parser.parse_line(line)
                 if frame is not None:
                     saw_usable_frame = True
+                    accepted_frame_count += 1
                     last_frame_at = time.monotonic()
                     resume_probe_started_at = None
                     selector.ingest(frame, observed_at=last_frame_at)
+                    if (
+                        not retain_verified_capture
+                        and accepted_frame_count >= _VERIFICATION_FRAME_COUNT
+                    ):
+                        retain_verified_capture = self._verify_candidate(target)
             now = time.monotonic()
             if self._target_liveness_probe is not None and now >= next_liveness_probe:
                 try:
@@ -1105,9 +1460,8 @@ class PresentMonFpsService(QObject):
             if not saw_usable_frame and _presentmon_permission_required(stderr_tail):
                 outcome = _CaptureOutcome.PERMISSION_REQUIRED
                 break
-            overlay_visible = self._overlay_is_visible()
             if not saw_usable_frame:
-                if overlay_visible:
+                if retain_verified_capture:
                     no_frame_probe_started_at = None
                 elif no_frame_probe_started_at is None:
                     no_frame_probe_started_at = now
@@ -1119,10 +1473,9 @@ class PresentMonFpsService(QObject):
                 and last_frame_at is not None
                 and now - last_frame_at >= self._frame_stall_timeout_seconds
             ):
-                if overlay_visible:
-                    # Foreground-owned overlays can legitimately pause a game's presentation.
-                    # Keep PresentMon attached and retain the verified metric instead of
-                    # consuming stall-restart attempts while Vigil is visible.
+                if retain_verified_capture:
+                    # Only a frame-verified game owns a persistent collector across
+                    # stale periods. Provisional targets stop and park after timeout.
                     resume_probe_started_at = None
                 elif resume_probe_started_at is None:
                     # Give a game one full stall interval to resume after Vigil hides.
@@ -1139,7 +1492,7 @@ class PresentMonFpsService(QObject):
                         metric.history,
                         (
                             "WAITING FOR GAME FRAMES"
-                            if overlay_visible
+                            if retain_verified_capture
                             else "PROBING GAME FRAMES"
                         ),
                     )
@@ -1187,6 +1540,45 @@ class PresentMonFpsService(QObject):
         with self._lock:
             return self._overlay_visible
 
+    def _verify_candidate(self, target: FpsTarget) -> bool:
+        selector = self._candidate_selector
+        if selector is None:
+            return False
+        verified_match = selector.record_verified(target)
+        if verified_match is None:
+            return False
+        with self._lock:
+            if self._target is None or self._target.identity_key != target.identity_key:
+                return False
+            self._verified_target_identity = target.identity_key
+            self._preferred_target = None
+            self._pending_foreground_hint = None
+            self._discovery_active.clear()
+        identity = verified_match.identity
+        if identity is None:
+            _LOGGER.info(
+                "FPS local target verified by frames; ownership retained until exit: %s (pid=%d)",
+                target.executable_name,
+                target.process_id,
+            )
+        else:
+            _LOGGER.info(
+                "FPS provider target verified by frames; ownership retained until exit: "
+                "%s (pid=%d, provider=%s, game=%s)",
+                target.executable_name,
+                target.process_id,
+                identity.provider_id,
+                identity.provider_game_id,
+            )
+        return True
+
+    def _retains_verified_capture_locked(self, target: FpsTarget) -> bool:
+        return self._verified_target_identity == target.identity_key
+
+    def _retains_verified_capture(self, target: FpsTarget) -> bool:
+        with self._lock:
+            return self._retains_verified_capture_locked(target)
+
 
 class UnavailableFpsService(QObject):
     """No-op FPS service for unsupported platforms."""
@@ -1206,7 +1598,8 @@ class UnavailableFpsService(QObject):
     def set_known_games(self, games: tuple[GameRecord, ...]) -> None:
         del games
 
-    def request_discovery(self) -> None:
+    def request_discovery(self, preferred_target: FpsTarget | None = None) -> None:
+        del preferred_target
         return
 
     def set_overlay_visible(self, visible: bool) -> None:
@@ -1222,17 +1615,32 @@ def create_platform_fps_service(
         return UnavailableFpsService()
     resolved_paths = paths or ApplicationPaths.discover()
     from vigil_overlay.services.windows_process import (
-        capture_ranked_fps_targets,
+        capture_foreground_fps_targets,
         is_fps_target_alive,
     )
+    from vigil_overlay.services.windows_telemetry import ProcessGpuUsageSampler
+
+    gpu_usage_sampler: ProcessGpuUsageSampler | None
+    try:
+        gpu_usage_sampler = ProcessGpuUsageSampler()
+    except OSError:
+        gpu_usage_sampler = None
+        _LOGGER.exception(
+            "Process GPU activity is unavailable; FPS fallback will use safety retries"
+        )
 
     return PresentMonFpsService(
         PresentMonRuntimeManager(resolved_paths),
-        candidate_provider=lambda: capture_ranked_fps_targets(
-            max_candidates=_RAW_GPU_CANDIDATE_LIMIT
+        candidate_provider=lambda: capture_foreground_fps_targets(
+            max_candidates=_RAW_PROVIDER_CANDIDATE_LIMIT
         ),
-        candidate_selector=FpsCandidateSelector(),
+        candidate_selector=FpsCandidateSelector(
+            learned_cache=LearnedFpsGameCache(
+                resolved_paths.user_data_root / "fps" / "learned_games.json"
+            )
+        ),
         target_liveness_probe=is_fps_target_alive,
+        gpu_usage_sampler=gpu_usage_sampler,
     )
 
 
@@ -1252,6 +1660,18 @@ def build_presentmon_command(executable: Path, target: FpsTarget) -> list[str]:
         "--stop_existing_session",
         "--terminate_on_proc_exit",
     ]
+
+
+def _eligible_local_fallback(target: FpsTarget) -> bool:
+    executable_path = target.executable_path
+    if executable_path is None:
+        return False
+    parsed = PureWindowsPath(executable_path.strip())
+    if not parsed.is_absolute() or parsed.suffix.casefold() != ".exe":
+        return False
+    from vigil_overlay.services.windows_process import is_excluded_process_name
+
+    return not is_excluded_process_name(target.executable_name)
 
 
 def _start_hidden_process(command: Sequence[str]) -> subprocess.Popen[str]:
