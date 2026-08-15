@@ -18,6 +18,7 @@ from typing import Any, Final, Protocol, cast
 from PySide6.QtCore import QObject, Signal
 
 from vigil_overlay.contracts.controller import ControllerBatterySnapshot
+from vigil_overlay.core.worker_lifecycle import join_worker
 from vigil_overlay.services.controller_shortcuts import (
     ControllerControlState,
     ControllerShortcutService,
@@ -144,9 +145,7 @@ class XInputControllerBackend:
 
     def read_state(self, controller_index: int) -> ControllerState | None:
         if not 0 <= controller_index < _MAX_CONTROLLERS:
-            raise ValueError(
-                f"controller_index must be between 0 and {_MAX_CONTROLLERS - 1}"
-            )
+            raise ValueError(f"controller_index must be between 0 and {_MAX_CONTROLLERS - 1}")
         state = _XInputState()
         result = int(self._get_state(controller_index, ctypes.byref(state)))
         if result == _ERROR_DEVICE_NOT_CONNECTED:
@@ -179,9 +178,7 @@ class XInputControllerBackend:
         """
 
         if not 0 <= controller_index < _MAX_CONTROLLERS:
-            raise ValueError(
-                f"controller_index must be between 0 and {_MAX_CONTROLLERS - 1}"
-            )
+            raise ValueError(f"controller_index must be between 0 and {_MAX_CONTROLLERS - 1}")
         if self._get_battery is None:
             return ControllerBatterySnapshot(connected=True)
 
@@ -280,9 +277,7 @@ class ControllerCommandInterpreter:
         if repeat_interval_seconds <= 0:
             raise ValueError("repeat_interval_seconds must be positive")
         if not 0 < stick_release < stick_engage <= 32_767:
-            raise ValueError(
-                "stick thresholds must satisfy 0 < release < engage <= 32767"
-            )
+            raise ValueError("stick thresholds must satisfy 0 < release < engage <= 32767")
         if stick_dominance_ratio < 1.0:
             raise ValueError("stick_dominance_ratio must be at least 1.0")
         self._repeat_initial_seconds = repeat_initial_seconds
@@ -310,13 +305,9 @@ class ControllerCommandInterpreter:
 
         with self._interpreter_lock:
             self._previous_buttons = state.buttons
-            self._held_direction = self._direction_for_state(
-                state, allow_hysteresis=False
-            )
+            self._held_direction = self._direction_for_state(state, allow_hysteresis=False)
             self._next_repeat_at = (
-                now + self._repeat_initial_seconds
-                if self._held_direction is not None
-                else None
+                now + self._repeat_initial_seconds if self._held_direction is not None else None
             )
             self._suppressed_repeat_direction = None
 
@@ -355,9 +346,7 @@ class ControllerCommandInterpreter:
             and abs(state.left_thumb_y) < self._stick_release
         )
 
-    def update(
-        self, state: ControllerState, *, now: float
-    ) -> tuple[NavigationCommand, ...]:
+    def update(self, state: ControllerState, *, now: float) -> tuple[NavigationCommand, ...]:
         with self._interpreter_lock:
             commands: list[NavigationCommand] = []
             pressed = state.buttons & ~self._previous_buttons
@@ -538,20 +527,14 @@ class ControllerInputService(QObject):
         self._interpreter.reset()
         self._commands_armed.clear()
 
-    def set_shortcut_service(
-        self, shortcut_service: ControllerShortcutService | None
-    ) -> None:
+    def set_shortcut_service(self, shortcut_service: ControllerShortcutService | None) -> None:
         """Attach the shared shortcut matcher before polling starts."""
 
         if self.running:
-            raise RuntimeError(
-                "controller shortcut service cannot change while running"
-            )
+            raise RuntimeError("controller shortcut service cannot change while running")
         self._shortcut_service = shortcut_service
 
-    def suppress_direction_repeat_until_release(
-        self, command: NavigationCommand
-    ) -> None:
+    def suppress_direction_repeat_until_release(self, command: NavigationCommand) -> None:
         """Prevent a delivered directional command from auto-repeating until release."""
 
         self._interpreter.suppress_repeat_until_release(command)
@@ -561,13 +544,14 @@ class ControllerInputService(QObject):
             return
         self._stop_event.set()
         thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=max(2.0, self._reconnect_scan_seconds * 2.0))
-        if thread is not None and thread.is_alive():
-            _LOGGER.warning(
-                "Controller input thread did not stop within the shutdown timeout"
-            )
-        self._thread = None
+        stopped = join_worker(
+            thread,
+            timeout_seconds=max(2.0, self._reconnect_scan_seconds * 2.0),
+            worker_name="Controller input worker",
+            logger=_LOGGER,
+        )
+        if stopped:
+            self._thread = None
         self._set_active_controller(None)
         shortcut_service = self._shortcut_service
         if shortcut_service is not None:
@@ -589,9 +573,7 @@ class ControllerInputService(QObject):
         try:
             while not self._stop_event.is_set():
                 now = time.monotonic()
-                shortcut_states, shortcut_consumed_indexes = (
-                    self._poll_shortcut_states()
-                )
+                shortcut_states, shortcut_consumed_indexes = self._poll_shortcut_states()
                 if active_index is None:
                     if now >= next_scan_at:
                         active_index, state = self._find_connected_controller()
@@ -622,10 +604,7 @@ class ControllerInputService(QObject):
 
                 shortcut_consumed = active_index in shortcut_consumed_indexes
 
-                if (
-                    previous_buttons & XINPUT_GAMEPAD_A
-                    and not state.buttons & XINPUT_GAMEPAD_A
-                ):
+                if previous_buttons & XINPUT_GAMEPAD_A and not state.buttons & XINPUT_GAMEPAD_A:
                     self.activation_released.emit()
                 previous_buttons = state.buttons
 
@@ -647,10 +626,7 @@ class ControllerInputService(QObject):
                 previous_direction = self._interpreter.held_direction_command
                 commands = self._interpreter.update(state, now=now)
                 current_direction = self._interpreter.held_direction_command
-                if (
-                    previous_direction is not None
-                    and current_direction != previous_direction
-                ):
+                if previous_direction is not None and current_direction != previous_direction:
                     self.direction_released.emit(previous_direction)
                 for command in commands:
                     self.command_ready.emit(command)
@@ -699,9 +675,7 @@ class ControllerInputService(QObject):
         try:
             return self._backend.read_state(controller_index)
         except Exception:
-            _LOGGER.exception(
-                "Controller backend read failed for index %d", controller_index
-            )
+            _LOGGER.exception("Controller backend read failed for index %d", controller_index)
             return None
 
     def _set_active_controller(self, controller_index: int | None) -> None:
@@ -745,9 +719,7 @@ def _xinput_controls(state: ControllerState) -> frozenset[str]:
         XINPUT_GAMEPAD_X: "xinput:x",
         XINPUT_GAMEPAD_Y: "xinput:y",
     }
-    controls.update(
-        control for mask, control in button_controls.items() if state.buttons & mask
-    )
+    controls.update(control for mask, control in button_controls.items() if state.buttons & mask)
     if state.left_trigger >= 128:
         controls.add("xinput:left_trigger")
     if state.right_trigger >= 128:

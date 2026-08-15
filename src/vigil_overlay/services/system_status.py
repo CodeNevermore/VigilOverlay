@@ -15,6 +15,7 @@ from typing import Any, Final, Protocol, cast
 
 from PySide6.QtCore import QObject, Signal
 
+from vigil_overlay.core.worker_lifecycle import join_worker
 from vigil_overlay.services.audio_control import (
     AudioControlBackend,
     AudioControlError,
@@ -101,9 +102,7 @@ class WindowsOverlayStatusBackend:
         self._audio_backend.close()
 
     def _configure_api(self) -> None:
-        self._kernel32.GetSystemPowerStatus.argtypes = (
-            ctypes.POINTER(_SystemPowerStatus),
-        )
+        self._kernel32.GetSystemPowerStatus.argtypes = (ctypes.POINTER(_SystemPowerStatus),)
         self._kernel32.GetSystemPowerStatus.restype = wintypes.BOOL
         self._wininet.InternetGetConnectedState.argtypes = (
             ctypes.POINTER(wintypes.DWORD),
@@ -146,9 +145,7 @@ class WindowsOverlayStatusBackend:
         )
         ac_line = int(status.ac_line_status)
         power_plugged = (
-            True
-            if ac_line == _AC_LINE_ONLINE
-            else False if ac_line == _AC_LINE_OFFLINE else None
+            True if ac_line == _AC_LINE_ONLINE else False if ac_line == _AC_LINE_OFFLINE else None
         )
         return battery_present, battery_percent, power_plugged
 
@@ -188,9 +185,7 @@ class OverlayStatusRuntime(QObject):
         backend_factory: OverlayStatusBackendFactory | None = None,
     ) -> None:
         super().__init__(parent)
-        self._backend_factory = (
-            backend_factory or create_platform_overlay_status_backend
-        )
+        self._backend_factory = backend_factory or create_platform_overlay_status_backend
         self._queue: queue.Queue[bool | None] = queue.Queue()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -237,13 +232,13 @@ class OverlayStatusRuntime(QObject):
         self._stop.set()
         self._queue.put(None)
         thread = self._thread
-        if (
-            thread is not None
-            and thread.is_alive()
-            and thread is not threading.current_thread()
-        ):
-            thread.join(timeout=2.0)
-        if thread is None or not thread.is_alive():
+        stopped = join_worker(
+            thread,
+            timeout_seconds=2.0,
+            worker_name="Overlay status worker",
+            logger=_LOGGER,
+        )
+        if stopped:
             self._thread = None
 
     def _run(self) -> None:

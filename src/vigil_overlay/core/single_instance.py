@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 from ctypes import wintypes
 from typing import Any, Protocol, cast
@@ -12,6 +13,7 @@ _WAIT_OBJECT_0 = 0
 _WAIT_ABANDONED = 0x80
 _MUTEX_NAME = r"Local\VigilOverlay.SingleInstance"
 _ACTIVATION_EVENT_NAME = r"Local\VigilOverlay.Activate"
+_LOGGER = logging.getLogger("vigil_overlay")
 
 
 class SingleInstanceBackend(Protocol):
@@ -122,9 +124,7 @@ class WindowsSingleInstanceBackend:
         if timeout_milliseconds <= 0:
             return False
         result = int(
-            self._kernel32.WaitForSingleObject(
-                wintypes.HANDLE(self._mutex), timeout_milliseconds
-            )
+            self._kernel32.WaitForSingleObject(wintypes.HANDLE(self._mutex), timeout_milliseconds)
         )
         self._owns_mutex = result in {_WAIT_OBJECT_0, _WAIT_ABANDONED}
         return self._owns_mutex
@@ -137,11 +137,7 @@ class WindowsSingleInstanceBackend:
     def consume_activation_request(self) -> bool:
         if self._activation_event is None:
             return False
-        result = int(
-            self._kernel32.WaitForSingleObject(
-                wintypes.HANDLE(self._activation_event), 0
-            )
-        )
+        result = int(self._kernel32.WaitForSingleObject(wintypes.HANDLE(self._activation_event), 0))
         return result == _WAIT_OBJECT_0
 
     def close(self) -> None:
@@ -162,7 +158,12 @@ def create_platform_single_instance_guard() -> SingleInstanceGuard:
         return SingleInstanceGuard(UnavailableSingleInstanceBackend())
     try:
         return SingleInstanceGuard(WindowsSingleInstanceBackend())
-    except Exception:
+    except (AttributeError, OSError):
+        _LOGGER.warning(
+            "Windows single-instance primitives are unavailable; using the fail-open "
+            "process-local fallback",
+            exc_info=True,
+        )
         return SingleInstanceGuard(UnavailableSingleInstanceBackend())
 
 

@@ -25,12 +25,15 @@ from vigil_overlay.core.config import (
 from vigil_overlay.core.controller_shortcuts import ControllerShortcutBinding
 from vigil_overlay.core.errors import VigilOverlayError
 from vigil_overlay.core.hotkeys import parse_hotkey_combination
+from vigil_overlay.core.input_coordination import InputOwnershipCoordinator
 from vigil_overlay.core.input_routing import (
     InputControlDiagnostics,
-    OverlayInputMode,
     OverlayInputPolicy,
-    foreground_pending_input_policy,
-    resolve_overlay_input_policy,
+)
+from vigil_overlay.core.lifecycle import (
+    ApplicationServiceLifecycle,
+    LifecycleAction,
+    LifecycleShutdownAction,
 )
 from vigil_overlay.core.paths import ApplicationPaths
 from vigil_overlay.core.single_instance import SingleInstanceGuard
@@ -118,7 +121,6 @@ from vigil_overlay.ui.theme import apply_host_theme
 _LOGGER = logging.getLogger("vigil_overlay")
 _FOREGROUND_LEASE_POLL_MILLISECONDS = 50
 _FOREGROUND_CLAIM_TIMEOUT_SECONDS = 1.0
-_FOREGROUND_LOSS_CONFIRM_SECONDS = 0.20
 _HOME_REFRESH_COOLDOWN_SECONDS = 5.0
 
 
@@ -237,30 +239,14 @@ class VigilApplication:
         self._input_containment_health_timer.timeout.connect(
             self._input_containment_service.maintain
         )
-        self._foreground_ownership_service = (
+        foreground_ownership = (
             foreground_ownership_service or create_platform_foreground_ownership_service()
         )
-        self._foreground_clock = foreground_clock
-        self._foreground_claim_timeout_seconds = foreground_claim_timeout_seconds
-        self._foreground_claim_deadline = 0.0
-        self._foreground_claim_pending = False
-        self._foreground_loss_confirming = False
-        self._foreground_verified = False
         self._fps_foreground_target_provider = (
             fps_foreground_target_provider or capture_foreground_fps_target
         )
         self._foreground_ownership_timer = QTimer()
         self._foreground_ownership_timer.setInterval(_FOREGROUND_LEASE_POLL_MILLISECONDS)
-        self._foreground_ownership_timer.timeout.connect(self._reconcile_foreground_ownership)
-        self._controller_connected_state = False
-        self._controller_commands_ready = True
-        self._input_policy = resolve_overlay_input_policy(
-            overlay_visible=False,
-            controller_connected=False,
-            allow_mouse_navigation_while_controller_connected=(
-                config.controller.allow_mouse_navigation_while_controller_connected
-            ),
-        )
         self._game_provider_registry = game_provider_registry or GameProviderRegistry()
         self._game_library_service = game_library_service or GameLibraryService(
             GameLibraryAggregator(self._game_provider_registry)
@@ -323,6 +309,24 @@ class VigilApplication:
         )
         self.window.setWindowIcon(self._application_icon)
         self.window.set_integration_statuses(self._integration_manager.initial_statuses())
+        self._input_coordinator = InputOwnershipCoordinator(
+            window=self.window,
+            foreground_ownership=foreground_ownership,
+            foreground_monitor=self._foreground_ownership_timer,
+            controller_commands=self._controller_service,
+            guide_ownership=self._guide_button_service,
+            controller_ownership=self._controller_input_ownership_service,
+            input_containment=self._input_containment_service,
+            allow_mouse_navigation=(
+                lambda: self._config.controller.allow_mouse_navigation_while_controller_connected
+            ),
+            background_guide_enabled=(lambda: self._config.controller.guide_button_enabled),
+            clock=foreground_clock,
+            claim_timeout_seconds=foreground_claim_timeout_seconds,
+        )
+        self._foreground_ownership_timer.timeout.connect(
+            self._input_coordinator.reconcile_foreground_ownership
+        )
 
         self._hotkey_service.activated.connect(self._toggle_overlay_from_hotkey)
         self._controller_shortcut_service.activated.connect(
@@ -335,6 +339,7 @@ class VigilApplication:
         background_available = self._sync_background_availability(hotkey_active=hotkey_active)
 
         self._setup_tray(tray_available, background_available)
+        self.window.application_exit_requested.connect(self.quit)
         self.window.hidden_to_background.connect(self._sync_tray_action)
         self.window.hidden_to_background.connect(self._mark_fps_overlay_hidden)
         self.window.hidden_to_background.connect(self._handle_overlay_hidden)
@@ -375,8 +380,93 @@ class VigilApplication:
         )
         self._update_check_service.update_available.connect(self.window.show_available_update)
         self.window.update_handoff_requested.connect(self.quit)
+        self._service_lifecycle = self._create_service_lifecycle()
         self.qt_app.aboutToQuit.connect(self._before_quit)
-        self.window.apply_input_policy(self._input_policy)
+        self._input_coordinator.sync_policy(overlay_visible=False)
+
+    def _create_service_lifecycle(self) -> ApplicationServiceLifecycle:
+        """Declare the single ordered lifecycle for application-owned services."""
+
+        return ApplicationServiceLifecycle(
+            startup_actions=(
+                LifecycleAction(
+                    "single-instance activation monitor",
+                    self._start_instance_activation_monitor,
+                ),
+                LifecycleAction(
+                    "input-containment health monitor",
+                    self._input_containment_health_timer.start,
+                ),
+                LifecycleAction("game library", self._start_game_library),
+                LifecycleAction(
+                    "integration status",
+                    self._request_initial_integration_status,
+                ),
+                LifecycleAction("telemetry", self._telemetry_service.start),
+                LifecycleAction("fps", self._start_fps_service),
+                LifecycleAction("controller", self._controller_service.start),
+                LifecycleAction("raw controller", self._raw_controller_service.start),
+                LifecycleAction("guide button", self._start_guide_button_service),
+            ),
+            shutdown_actions=(
+                LifecycleShutdownAction.without_reason(
+                    "single-instance activation monitor",
+                    self._instance_activation_timer.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "input-containment health monitor",
+                    self._input_containment_health_timer.stop,
+                ),
+                LifecycleShutdownAction(
+                    "visible input control",
+                    self._release_visible_input_control,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "game library",
+                    self._stop_game_library,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "integration status",
+                    self._integration_status_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "update check",
+                    self._update_check_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "guide button",
+                    self._guide_button_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "controller input ownership",
+                    self._controller_input_ownership_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "input containment",
+                    self._input_containment_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "raw controller",
+                    self._raw_controller_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "controller",
+                    self._controller_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "fps",
+                    self._fps_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "telemetry",
+                    self._telemetry_service.stop,
+                ),
+                LifecycleShutdownAction.without_reason(
+                    "global hotkey",
+                    self._teardown_hotkey,
+                ),
+            ),
+        )
 
     @property
     def hotkey_registration(self) -> HotkeyRegistration | None:
@@ -386,16 +476,7 @@ class VigilApplication:
     def input_control_diagnostics(self) -> InputControlDiagnostics:
         """Return the containment guarantees that are currently verifiable."""
 
-        return InputControlDiagnostics(
-            mode=self._input_policy.mode,
-            foreground_verification_required=(self._foreground_ownership_service.required),
-            foreground_verification_supported=self._foreground_ownership_service.supported,
-            foreground_verified=self._foreground_verified,
-            gameinput_exclusivity_active=self._controller_input_ownership_service.active,
-            mouse_keyboard_containment_supported=self._input_containment_service.supported,
-            mouse_keyboard_containment_active=self._input_containment_service.active,
-            xinput_isolation_available=False,
-        )
+        return self._input_coordinator.diagnostics
 
     def _save_config(self, config: AppConfig) -> None:
         if self._read_only_config:
@@ -758,13 +839,12 @@ class VigilApplication:
         controller_index: int,
     ) -> None:
         del controller_index
-        self._controller_connected_state = bool(connected)
-        self._sync_input_policy()
+        self._input_coordinator.set_controller_connected(connected)
 
     def _handle_controller_commands_rearmed(self) -> None:
         """Open controller-primary routing after the worker observes neutral input."""
 
-        self._controller_commands_ready = True
+        self._input_coordinator.mark_controller_commands_rearmed()
 
     def _handle_mouse_navigation_preference_changed(self, enabled: bool) -> None:
         del enabled
@@ -783,199 +863,22 @@ class VigilApplication:
         *,
         overlay_visible: bool | None = None,
     ) -> OverlayInputPolicy:
-        visible = self.window.isVisible() if overlay_visible is None else overlay_visible
-        if (
-            visible
-            and self._foreground_ownership_service.required
-            and not self._foreground_verified
-        ):
-            policy = foreground_pending_input_policy()
-        else:
-            policy = resolve_overlay_input_policy(
-                overlay_visible=visible,
-                controller_connected=self._controller_connected_state,
-                allow_mouse_navigation_while_controller_connected=(
-                    self._config.controller.allow_mouse_navigation_while_controller_connected
-                ),
-            )
-        previous = self._input_policy
-        if policy == previous:
-            self._apply_runtime_input_policy(policy)
-            return policy
-
-        entering_native_controller_route = (
-            policy.route_native_controller_commands
-            and not previous.route_native_controller_commands
-        )
-        if entering_native_controller_route:
-            # Disarm before publishing a native controller route. Any signal already
-            # queued before the visible route opened is rejected until the worker
-            # reports a fully neutral controller state.
-            self._controller_commands_ready = False
-            self._controller_service.require_neutral_before_commands()
-        elif not policy.route_native_controller_commands:
-            self._controller_commands_ready = True
-
-        self._input_policy = policy
-        self._apply_runtime_input_policy(policy)
-        _LOGGER.debug("Overlay input mode changed: %s -> %s", previous.mode, policy.mode)
-        return policy
-
-    def _apply_runtime_input_policy(self, policy: OverlayInputPolicy) -> None:
-        """Synchronize window routing and native ownership without crossing modes."""
-
-        # Release global hooks before publishing a route that needs mouse input.
-        # Entering controller-primary does the inverse: first make Qt ignore mouse,
-        # then acquire ordinary controller ownership and native containment.
-        if policy.mode is not OverlayInputMode.CONTROLLER_PRIMARY:
-            self._input_containment_service.apply_policy(policy)
-
-        self.window.apply_input_policy(policy)
-        if policy.hold_gameinput_ownership:
-            self._guide_button_service.set_controller_ownership_active(True)
-            self._controller_input_ownership_service.activate(
-                background_guide_enabled=self._config.controller.guide_button_enabled
-            )
-        else:
-            self._controller_input_ownership_service.deactivate()
-            self._guide_button_service.set_controller_ownership_active(False)
-
-        if policy.mode is OverlayInputMode.CONTROLLER_PRIMARY:
-            self._input_containment_service.apply_policy(policy)
+        return self._input_coordinator.sync_policy(overlay_visible=overlay_visible)
 
     def _begin_foreground_input_lease(self) -> None:
         """Suspend input until Windows confirms that Vigil owns foreground."""
 
-        service = self._foreground_ownership_service
-        service.release()
-        self._foreground_verified = False
-        self._foreground_loss_confirming = False
-        if not service.required:
-            self._foreground_claim_pending = False
-            self._sync_input_policy(overlay_visible=True)
-            _LOGGER.debug(
-                "Foreground verification unavailable; using portable input routing: %s",
-                service.detail,
-            )
-            return
-
-        self._foreground_claim_pending = True
-        self._foreground_claim_deadline = (
-            self._foreground_clock() + self._foreground_claim_timeout_seconds
-        )
-        self._controller_commands_ready = False
-        self._sync_input_policy(overlay_visible=True)
-        service.request(int(self.window.winId()))
-        self._foreground_ownership_timer.start()
-        self._reconcile_foreground_ownership()
+        self._input_coordinator.begin_foreground_lease()
 
     def _reconcile_foreground_ownership(self) -> None:
         """Acquire or monitor foreground without automatically hiding the overlay."""
 
-        service = self._foreground_ownership_service
-        if not service.required:
-            return
-        if not (self._foreground_claim_pending or self._foreground_verified):
-            return
-        if not self.window.isVisible():
-            self._release_visible_input_control("overlay no longer visible")
-            return
-        if service.verify():
-            if self._foreground_verified:
-                return
-            restored_after_transition = self._foreground_loss_confirming
-            self._foreground_verified = True
-            self._foreground_claim_pending = False
-            self._foreground_loss_confirming = False
-            self._sync_input_policy(overlay_visible=True)
-            reason = (
-                "foreground lease restored after transient transition"
-                if restored_after_transition
-                else "foreground lease acquired"
-            )
-            self._log_input_control_status(reason)
-            return
-
-        if self._foreground_verified:
-            _LOGGER.warning(
-                "Vigil no longer owns foreground; suspending input control while the "
-                "foreground transition is confirmed: %s",
-                service.detail,
-            )
-            self._suspend_input_for_foreground_recheck()
-            return
-
-        if (
-            self._foreground_claim_pending
-            and self._foreground_clock() >= self._foreground_claim_deadline
-        ):
-            confirmed_loss = self._foreground_loss_confirming
-            _LOGGER.warning(
-                "%s; input remains suspended and the visible overlay will retry activation: %s",
-                (
-                    "Vigil foreground loss was confirmed"
-                    if confirmed_loss
-                    else "Vigil could not verify foreground ownership"
-                ),
-                service.detail,
-            )
-            self._foreground_claim_deadline = (
-                self._foreground_clock() + self._foreground_claim_timeout_seconds
-            )
-            service.request(int(self.window.winId()))
-
-    def _suspend_input_for_foreground_recheck(self) -> None:
-        """Release containment immediately while tolerating a transient HWND handoff."""
-
-        self._foreground_ownership_service.release()
-        self._foreground_verified = False
-        self._foreground_claim_pending = True
-        self._foreground_loss_confirming = True
-        self._foreground_claim_deadline = (
-            self._foreground_clock() + _FOREGROUND_LOSS_CONFIRM_SECONDS
-        )
-        self._sync_input_policy(overlay_visible=True)
-        self._log_input_control_status("foreground transition suspended")
+        self._input_coordinator.reconcile_foreground_ownership()
 
     def _release_visible_input_control(self, reason: str) -> None:
         """Drop all process/global containment state before hiding or shutdown."""
 
-        had_lease_state = self._foreground_claim_pending or self._foreground_verified
-        self._foreground_ownership_timer.stop()
-        self._foreground_ownership_service.release()
-        self._foreground_claim_pending = False
-        self._foreground_loss_confirming = False
-        self._foreground_verified = False
-        self._sync_input_policy(overlay_visible=False)
-        if had_lease_state:
-            self._log_input_control_status(reason)
-
-    def _log_input_control_status(self, reason: str) -> None:
-        status = self.input_control_diagnostics
-        _LOGGER.info(
-            "Input control status (%s): mode=%s foreground_required=%s "
-            "foreground_supported=%s foreground_verified=%s gameinput_exclusive=%s "
-            "low_level_supported=%s low_level_containment=%s "
-            "raw_input_isolation=%s xinput_isolation=%s",
-            reason,
-            status.mode.value,
-            status.foreground_verification_required,
-            status.foreground_verification_supported,
-            status.foreground_verified,
-            status.gameinput_exclusivity_active,
-            status.mouse_keyboard_containment_supported,
-            status.mouse_keyboard_containment_active,
-            status.raw_input_isolation_available,
-            status.xinput_isolation_available,
-        )
-        if (
-            status.mode is OverlayInputMode.CONTROLLER_PRIMARY
-            and not status.gameinput_exclusivity_active
-        ):
-            _LOGGER.warning(
-                "Controller-primary is using the XInput compatibility route; GameInput "
-                "exclusivity is unavailable and background controller consumers may react"
-            )
+        self._input_coordinator.release_visible_control(reason)
 
     def _handle_controller_command(
         self,
@@ -990,10 +893,7 @@ class VigilApplication:
             return
         if not self.window.isVisible():
             return
-        if (
-            not self._input_policy.route_native_controller_commands
-            or not self._controller_commands_ready
-        ):
+        if not self._input_coordinator.controller_commands_allowed:
             return
         result = self.window.handle_controller_navigation_command(command)
         if result.outcome is NavigationOutcome.WIDGET_CHANGED and command in {
@@ -1028,7 +928,7 @@ class VigilApplication:
         guide_required = enabled or "gameinput:guide" in self._config.controller.shortcut_controls
         if guide_required:
             self._guide_button_service.set_controller_ownership_active(
-                self._input_policy.hold_gameinput_ownership
+                self._input_coordinator.policy.hold_gameinput_ownership
             )
             self._guide_button_service.start()
         else:
@@ -1269,47 +1169,48 @@ class VigilApplication:
         self._tray_reset_action = None
         self._tray_quit_action = None
 
-    def quit(self) -> None:
-        self._quitting = True
-        self._instance_activation_timer.stop()
-        self._input_containment_health_timer.stop()
-        self._release_visible_input_control("application quit")
-        self._game_library_service.stop()
-        self._game_library_started = False
-        self._integration_status_service.stop()
-        self._update_check_service.stop()
-        self._guide_button_service.stop()
-        self._controller_input_ownership_service.stop()
-        self._input_containment_service.stop()
-        self._raw_controller_service.stop()
-        self._controller_service.stop()
-        self._fps_service.stop()
-        self._telemetry_service.stop()
-        self._teardown_hotkey()
-        self.window.allow_close()
-        self.window.close()
-        self._teardown_tray()
-        self.qt_app.quit()
-
-    def run(self) -> int:
-        """Start application services and enter the Qt event loop."""
-
+    def _start_instance_activation_monitor(self) -> None:
         if self._single_instance_guard is not None:
             self._instance_activation_timer.start()
-        self._input_containment_health_timer.start()
+
+    def _start_game_library(self) -> None:
         self._game_library_started = True
         self._request_home_library_refresh(force=True)
+
+    def _stop_game_library(self) -> None:
+        self._game_library_service.stop()
+        self._game_library_started = False
+
+    def _request_initial_integration_status(self) -> None:
         self._integration_status_service.request(self._current_game_library)
-        self._telemetry_service.start()
+
+    def _start_fps_service(self) -> None:
         self._fps_service.start()
         self._fps_service.set_overlay_visible(False)
-        self._controller_service.start()
-        self._raw_controller_service.start()
+
+    def _start_guide_button_service(self) -> None:
         if (
             self._config.controller.guide_button_enabled
             or "gameinput:guide" in self._config.controller.shortcut_controls
         ):
             self._guide_button_service.start()
+
+    def _shutdown(self, reason: str, *, close_window: bool) -> None:
+        self._service_lifecycle.stop(reason)
+        if close_window:
+            self.window.allow_close()
+            self.window.close()
+        self._teardown_tray()
+
+    def quit(self) -> None:
+        self._quitting = True
+        self._shutdown("application quit", close_window=True)
+        self.qt_app.quit()
+
+    def run(self) -> int:
+        """Start application services and enter the Qt event loop."""
+
+        self._service_lifecycle.start()
         self._show_overlay()
         if self._startup_hotkey_failure is not None:
             QTimer.singleShot(0, self._show_startup_hotkey_failure)
@@ -1335,25 +1236,7 @@ class VigilApplication:
             self.window.show_startup_safety_warning(detail)
 
     def _before_quit(self) -> None:
-        self._instance_activation_timer.stop()
-        self._input_containment_health_timer.stop()
-        self._release_visible_input_control("Qt application shutdown")
-        self._game_library_service.stop()
-        self._game_library_started = False
-        self._integration_status_service.stop()
-        self._update_check_service.stop()
-        self._guide_button_service.stop()
-        self._controller_input_ownership_service.stop()
-        self._input_containment_service.stop()
-        self._raw_controller_service.stop()
-        self._controller_service.stop()
-        self._fps_service.stop()
-        self._telemetry_service.stop()
-        self._teardown_hotkey()
-        if not self._quitting:
-            self.window.allow_close()
-            self.window.close()
-        self._teardown_tray()
+        self._shutdown("Qt application shutdown", close_window=not self._quitting)
         if not self._read_only_config:
             try:
                 self._save_config(self._config)

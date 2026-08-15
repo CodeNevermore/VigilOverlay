@@ -11,6 +11,7 @@ from typing import Final
 
 from PySide6.QtCore import QObject, Signal
 
+from vigil_overlay.core.worker_lifecycle import join_worker
 from vigil_overlay.services.fps import FpsMetricUpdate
 from vigil_overlay.services.telemetry import (
     PerformanceMetric,
@@ -63,9 +64,7 @@ class TelemetryHistoryAccumulator:
                 _percent_metric(
                     PerformanceMetric.VRAM,
                     sample.vram_percent,
-                    _format_memory_pair(
-                        sample.vram_used_bytes, sample.vram_total_bytes
-                    ),
+                    _format_memory_pair(sample.vram_used_bytes, sample.vram_total_bytes),
                     tuple(self._history[PerformanceMetric.VRAM]),
                 ),
                 _percent_metric(
@@ -144,9 +143,14 @@ class TelemetryPollingService(QObject):
             return
         self._stop_event.set()
         thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=max(2.0, self._interval_seconds * 2.0))
-        self._thread = None
+        stopped = join_worker(
+            thread,
+            timeout_seconds=max(2.0, self._interval_seconds * 2.0),
+            worker_name="Telemetry worker",
+            logger=_LOGGER,
+        )
+        if stopped:
+            self._thread = None
         try:
             self._sampler.close()
         except Exception:
@@ -164,9 +168,7 @@ class TelemetryPollingService(QObject):
                 with self._state_lock:
                     snapshot = snapshot.with_metric(self._latest_fps_metric)
             except Exception:
-                _LOGGER.exception(
-                    "Telemetry sample failed; retaining last good snapshot"
-                )
+                _LOGGER.exception("Telemetry sample failed; retaining last good snapshot")
             else:
                 with self._state_lock:
                     self._latest = snapshot

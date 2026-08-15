@@ -8,6 +8,7 @@ from threading import Event, Lock, Thread
 
 from PySide6.QtCore import QObject, Signal
 
+from vigil_overlay.core.worker_lifecycle import join_worker
 from vigil_overlay.services.game_library import GameLibraryAggregator
 
 _LOGGER = logging.getLogger("vigil_overlay")
@@ -48,10 +49,27 @@ class GameLibraryService(QObject):
             raise ValueError("provider_id must be non-empty")
         self.start(provider_id)
 
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            thread = self._thread
+            return thread is not None and thread.is_alive()
+
     def stop(self) -> None:
         self._stop_event.set()
         with self._lock:
             self._pending.clear()
+            thread = self._thread
+        stopped = join_worker(
+            thread,
+            timeout_seconds=2.0,
+            worker_name="Game library discovery worker",
+            logger=_LOGGER,
+        )
+        if stopped:
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
 
     def _run(self, provider_id: str | None) -> None:
         current = provider_id
@@ -62,6 +80,8 @@ class GameLibraryService(QObject):
                     cancellation_event=self._stop_event,
                 )
             except Exception:
+                # Intentional provider boundary: one unexpected discovery failure
+                # remains observable without terminating the reusable worker bridge.
                 _LOGGER.exception("Game library discovery failed unexpectedly")
             else:
                 if not self._stop_event.is_set():

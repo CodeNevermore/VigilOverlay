@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from PySide6.QtCore import QObject
 
+from vigil_overlay.core.worker_lifecycle import join_worker
 from vigil_overlay.services.controller_shortcuts import (
     ControllerControlState,
     ControllerShortcutService,
@@ -71,9 +72,7 @@ class WindowsGamingInputBackend:
                 switch_count = int(controller.switch_count)
                 axis_count = int(controller.axis_count)
                 buttons: Array[bool] = self._array_type("?", button_count)
-                switches: Array[GameControllerSwitchPosition] = self._array_type(
-                    "i", switch_count
-                )
+                switches: Array[GameControllerSwitchPosition] = self._array_type("i", switch_count)
                 axes: Array[Double] = self._array_type("d", axis_count)
                 controller.get_current_reading(buttons, switches, axes)
                 identity = str(controller.non_roamable_id)
@@ -140,9 +139,14 @@ class RawControllerInputService(QObject):
             return
         self._stop_event.set()
         thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
-        self._thread = None
+        stopped = join_worker(
+            thread,
+            timeout_seconds=2.0,
+            worker_name="Generic controller input worker",
+            logger=_LOGGER,
+        )
+        if stopped:
+            self._thread = None
         for device_id in tuple(self._known_devices):
             self._shortcut_service.observe_disconnect(device_id)
         self._known_devices.clear()

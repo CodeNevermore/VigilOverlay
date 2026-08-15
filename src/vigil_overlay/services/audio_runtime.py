@@ -11,6 +11,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
+from vigil_overlay.core.worker_lifecycle import join_worker
 from vigil_overlay.services.audio_control import (
     AudioControlBackend,
     AudioControlError,
@@ -152,9 +153,13 @@ class AudioControlRuntime(QObject):
         self._stop.set()
         self._queue.put(None)
         thread = self._thread
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
-        if thread is None or not thread.is_alive():
+        stopped = join_worker(
+            thread,
+            timeout_seconds=2.0,
+            worker_name="Audio control worker",
+            logger=_LOGGER,
+        )
+        if stopped:
             self._thread = None
 
     def _run(self) -> None:

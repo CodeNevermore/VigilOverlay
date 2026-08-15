@@ -15,6 +15,7 @@ from ctypes import wintypes
 from typing import Any, Final, cast
 
 from vigil_overlay.core.input_routing import OverlayInputMode
+from vigil_overlay.core.worker_lifecycle import join_worker
 from vigil_overlay.services.input_containment import (
     HookDiagnosticRecord,
     InputContainmentPlan,
@@ -124,9 +125,7 @@ class WindowsLowLevelHookContainmentBackend:
     def healthy(self) -> bool:
         thread = self._thread
         with self._hook_lock:
-            hooks_active = (
-                self._mouse_hook is not None and self._keyboard_hook is not None
-            )
+            hooks_active = self._mouse_hook is not None and self._keyboard_hook is not None
         return bool(
             thread is not None
             and thread.is_alive()
@@ -185,15 +184,18 @@ class WindowsLowLevelHookContainmentBackend:
                     error,
                 )
         thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(_HOOK_STOP_TIMEOUT_SECONDS)
-            if thread.is_alive():
-                _LOGGER.error(
-                    "Input-containment hook thread did not stop promptly; hooks were already "
-                    "explicitly released fail-open"
-                )
-        self._thread = None
-        self._thread_id = 0
+        stopped = join_worker(
+            thread,
+            timeout_seconds=_HOOK_STOP_TIMEOUT_SECONDS,
+            worker_name=(
+                "Input-containment hook worker; hooks were already explicitly released fail-open"
+            ),
+            logger=_LOGGER,
+            timeout_level=logging.ERROR,
+        )
+        if stopped:
+            self._thread = None
+            self._thread_id = 0
         self._startup_succeeded = False
         self._detail = "Windows low-level input containment stopped"
 
@@ -255,13 +257,10 @@ class WindowsLowLevelHookContainmentBackend:
         try:
             self._mouse_callback = _HOOKPROC(self._mouse_hook_callback)
             self._keyboard_callback = _HOOKPROC(self._keyboard_hook_callback)
-            mouse_hook = self._user32.SetWindowsHookExW(
-                _WH_MOUSE_LL, self._mouse_callback, None, 0
-            )
+            mouse_hook = self._user32.SetWindowsHookExW(_WH_MOUSE_LL, self._mouse_callback, None, 0)
             if not mouse_hook:
                 self._detail = (
-                    "WH_MOUSE_LL installation failed with Windows error "
-                    f"{_windows_last_error()}"
+                    f"WH_MOUSE_LL installation failed with Windows error {_windows_last_error()}"
                 )
                 _LOGGER.error(self._detail)
                 return
@@ -273,8 +272,7 @@ class WindowsLowLevelHookContainmentBackend:
             )
             if not keyboard_hook:
                 self._detail = (
-                    "WH_KEYBOARD_LL installation failed with Windows error "
-                    f"{_windows_last_error()}"
+                    f"WH_KEYBOARD_LL installation failed with Windows error {_windows_last_error()}"
                 )
                 _LOGGER.error(self._detail)
                 self._release_hooks()
@@ -295,25 +293,19 @@ class WindowsLowLevelHookContainmentBackend:
 
         try:
             while not self._stop_requested.is_set():
-                result = int(
-                    self._user32.GetMessageW(ctypes.byref(message), None, 0, 0)
-                )
+                result = int(self._user32.GetMessageW(ctypes.byref(message), None, 0, 0))
                 if result <= 0:
                     break
         except Exception:
             _LOGGER.exception("Input-containment native message loop failed")
         finally:
             if self._callback_faulted.is_set():
-                self._detail = (
-                    "Low-level input hook callback failed; containment released"
-                )
+                self._detail = "Low-level input hook callback failed; containment released"
                 _LOGGER.error(
                     "A low-level input hook callback failed; containment was released fail-open"
                 )
             elif not self._stop_requested.is_set():
-                self._detail = (
-                    "Input-containment native message loop stopped unexpectedly"
-                )
+                self._detail = "Input-containment native message loop stopped unexpectedly"
             self._release_hooks()
             self._startup_succeeded = False
             self._thread_id = 0
@@ -327,13 +319,9 @@ class WindowsLowLevelHookContainmentBackend:
             if handle is None:
                 continue
             try:
-                released = bool(
-                    self._user32.UnhookWindowsHookEx(ctypes.c_void_p(handle))
-                )
+                released = bool(self._user32.UnhookWindowsHookEx(ctypes.c_void_p(handle)))
             except Exception:
-                _LOGGER.exception(
-                    "Unexpected error while releasing a Windows low-level input hook"
-                )
+                _LOGGER.exception("Unexpected error while releasing a Windows low-level input hook")
                 continue
             if not released:
                 _LOGGER.warning(
@@ -344,9 +332,7 @@ class WindowsLowLevelHookContainmentBackend:
     def _mouse_hook_callback(self, n_code: int, w_param: int, l_param: int) -> int:
         try:
             if n_code >= 0:
-                data = ctypes.cast(
-                    l_param, ctypes.POINTER(_MouseLowLevelHookStruct)
-                ).contents
+                data = ctypes.cast(l_param, ctypes.POINTER(_MouseLowLevelHookStruct)).contents
                 classification = classify_mouse_hook_flags(int(data.flags))
                 swallowed = should_swallow_mouse(self._plan, classification)
                 self._queue_diagnostic("mouse", classification, swallowed)
@@ -359,9 +345,7 @@ class WindowsLowLevelHookContainmentBackend:
     def _keyboard_hook_callback(self, n_code: int, w_param: int, l_param: int) -> int:
         try:
             if n_code >= 0:
-                data = ctypes.cast(
-                    l_param, ctypes.POINTER(_KeyboardLowLevelHookStruct)
-                ).contents
+                data = ctypes.cast(l_param, ctypes.POINTER(_KeyboardLowLevelHookStruct)).contents
                 classification = classify_keyboard_hook_flags(int(data.flags))
                 swallowed = should_swallow_keyboard(self._plan, classification)
                 self._queue_diagnostic("keyboard", classification, swallowed)

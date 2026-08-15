@@ -52,7 +52,7 @@ verified game to pause, Performance keeps the last current value, labels it **LA
 FPS**, and freezes the existing average. A game that keeps presenting continues to
 show live values. The FPS session resets when the verified target exits.
 
-Vigil 0.1.4.1 no longer installs or uses HidHide for active controller handling. An
+Vigil no longer installs or uses HidHide for active controller handling. An
 upgrade never uninstalls a user-owned package or rewrites its application and device lists.
 If an older Vigil-authored recovery journal proves that hiding may still be active,
 Vigil performs a one-time pass-through check before removing only its own legacy state.
@@ -135,8 +135,10 @@ Vigil after the browser handoff succeeds. Choosing Later, or a failed browser la
 keeps Vigil running.
 
 Configuration, logs, integration data, and caches are stored under the current user's
-Vigil Overlay application-data directories. Run `VigilOverlay --diagnose` to print the
-resolved non-sensitive paths.
+Vigil Overlay application-data directories. Logs are limited to an 8 MiB rotating
+history across the active file and three backups, and managed log files older than 14
+days are removed at startup. Run `VigilOverlay --diagnose` to print the resolved
+non-sensitive paths.
 
 ## Playnite integration
 

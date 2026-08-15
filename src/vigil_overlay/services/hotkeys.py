@@ -14,6 +14,7 @@ from typing import Any, Protocol, cast
 from PySide6.QtCore import QMetaObject, QObject, Qt, Signal, Slot
 
 from vigil_overlay.core.hotkeys import HotkeyCombination
+from vigil_overlay.core.worker_lifecycle import join_worker
 
 _LOGGER = logging.getLogger("vigil_overlay")
 _HOTKEY_ID = 0x5647
@@ -158,20 +159,20 @@ class Win32HotkeyBackend:
                 post_thread_message.restype = wintypes.BOOL
                 post_thread_message(thread_id, _WM_QUIT, 0, 0)
             except (AttributeError, OSError):
-                _LOGGER.exception(
-                    "Could not post shutdown message to global hotkey thread"
-                )
-        thread.join(timeout=2.0)
-        if thread.is_alive():
-            _LOGGER.warning(
-                "Global hotkey thread did not stop within the shutdown timeout"
-            )
+                _LOGGER.exception("Could not post shutdown message to global hotkey thread")
+        stopped = join_worker(
+            thread,
+            timeout_seconds=2.0,
+            worker_name="Global hotkey worker",
+            logger=_LOGGER,
+        )
 
         with self._lock:
-            self._thread = None
-            self._thread_id = None
-            self._registration = None
-            self._started.clear()
+            if stopped:
+                self._thread = None
+                self._thread_id = None
+                self._registration = None
+                self._started.clear()
 
     def _message_loop(
         self,
@@ -245,18 +246,15 @@ class Win32HotkeyBackend:
                 error_code = int(get_last_error()) if callable(get_last_error) else 0
                 if error_code == _ERROR_HOTKEY_ALREADY_REGISTERED:
                     detail = (
-                        "The hotkey is reserved by Windows or already owned by "
-                        "another application"
+                        "The hotkey is reserved by Windows or already owned by another application"
                     )
                 elif error_code:
                     detail = (
-                        "The Windows hotkey backend rejected the combination "
-                        f"(error {error_code})"
+                        f"The Windows hotkey backend rejected the combination (error {error_code})"
                     )
                 else:
                     detail = (
-                        "The Windows hotkey backend rejected the combination "
-                        "without an error code"
+                        "The Windows hotkey backend rejected the combination without an error code"
                     )
                 self._registration = HotkeyRegistration(
                     active=False,
@@ -327,9 +325,7 @@ class GlobalHotkeyService(QObject):
         registration = self._backend.start(combination, self._queue_activation)
         self._started = True
         self._registration = registration
-        self._accept_activations = (
-            registration.active and not self._activations_suspended
-        )
+        self._accept_activations = registration.active and not self._activations_suspended
         self.registration_changed.emit(registration.active, registration.detail)
         return registration
 
@@ -353,9 +349,7 @@ class GlobalHotkeyService(QObject):
 
         self._activations_suspended = False
         self._accept_activations = bool(
-            self._started
-            and self._registration is not None
-            and self._registration.active
+            self._started and self._registration is not None and self._registration.active
         )
 
     def _queue_activation(self) -> None:

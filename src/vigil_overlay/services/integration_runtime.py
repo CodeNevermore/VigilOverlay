@@ -7,6 +7,7 @@ import threading
 
 from PySide6.QtCore import QObject, Signal
 
+from vigil_overlay.core.worker_lifecycle import join_worker
 from vigil_overlay.services.game_library import AggregatedGameLibrary
 from vigil_overlay.services.integrations import IntegrationManager
 
@@ -44,19 +45,44 @@ class IntegrationStatusService(QObject):
             self._thread.start()
         return generation
 
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            thread = self._thread
+            return thread is not None and thread.is_alive()
+
+    def wait_until_idle(self, timeout_seconds: float = 2.0) -> bool:
+        """Wait boundedly for the currently requested status pass to finish."""
+
+        with self._lock:
+            thread = self._thread
+        stopped = join_worker(
+            thread,
+            timeout_seconds=timeout_seconds,
+            worker_name="Integration status worker",
+            logger=_LOGGER,
+        )
+        if stopped:
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+        return stopped
+
     def stop(self) -> None:
         self._stop.set()
         with self._lock:
             self._pending = None
             thread = self._thread
-        if (
-            thread is not None
-            and thread.is_alive()
-            and thread is not threading.current_thread()
-        ):
-            thread.join(timeout=2.0)
-        if thread is None or not thread.is_alive():
-            self._thread = None
+        stopped = join_worker(
+            thread,
+            timeout_seconds=2.0,
+            worker_name="Integration status worker",
+            logger=_LOGGER,
+        )
+        if stopped:
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -71,6 +97,8 @@ class IntegrationStatusService(QObject):
             try:
                 statuses = self._manager.statuses(library)
             except Exception:
+                # Intentional integration boundary: detectors and optional bridges
+                # must not take down the Qt host when one status pass fails.
                 _LOGGER.exception("Integration status discovery failed unexpectedly")
             else:
                 with self._lock:
