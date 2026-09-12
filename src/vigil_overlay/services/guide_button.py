@@ -569,6 +569,29 @@ class GuideButtonInputService(QObject):
         except Exception:
             _LOGGER.exception("GameInput Guide focus policy could not be updated")
 
+    def rearm(self) -> None:
+        """Recreate Guide capture after the observed controller topology changes.
+
+        GameInput can retain a live-looking system-button registration after a
+        controller sleeps, reconnects, or is re-enumerated. Recreate that native
+        registration when XInput observes any topology change. A successful refresh
+        publishes only the final active state so Guide-only background recovery is not
+        briefly withdrawn during the handoff.
+        """
+
+        if self._closed:
+            return
+        if self._active:
+            try:
+                self._backend.stop()
+            except Exception:
+                self._active = False
+                _LOGGER.exception("Guide-button backend could not stop for reconnect re-arm")
+                self.availability_changed.emit(False, self._backend.detail)
+                return
+            self._active = False
+        self.start()
+
     def deactivate(self) -> None:
         """Stop Guide capture without permanently closing the service."""
 

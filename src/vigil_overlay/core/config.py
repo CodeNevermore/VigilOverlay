@@ -43,6 +43,7 @@ class StartupSettings:
     """Per-user Windows startup preference."""
 
     start_with_windows: bool = True
+    start_minimized: bool = True
 
 
 @dataclass(slots=True)
@@ -157,11 +158,18 @@ class AppConfig:
         )
 
         startup_raw = _require_mapping(migrated["startup"], "startup")
-        _require_exact_keys(startup_raw, {"start_with_windows"}, "startup")
+        _require_exact_keys(
+            startup_raw,
+            {"start_with_windows", "start_minimized"},
+            "startup",
+        )
         startup = StartupSettings(
             start_with_windows=_require_bool(
                 startup_raw["start_with_windows"], "startup.start_with_windows"
-            )
+            ),
+            start_minimized=_require_bool(
+                startup_raw["start_minimized"], "startup.start_minimized"
+            ),
         )
 
         background_raw = _require_mapping(migrated["background"], "background")
@@ -485,6 +493,14 @@ def _migrate_v16_to_v17(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _migrate_v17_to_v18(raw: dict[str, Any]) -> dict[str, Any]:
+    startup = raw.get("startup")
+    if isinstance(startup, dict):
+        startup.setdefault("start_minimized", True)
+    raw["schema_version"] = 18
+    return raw
+
+
 _MIGRATIONS: dict[int, Migration] = {
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
@@ -502,6 +518,7 @@ _MIGRATIONS: dict[int, Migration] = {
     14: _migrate_v14_to_v15,
     15: _migrate_v15_to_v16,
     16: _migrate_v16_to_v17,
+    17: _migrate_v17_to_v18,
 }
 
 

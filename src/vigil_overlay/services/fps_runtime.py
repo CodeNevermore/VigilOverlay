@@ -60,6 +60,8 @@ _REJECTED_RESCAN_DELAY_MULTIPLIERS: Final[tuple[float, ...]] = (1.0, 6.0, 24.0)
 _DEFAULT_GPU_PROBE_INTERVAL_SECONDS: Final[float] = 10.0
 _DEFAULT_GPU_ACTIVITY_THRESHOLD_PERCENT: Final[float] = 5.0
 _DEFAULT_GPU_SAFETY_RETRY_SECONDS: Final[float] = 120.0
+_DEFAULT_VERIFIED_RECOVERY_TIMEOUT_SECONDS: Final[float] = 300.0
+_DEFAULT_VERIFIED_ACTIVITY_GRACE_SECONDS: Final[float] = 2.0
 _GPU_ACTIVITY_SAMPLE_COUNT: Final[int] = 2
 _DEFAULT_MAX_STALL_RESTARTS: Final[int] = 3
 _DEFAULT_UNEXPECTED_FAILURE_RETRY_DELAYS_SECONDS: Final[tuple[float, ...]] = (
@@ -76,7 +78,7 @@ _STDERR_LINE_LIMIT: Final[int] = 1_000
 
 
 class ProcessGpuUsageProbe(Protocol):
-    """Low-duty process-scoped GPU activity source used only to wake parked targets."""
+    """Low-duty process-scoped GPU activity source used for FPS recovery."""
 
     def sample(self, process_ids: frozenset[int]) -> dict[int, float]: ...
 
@@ -96,6 +98,7 @@ class _CaptureOutcome(StrEnum):
     COLLECTOR_FAILED = "collector_failed"
     PERMISSION_REQUIRED = "permission_required"
     STALLED = "stalled"
+    VERIFIED_RECOVERY_REQUIRED = "verified_recovery_required"
 
 
 class PresentMonFpsService(QObject):
@@ -124,6 +127,10 @@ class PresentMonFpsService(QObject):
         gpu_probe_interval_seconds: float = _DEFAULT_GPU_PROBE_INTERVAL_SECONDS,
         gpu_activity_threshold_percent: float = (_DEFAULT_GPU_ACTIVITY_THRESHOLD_PERCENT),
         gpu_safety_retry_seconds: float = _DEFAULT_GPU_SAFETY_RETRY_SECONDS,
+        verified_recovery_timeout_seconds: float = (
+            _DEFAULT_VERIFIED_RECOVERY_TIMEOUT_SECONDS
+        ),
+        verified_activity_grace_seconds: float = _DEFAULT_VERIFIED_ACTIVITY_GRACE_SECONDS,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -143,6 +150,16 @@ class PresentMonFpsService(QObject):
             raise ValueError("gpu_activity_threshold_percent must be finite and non-negative")
         if gpu_safety_retry_seconds <= 0:
             raise ValueError("gpu_safety_retry_seconds must be positive")
+        if (
+            not math.isfinite(verified_recovery_timeout_seconds)
+            or verified_recovery_timeout_seconds <= 0
+        ):
+            raise ValueError("verified_recovery_timeout_seconds must be positive")
+        if (
+            not math.isfinite(verified_activity_grace_seconds)
+            or verified_activity_grace_seconds <= 0
+        ):
+            raise ValueError("verified_activity_grace_seconds must be positive")
         if max_stall_restarts < 0:
             raise ValueError("max_stall_restarts cannot be negative")
         if len(unexpected_failure_retry_delays_seconds) != 3 or any(
@@ -167,6 +184,8 @@ class PresentMonFpsService(QObject):
         self._gpu_probe_interval_seconds = gpu_probe_interval_seconds
         self._gpu_activity_threshold_percent = gpu_activity_threshold_percent
         self._gpu_safety_retry_seconds = gpu_safety_retry_seconds
+        self._verified_recovery_timeout_seconds = verified_recovery_timeout_seconds
+        self._verified_activity_grace_seconds = verified_activity_grace_seconds
         self._lock = threading.Lock()
         self._ownership = FpsCaptureOwnership()
         self._generation = 0
@@ -179,6 +198,7 @@ class PresentMonFpsService(QObject):
         self._provider_evidence_loaded = False
         self._provider_evidence_revision = 0
         self._overlay_visible = False
+        self._verified_recovery_hint = threading.Event()
         self._discovery_active = threading.Event()
         self._discovery_active.set()
         self._started = False
@@ -369,6 +389,11 @@ class PresentMonFpsService(QObject):
             if thread is not None and thread.is_alive():
                 target = self._target
                 if target is not None and self._retains_verified_capture_locked(target):
+                    if (
+                        preferred_target is not None
+                        and preferred_target.identity_key == target.identity_key
+                    ):
+                        self._verified_recovery_hint.set()
                     return
             else:
                 target = self._target
@@ -444,6 +469,7 @@ class PresentMonFpsService(QObject):
             self._capture_stop = None
             self._capture_thread = None
             self._process = None
+            self._verified_recovery_hint.clear()
             self._ownership.replace_target(target)
             if not discover:
                 self._preferred_target = None
@@ -730,34 +756,11 @@ class PresentMonFpsService(QObject):
                     return
                 if not self._activate_candidate(generation, candidate):
                     return
-                command = build_presentmon_command(runtime.executable, candidate)
-                try:
-                    process = _start_hidden_process(command)
-                except OSError:
-                    _LOGGER.exception(
-                        "PresentMon FPS collector could not be started for %s (pid=%d)",
-                        candidate.executable_name,
-                        candidate.process_id,
-                    )
-                    self._complete_capture(
-                        generation,
-                        candidate,
-                        secondary_text="FPS COLLECTOR FAILED",
-                    )
+                outcome = self._run_candidate_collector(
+                    runtime.executable, generation, candidate, stop_event
+                )
+                if outcome is None:
                     return
-                with self._lock:
-                    if generation != self._generation:
-                        _terminate_process(process)
-                        return
-                    self._process = process
-                try:
-                    outcome = self._consume_process(process, candidate, stop_event)
-                finally:
-                    _terminate_process(process)
-                    with self._lock:
-                        if generation == self._generation and self._process is process:
-                            self._process = None
-                    self._discovery_active.set()
                 if outcome is _CaptureOutcome.CANCELLED:
                     return
                 if outcome is _CaptureOutcome.PERMISSION_REQUIRED:
@@ -899,26 +902,95 @@ class PresentMonFpsService(QObject):
             if stop_event.wait(self._target_retry_delay_seconds):
                 return
 
+    def _run_candidate_collector(
+        self,
+        executable: Path,
+        generation: int,
+        target: FpsTarget,
+        stop_event: threading.Event,
+    ) -> _CaptureOutcome | None:
+        verified_restarts = 0
+        while not stop_event.is_set():
+            command = build_presentmon_command(executable, target)
+            try:
+                process = _start_hidden_process(command)
+            except OSError:
+                _LOGGER.exception(
+                    "PresentMon FPS collector could not be started for %s (pid=%d)",
+                    target.executable_name,
+                    target.process_id,
+                )
+                self._complete_capture(
+                    generation,
+                    target,
+                    secondary_text="FPS COLLECTOR FAILED",
+                )
+                return None
+            with self._lock:
+                if generation != self._generation:
+                    _terminate_process(process)
+                    return _CaptureOutcome.CANCELLED
+                self._process = process
+            try:
+                outcome = self._consume_process(process, target, stop_event)
+            finally:
+                _terminate_process(process)
+                with self._lock:
+                    if generation == self._generation and self._process is process:
+                        self._process = None
+                self._discovery_active.set()
+            if outcome is not _CaptureOutcome.VERIFIED_RECOVERY_REQUIRED:
+                return outcome
+            with self._lock:
+                if (
+                    generation != self._generation
+                    or not self._retains_verified_capture_locked(target)
+                ):
+                    return _CaptureOutcome.CANCELLED
+                self._discovery_active.clear()
+            verified_restarts += 1
+            _LOGGER.warning(
+                "Restarting silent verified FPS collector %d for %s (pid=%d)",
+                verified_restarts,
+                target.executable_name,
+                target.process_id,
+            )
+        return _CaptureOutcome.CANCELLED
+
+    def _sample_process_gpu_usage(
+        self,
+        process_ids: frozenset[int],
+    ) -> dict[int, float] | None:
+        sampler = self._gpu_usage_sampler
+        if sampler is None:
+            return None
+        try:
+            return sampler.sample(process_ids)
+        except (OSError, RuntimeError):
+            _LOGGER.exception(
+                "Process GPU activity is unavailable; timed FPS recovery remains active"
+            )
+            with suppress(OSError, RuntimeError):
+                sampler.close()
+            self._gpu_usage_sampler = None
+            return None
+
+    def _verified_target_has_gpu_activity(self, target: FpsTarget) -> bool:
+        usage_by_pid = self._sample_process_gpu_usage(frozenset((target.process_id,)))
+        usage = None if usage_by_pid is None else usage_by_pid.get(target.process_id)
+        return usage is not None and usage >= self._gpu_activity_threshold_percent
+
     def _sample_gpu_wakes(
         self,
         candidates: tuple[FpsTarget, ...],
         high_samples: dict[tuple[int, int | str], int],
     ) -> frozenset[tuple[int, int | str]]:
-        sampler = self._gpu_usage_sampler
-        if sampler is None or not candidates:
+        if not candidates:
             return frozenset()
-        try:
-            usage_by_pid = sampler.sample(
-                frozenset(candidate.process_id for candidate in candidates)
-            )
-        except (OSError, RuntimeError):
-            _LOGGER.exception(
-                "Process GPU activity is unavailable; parked FPS targets will use "
-                "their safety retry"
-            )
-            with suppress(OSError, RuntimeError):
-                sampler.close()
-            self._gpu_usage_sampler = None
+        usage_by_pid = self._sample_process_gpu_usage(
+            frozenset(candidate.process_id for candidate in candidates)
+        )
+        if usage_by_pid is None:
             for candidate in candidates:
                 high_samples.pop(candidate.identity_key, None)
             return frozenset()
@@ -1135,6 +1207,9 @@ class PresentMonFpsService(QObject):
         last_frame_at: float | None = None
         resume_probe_started_at: float | None = None
         next_publish = started_at + self._publish_interval_seconds
+        next_verified_gpu_probe = started_at + self._gpu_probe_interval_seconds
+        verified_gpu_high_samples = 0
+        verified_activity_detected_at: float | None = None
         saw_usable_frame = False
         accepted_frame_count = 0
         retain_verified_capture = self._retains_verified_capture(target)
@@ -1177,6 +1252,10 @@ class PresentMonFpsService(QObject):
                     accepted_frame_count += 1
                     last_frame_at = time.monotonic()
                     resume_probe_started_at = None
+                    verified_gpu_high_samples = 0
+                    verified_activity_detected_at = None
+                    next_verified_gpu_probe = last_frame_at + self._gpu_probe_interval_seconds
+                    self._verified_recovery_hint.clear()
                     selector.ingest(frame, observed_at=last_frame_at)
                     if (
                         not retain_verified_capture
@@ -1235,6 +1314,51 @@ class PresentMonFpsService(QObject):
                     break
             else:
                 resume_probe_started_at = None
+            silence_started_at = (
+                last_frame_at if last_frame_at is not None else started_at
+            )
+            verified_stream_stale = (
+                retain_verified_capture
+                and now - silence_started_at >= self._frame_stall_timeout_seconds
+            )
+            if verified_stream_stale:
+                if (
+                    verified_activity_detected_at is None
+                    and self._verified_recovery_hint.is_set()
+                ):
+                    self._verified_recovery_hint.clear()
+                    verified_activity_detected_at = now
+                if verified_activity_detected_at is None and now >= next_verified_gpu_probe:
+                    next_verified_gpu_probe = now + self._gpu_probe_interval_seconds
+                    if self._verified_target_has_gpu_activity(target):
+                        verified_gpu_high_samples += 1
+                    else:
+                        verified_gpu_high_samples = 0
+                    if verified_gpu_high_samples >= _GPU_ACTIVITY_SAMPLE_COUNT:
+                        verified_activity_detected_at = now
+                if (
+                    verified_activity_detected_at is not None
+                    and now - verified_activity_detected_at
+                    >= self._verified_activity_grace_seconds
+                ):
+                    _LOGGER.info(
+                        "FPS verified stream stayed silent after renewed game activity; "
+                        "recycling collector for %s (pid=%d)",
+                        target.executable_name,
+                        target.process_id,
+                    )
+                    outcome = _CaptureOutcome.VERIFIED_RECOVERY_REQUIRED
+                    break
+                if now - silence_started_at >= self._verified_recovery_timeout_seconds:
+                    _LOGGER.info(
+                        "FPS verified stream stayed silent for %.1f seconds; recycling "
+                        "collector for %s (pid=%d)",
+                        self._verified_recovery_timeout_seconds,
+                        target.executable_name,
+                        target.process_id,
+                    )
+                    outcome = _CaptureOutcome.VERIFIED_RECOVERY_REQUIRED
+                    break
             if now >= next_publish:
                 metric = selector.metric(now=now)
                 if metric.numeric_value is None:
@@ -1266,6 +1390,7 @@ class PresentMonFpsService(QObject):
             _CaptureOutcome.NO_FRAMES,
             _CaptureOutcome.PERMISSION_REQUIRED,
             _CaptureOutcome.STALLED,
+            _CaptureOutcome.VERIFIED_RECOVERY_REQUIRED,
         }:
             _terminate_process(process)
         join_worker(

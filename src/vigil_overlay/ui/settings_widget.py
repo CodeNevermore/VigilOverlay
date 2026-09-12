@@ -596,7 +596,10 @@ class SettingsWidgetView(QWidget):
                 "global_hotkey",
             ),
         ),
-        _SectionSpec("Overlay", ("start_with_windows", "run_in_background")),
+        _SectionSpec(
+            "Overlay",
+            ("start_with_windows", "start_minimized", "run_in_background"),
+        ),
         _SectionSpec("Widgets", ("widgets",)),
         _SectionSpec("Recovery", ("safe_mode", "reset_window_position")),
     )
@@ -612,6 +615,8 @@ class SettingsWidgetView(QWidget):
         hotkey_combination: str,
         start_with_windows_enabled: bool = True,
         start_with_windows_available: bool = True,
+        start_minimized_enabled: bool = True,
+        start_minimized_available: bool = True,
         run_in_background_enabled: bool = True,
         run_in_background_available: bool = True,
         safe_mode_active: bool = False,
@@ -643,6 +648,8 @@ class SettingsWidgetView(QWidget):
         self._hotkey_combination = hotkey_combination
         self._start_with_windows_enabled = start_with_windows_enabled
         self._start_with_windows_available = start_with_windows_available
+        self._start_minimized_enabled = start_minimized_enabled
+        self._start_minimized_available = start_minimized_available
         self._run_in_background_enabled = run_in_background_enabled
         self._run_in_background_available = run_in_background_available
         self._safe_mode_active = safe_mode_active
@@ -681,6 +688,17 @@ class SettingsWidgetView(QWidget):
     def set_start_with_windows_available(self, available: bool) -> None:
         self._start_with_windows_available = available
         row = self._buttons_by_item["start_with_windows"]
+        row.setEnabled(available)
+
+    def set_start_minimized_enabled(self, enabled: bool) -> None:
+        self._start_minimized_enabled = enabled
+        row = self._buttons_by_item["start_minimized"]
+        row.set_toggle_checked(enabled)
+        row.update()
+
+    def set_start_minimized_available(self, available: bool) -> None:
+        self._start_minimized_available = available
+        row = self._buttons_by_item["start_minimized"]
         row.setEnabled(available)
 
     def set_run_in_background_enabled(self, enabled: bool) -> None:
@@ -861,6 +879,8 @@ class SettingsWidgetView(QWidget):
         )
         self.set_start_with_windows_enabled(self._start_with_windows_enabled)
         self.set_start_with_windows_available(self._start_with_windows_available)
+        self.set_start_minimized_enabled(self._start_minimized_enabled)
+        self.set_start_minimized_available(self._start_minimized_available)
         self.set_run_in_background_enabled(self._run_in_background_enabled)
         self.set_run_in_background_available(self._run_in_background_available)
         self.set_safe_mode_active(self._safe_mode_active)
@@ -880,6 +900,8 @@ class SettingsWidgetView(QWidget):
         if item.item_id == "global_hotkey":
             return SettingsRowButton(item, self, trailing_text=self._hotkey_combination)
         if item.item_id == "start_with_windows":
+            return SettingsRowButton(item, self, toggle=True)
+        if item.item_id == "start_minimized":
             return SettingsRowButton(item, self, toggle=True)
         if item.item_id == "run_in_background":
             return SettingsRowButton(item, self, toggle=True)

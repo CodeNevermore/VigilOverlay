@@ -286,6 +286,7 @@ class VigilApplication:
             tray_available=tray_available,
             hotkey_active=False,
         )
+        self._background_available = initial_background
         self.window = OverlayWindow(
             config,
             self._save_config,
@@ -300,6 +301,7 @@ class VigilApplication:
             power_action_callback=self._power_control_service.execute,
             startup_change_callback=self._change_start_with_windows,
             startup_available=startup_available,
+            start_minimized_available=not self._read_only_config,
             background_change_callback=self._change_run_in_background,
             background_setting_available=not self._read_only_config,
             safe_mode_active=safe_mode,
@@ -355,6 +357,9 @@ class VigilApplication:
         self._controller_service.command_ready.connect(self._handle_controller_command)
         self._controller_service.connection_changed.connect(
             self._handle_controller_connection_changed
+        )
+        self._controller_service.controller_topology_changed.connect(
+            self._handle_controller_topology_changed
         )
         self._controller_service.activation_released.connect(
             self.window.notify_controller_activation_released
@@ -745,6 +750,7 @@ class VigilApplication:
             hotkey_active=hotkey_active,
             guide_active=self._guide_button_service.active,
         )
+        self._background_available = available
         self.window.set_background_available(available)
         self.qt_app.setQuitOnLastWindowClosed(not available)
         return available
@@ -840,6 +846,17 @@ class VigilApplication:
     ) -> None:
         del controller_index
         self._input_coordinator.set_controller_connected(connected)
+
+    def _handle_controller_topology_changed(
+        self,
+        controller_indexes: tuple[int, ...],
+    ) -> None:
+        del controller_indexes
+        if (
+            self._config.controller.guide_button_enabled
+            or "gameinput:guide" in self._config.controller.shortcut_controls
+        ):
+            self._guide_button_service.rearm()
 
     def _handle_controller_commands_rearmed(self) -> None:
         """Open controller-primary routing after the worker observes neutral input."""
@@ -1211,13 +1228,28 @@ class VigilApplication:
         """Start application services and enter the Qt event loop."""
 
         self._service_lifecycle.start()
-        self._show_overlay()
+        self._apply_initial_visibility()
         if self._startup_hotkey_failure is not None:
             QTimer.singleShot(0, self._show_startup_hotkey_failure)
         if self._startup_safety_warning is not None:
             QTimer.singleShot(0, self._show_startup_safety_warning)
         QTimer.singleShot(1_500, self._update_check_service.check)
         return self.qt_app.exec()
+
+    def _apply_initial_visibility(self) -> None:
+        should_start_minimized = (
+            self._config.startup.start_minimized
+            and self._background_available
+            and not self._safe_mode
+            and self._startup_hotkey_failure is None
+            and self._startup_safety_warning is None
+        )
+        if should_start_minimized:
+            _LOGGER.info("Vigil started minimized and is available through background controls")
+            return
+        if self._config.startup.start_minimized and not self._safe_mode:
+            _LOGGER.info("Start minimized was bypassed because startup requires a visible overlay")
+        self._show_overlay()
 
     def _show_startup_hotkey_failure(self) -> None:
         failure = self._startup_hotkey_failure

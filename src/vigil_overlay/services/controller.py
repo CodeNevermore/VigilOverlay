@@ -441,6 +441,8 @@ class ControllerInputService(QObject):
 
     command_ready = Signal(object)
     connection_changed = Signal(bool, int)
+    active_controller_changed = Signal(int, int)
+    controller_topology_changed = Signal(object)
     activation_released = Signal()
     direction_released = Signal(object)
     commands_rearmed = Signal()
@@ -469,6 +471,7 @@ class ControllerInputService(QObject):
         self._thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
         self._active_controller_index: int | None = None
+        self._connected_controller_indexes: frozenset[int] = frozenset()
         self._commands_armed = threading.Event()
         self._commands_armed.set()
         self._closed = False
@@ -483,6 +486,11 @@ class ControllerInputService(QObject):
     def active_controller_index(self) -> int | None:
         with self._state_lock:
             return self._active_controller_index
+
+    @property
+    def connected_controller_indexes(self) -> frozenset[int]:
+        with self._state_lock:
+            return self._connected_controller_indexes
 
     def battery_snapshot(self) -> ControllerBatterySnapshot:
         """Return battery state for the active XInput controller without changing input flow."""
@@ -553,6 +561,7 @@ class ControllerInputService(QObject):
         if stopped:
             self._thread = None
         self._set_active_controller(None)
+        self._set_connected_controller_indexes(frozenset(), publish=False)
         shortcut_service = self._shortcut_service
         if shortcut_service is not None:
             for device_id in tuple(self._shortcut_devices):
@@ -570,37 +579,98 @@ class ControllerInputService(QObject):
         active_index: int | None = None
         next_scan_at = 0.0
         previous_buttons = 0
+        handoff_armed_indexes: set[int] = set()
         try:
             while not self._stop_event.is_set():
                 now = time.monotonic()
-                shortcut_states, shortcut_consumed_indexes = self._poll_shortcut_states()
+                scan_all = self._shortcut_service is not None or now >= next_scan_at
+                controller_states, shortcut_consumed_indexes = self._poll_controller_states(
+                    active_index,
+                    scan_all=scan_all,
+                )
+                if scan_all:
+                    next_scan_at = now + self._reconnect_scan_seconds
+                    connected_indexes = frozenset(controller_states)
+                    self._set_connected_controller_indexes(connected_indexes)
+                    handoff_armed_indexes.intersection_update(connected_indexes)
                 if active_index is None:
-                    if now >= next_scan_at:
-                        active_index, state = self._find_connected_controller()
-                        next_scan_at = now + self._reconnect_scan_seconds
-                        if active_index is not None and state is not None:
-                            self._interpreter.prime(state, now=now)
-                            previous_buttons = state.buttons
-                            self._set_active_controller(active_index)
-                            _LOGGER.info("Controller %d connected", active_index)
+                    if controller_states:
+                        active_index = min(controller_states)
+                        state = controller_states[active_index]
+                        self._interpreter.prime(state, now=now)
+                        previous_buttons = state.buttons
+                        handoff_armed_indexes.discard(active_index)
+                        self._set_active_controller(active_index)
+                        _LOGGER.info("Controller %d connected", active_index)
                     if self._stop_event.wait(self._poll_interval_seconds):
                         break
                     continue
 
-                state = shortcut_states.get(active_index)
-                if self._shortcut_service is None:
-                    state = self._safe_read_state(active_index)
-                if state is None:
+                active_state = controller_states.get(active_index)
+                if active_state is None:
                     disconnected_index = active_index
-                    active_index = None
-                    next_scan_at = now
-                    self._interpreter.reset()
-                    previous_buttons = 0
-                    self._set_active_controller(None)
-                    _LOGGER.info("Controller %d disconnected", disconnected_index)
+                    if not scan_all:
+                        controller_states, shortcut_consumed_indexes = self._poll_controller_states(
+                            None, scan_all=True
+                        )
+                        next_scan_at = now + self._reconnect_scan_seconds
+                        connected_indexes = frozenset(controller_states)
+                        self._set_connected_controller_indexes(connected_indexes)
+                        handoff_armed_indexes.intersection_update(connected_indexes)
+                    self._release_active_edges(previous_buttons)
+                    replacement_index = min(controller_states) if controller_states else None
+                    if replacement_index is None:
+                        active_index = None
+                        previous_buttons = 0
+                        self._set_active_controller(None)
+                        _LOGGER.info("Controller %d disconnected", disconnected_index)
+                    else:
+                        active_index = replacement_index
+                        replacement_state = controller_states[replacement_index]
+                        self._interpreter.prime(replacement_state, now=now)
+                        previous_buttons = replacement_state.buttons
+                        handoff_armed_indexes.discard(disconnected_index)
+                        handoff_armed_indexes.discard(replacement_index)
+                        self._set_active_controller(replacement_index)
+                        _LOGGER.info(
+                            "Controller %d disconnected; controller %d is now active",
+                            disconnected_index,
+                            replacement_index,
+                        )
                     if self._stop_event.wait(self._poll_interval_seconds):
                         break
                     continue
+
+                state = active_state
+                for controller_index, candidate_state in controller_states.items():
+                    if controller_index == active_index:
+                        continue
+                    if self._interpreter.is_neutral(candidate_state):
+                        handoff_armed_indexes.add(controller_index)
+                handoff_index = next(
+                    (
+                        controller_index
+                        for controller_index in sorted(handoff_armed_indexes)
+                        if controller_index != active_index
+                        and controller_index in controller_states
+                        and not self._interpreter.is_neutral(controller_states[controller_index])
+                    ),
+                    None,
+                )
+                if handoff_index is not None:
+                    previous_index = active_index
+                    self._release_active_edges(previous_buttons)
+                    active_index = handoff_index
+                    state = controller_states[handoff_index]
+                    previous_buttons = 0
+                    handoff_armed_indexes.discard(previous_index)
+                    handoff_armed_indexes.discard(handoff_index)
+                    self._set_active_controller(handoff_index)
+                    _LOGGER.info(
+                        "Controller %d took over navigation from controller %d",
+                        handoff_index,
+                        previous_index,
+                    )
 
                 shortcut_consumed = active_index in shortcut_consumed_indexes
 
@@ -638,18 +708,30 @@ class ControllerInputService(QObject):
             )
             self._set_active_controller(None)
 
-    def _poll_shortcut_states(self) -> tuple[dict[int, ControllerState], set[int]]:
+    def _poll_controller_states(
+        self,
+        active_index: int | None,
+        *,
+        scan_all: bool,
+    ) -> tuple[dict[int, ControllerState], set[int]]:
         shortcut_service = self._shortcut_service
-        if shortcut_service is None:
-            return {}, set()
         states: dict[int, ControllerState] = {}
         consumed_indexes: set[int] = set()
         connected: set[str] = set()
-        for controller_index in range(_MAX_CONTROLLERS):
+        controller_indexes: range | tuple[int, ...]
+        if scan_all:
+            controller_indexes = range(_MAX_CONTROLLERS)
+        elif active_index is None:
+            controller_indexes = ()
+        else:
+            controller_indexes = (active_index,)
+        for controller_index in controller_indexes:
             state = self._safe_read_state(controller_index)
             if state is None:
                 continue
             states[controller_index] = state
+            if shortcut_service is None:
+                continue
             device_id = f"xinput:{controller_index}"
             connected.add(device_id)
             if shortcut_service.observe_state(
@@ -659,17 +741,11 @@ class ControllerInputService(QObject):
                 )
             ):
                 consumed_indexes.add(controller_index)
-        for device_id in self._shortcut_devices - connected:
-            shortcut_service.observe_disconnect(device_id)
-        self._shortcut_devices = connected
+        if shortcut_service is not None and scan_all:
+            for device_id in self._shortcut_devices - connected:
+                shortcut_service.observe_disconnect(device_id)
+            self._shortcut_devices = connected
         return states, consumed_indexes
-
-    def _find_connected_controller(self) -> tuple[int | None, ControllerState | None]:
-        for controller_index in range(_MAX_CONTROLLERS):
-            state = self._safe_read_state(controller_index)
-            if state is not None:
-                return controller_index, state
-        return None, None
 
     def _safe_read_state(self, controller_index: int) -> ControllerState | None:
         try:
@@ -684,10 +760,33 @@ class ControllerInputService(QObject):
             if previous == controller_index:
                 return
             self._active_controller_index = controller_index
-        if previous is not None:
+        if previous is not None and controller_index is None:
             self.connection_changed.emit(False, previous)
-        if controller_index is not None:
+        elif previous is None and controller_index is not None:
             self.connection_changed.emit(True, controller_index)
+        elif previous is not None and controller_index is not None:
+            self.active_controller_changed.emit(previous, controller_index)
+
+    def _set_connected_controller_indexes(
+        self,
+        controller_indexes: frozenset[int],
+        *,
+        publish: bool = True,
+    ) -> None:
+        with self._state_lock:
+            if self._connected_controller_indexes == controller_indexes:
+                return
+            self._connected_controller_indexes = controller_indexes
+        if publish:
+            self.controller_topology_changed.emit(tuple(sorted(controller_indexes)))
+
+    def _release_active_edges(self, previous_buttons: int) -> None:
+        if previous_buttons & XINPUT_GAMEPAD_A:
+            self.activation_released.emit()
+        previous_direction = self._interpreter.held_direction_command
+        if previous_direction is not None:
+            self.direction_released.emit(previous_direction)
+        self._interpreter.reset()
 
 
 def create_platform_controller_service() -> ControllerInputService:

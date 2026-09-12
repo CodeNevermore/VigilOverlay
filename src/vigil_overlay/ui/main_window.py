@@ -138,6 +138,7 @@ class OverlayWindow(QWidget):
         power_action_callback: PowerActionCallback | None = None,
         startup_change_callback: StartupChangeCallback | None = None,
         startup_available: bool = False,
+        start_minimized_available: bool = True,
         background_change_callback: BackgroundChangeCallback | None = None,
         background_setting_available: bool = True,
         safe_mode_active: bool = False,
@@ -158,6 +159,7 @@ class OverlayWindow(QWidget):
         self._controller_shortcut_capture_callback = controller_shortcut_capture_callback
         self._startup_change_callback = startup_change_callback
         self._startup_available = startup_available
+        self._start_minimized_available = start_minimized_available
         self._background_change_callback = background_change_callback
         self._background_setting_available = background_setting_available
         self._safe_mode_active = safe_mode_active
@@ -293,6 +295,8 @@ class OverlayWindow(QWidget):
             hotkey_combination=self._config.hotkey.combination,
             start_with_windows_enabled=self._config.startup.start_with_windows,
             start_with_windows_available=self._startup_available,
+            start_minimized_enabled=self._config.startup.start_minimized,
+            start_minimized_available=self._start_minimized_available,
             run_in_background_enabled=self._config.background.run_in_background,
             run_in_background_available=self._background_setting_available,
             safe_mode_active=self._safe_mode_active,
@@ -685,6 +689,9 @@ class OverlayWindow(QWidget):
             if success:
                 self._sync_start_with_windows_setting_label()
             return
+        if widget_id == "settings" and item_id == "start_minimized":
+            self._toggle_start_minimized_setting()
+            return
         if widget_id == "settings" and item_id == "safe_mode":
             if self._safe_mode_restart_callback is None:
                 self._action_status.setText("Safe Mode restart is unavailable in this build.")
@@ -813,6 +820,34 @@ class OverlayWindow(QWidget):
         settings_view = self._navigation.settings_view
         if settings_view is not None:
             settings_view.set_start_with_windows_enabled(self._config.startup.start_with_windows)
+
+    def _toggle_start_minimized_setting(self) -> None:
+        if not self._start_minimized_available:
+            self._action_status.setText(
+                "Safe mode is read-only; Start minimized cannot be changed."
+            )
+            return
+
+        previous = self._config.startup.start_minimized
+        enabled = not previous
+        self._config.startup.start_minimized = enabled
+        try:
+            self._persist_config_callback(self._config)
+        except (OSError, VigilOverlayError) as exc:
+            self._config.startup.start_minimized = previous
+            self._sync_start_minimized_setting_label()
+            self._action_status.setText(f"Could not save Start minimized: {exc}")
+            _LOGGER.exception("Could not persist Start minimized setting")
+            return
+        self._sync_start_minimized_setting_label()
+        state = "enabled" if enabled else "disabled"
+        self._action_status.setText(f"Start minimized {state}.")
+        _LOGGER.info("Start minimized %s", state)
+
+    def _sync_start_minimized_setting_label(self) -> None:
+        settings_view = self._navigation.settings_view
+        if settings_view is not None:
+            settings_view.set_start_minimized_enabled(self._config.startup.start_minimized)
 
     def _sync_run_in_background_setting_label(self) -> None:
         settings_view = self._navigation.settings_view

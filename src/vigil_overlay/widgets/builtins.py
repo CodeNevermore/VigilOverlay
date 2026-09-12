@@ -233,6 +233,12 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
                     "overlay",
                 ),
                 WidgetItemDefinition(
+                    "start_minimized",
+                    "Start minimized",
+                    "Keep Vigil hidden after launch until opened from tray, hotkey, or Guide.",
+                    "overlay",
+                ),
+                WidgetItemDefinition(
                     "run_in_background",
                     "Run in background",
                     "Keep Vigil running while hidden so tray, hotkey, or Guide can reopen it.",

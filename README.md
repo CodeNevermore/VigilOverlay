@@ -17,8 +17,8 @@ separate service boundaries.
 - Display projection, resolution, and refresh-rate controls with Keep/Revert safety.
 - Recent-game discovery for Steam, Xbox / Microsoft Store, Epic Games, Battle.net,
   EA app, Ubisoft Connect, GOG, Manual Games, and the optional Playnite bridge.
-- Editable global hotkey, Guide-button support, Start with Windows, background mode,
-  tray controls, Safe Mode, and automatic invalid-settings recovery.
+- Editable global hotkey, Guide-button support, Start with Windows, start-minimized
+  launch, background mode, tray controls, Safe Mode, and invalid-settings recovery.
 - Consistent dark/light Vigil dialogs for power, updates, shortcut editing, FPS
   errors, and confirmations, with controller-safe focus and activation handling.
 - Verified foreground ownership and fail-open mouse/keyboard containment while the
@@ -32,6 +32,14 @@ and retries activation instead of hiding itself. Vigil remains controller-naviga
 through its shared compatibility route, so the game may receive the same controller
 presses until foreground ownership is verified and GameInput ownership activates.
 
+Vigil observes every XInput controller slot. A controller topology change after sleep,
+power loss, reconnection, or replacement re-arms the separate Home/Guide listener, so
+restoring the overlay does not require restarting Vigil. If another connected
+controller first reaches neutral and then sends navigation input, it becomes the active
+navigation controller without briefly reporting that all controllers disconnected.
+Input already held when a controller connects is ignored for handoff, reducing
+accidental takeovers from held buttons or stick drift.
+
 FPS discovery captures the foreground game before Vigil opens. Exact executables
 learned from earlier frame-verified sessions rank first, followed by the foreground
 installed-provider match and other visible provider matches. If none match, only the
@@ -41,16 +49,22 @@ games or unavailable GPU counters. Vigil never searches for the globally busiest
 process.
 
 Every new candidate remains provisional until three usable PresentMon frames verify
-its current process. Vigil then learns that executable and keeps one collector through
-later absent or stale frames until the process exits. A provisional candidate that
+its current process. Vigil then learns that executable and keeps verified ownership
+and its collector through later absent or stale frames. A provisional candidate that
 produces no usable frames is stopped and parked instead of leaving PresentMon running;
 retries back off from 5 seconds to 30 seconds and then 2 minutes, while renewed
 foreground activity, sustained GPU activity, provider changes, or process relaunch can
-wake it sooner. Once a target verifies, candidate scanning and GPU wake checks pause.
-Accepted frames update current FPS and the session average. If opening Vigil causes a
-verified game to pause, Performance keeps the last current value, labels it **LAST
-FPS**, and freezes the existing average. A game that keeps presenting continues to
-show live values. The FPS session resets when the verified target exits.
+wake it sooner.
+
+Once a target verifies, candidate scanning pauses. If its collector stays silent,
+matching foreground activity or two sustained low-frequency GPU samples starts a short
+recovery grace period. Vigil recycles a collector that still does not resume for the
+same verified process, preserving its FPS history and target ownership. A five-minute
+fallback repeats while the process remains alive, so even very long pauses continue to
+receive recovery attempts. Accepted frames update current FPS and the session average.
+During a pause, Performance keeps the last current value, labels it **LAST FPS**, and
+freezes the existing average until new frames resume. The FPS session resets only when
+the verified target exits.
 
 Vigil no longer installs or uses HidHide for active controller handling. An
 upgrade never uninstalls a user-owned package or rewrites its application and device lists.
@@ -71,6 +85,11 @@ Production Windows builds request administrator approval when Vigil starts so
 PresentMon can capture FPS telemetry reliably. Start with Windows uses an elevated
 per-user scheduled task. Release artifacts are intentionally unsigned, so Windows
 may display an Unknown Publisher or SmartScreen warning.
+
+Start minimized is enabled by default. On ordinary launches, Vigil stays hidden until
+opened from the tray, global hotkey, or controller Home/Guide button. Safe Mode,
+actionable startup warnings, and launches without a valid background restore path
+still open the overlay visibly.
 
 ## Running from source
 

@@ -456,6 +456,8 @@ class NavigationShell(QWidget):
         hotkey_combination: str = "Ctrl+Alt+Shift+G",
         start_with_windows_enabled: bool = True,
         start_with_windows_available: bool = True,
+        start_minimized_enabled: bool = True,
+        start_minimized_available: bool = True,
         run_in_background_enabled: bool = True,
         run_in_background_available: bool = True,
         safe_mode_active: bool = False,
@@ -508,6 +510,8 @@ class NavigationShell(QWidget):
         self._hotkey_combination = hotkey_combination
         self._start_with_windows_enabled = start_with_windows_enabled
         self._start_with_windows_available = start_with_windows_available
+        self._start_minimized_enabled = start_minimized_enabled
+        self._start_minimized_available = start_minimized_available
         self._run_in_background_enabled = run_in_background_enabled
         self._run_in_background_available = run_in_background_available
         self._safe_mode_active = safe_mode_active
@@ -1310,6 +1314,8 @@ class NavigationShell(QWidget):
                 hotkey_combination=self._hotkey_combination,
                 start_with_windows_enabled=self._start_with_windows_enabled,
                 start_with_windows_available=self._start_with_windows_available,
+                start_minimized_enabled=self._start_minimized_enabled,
+                start_minimized_available=self._start_minimized_available,
                 run_in_background_enabled=self._run_in_background_enabled,
                 run_in_background_available=self._run_in_background_available,
                 safe_mode_active=self._safe_mode_active,
