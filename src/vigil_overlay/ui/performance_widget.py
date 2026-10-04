@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPaintEvent, QPalette, QPen
 from PySide6.QtWidgets import (
     QFrame,
@@ -51,9 +51,7 @@ class TelemetryHistoryGraph(QWidget):
         painter.drawLine(area.bottomLeft(), area.bottomRight())
 
         samples = self._metric.history
-        usable = [
-            (index, value) for index, value in enumerate(samples) if value is not None
-        ]
+        usable = [(index, value) for index, value in enumerate(samples) if value is not None]
         if len(usable) < 2:
             painter.end()
             return
@@ -84,6 +82,8 @@ class TelemetryHistoryGraph(QWidget):
 
 class PerformanceWidgetView(QWidget):
     """Metric selector and selected-metric detail panel."""
+
+    fps_options_requested = Signal()
 
     def __init__(
         self,
@@ -209,9 +209,14 @@ class PerformanceWidgetView(QWidget):
         detail_layout.addLayout(graph_grid)
         body.addWidget(detail, 1)
         root.addLayout(body, 1)
+        self._fps_options = QPushButton("Choose FPS game / remembered games", self)
+        self._fps_options.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._fps_options.clicked.connect(lambda checked=False: self.fps_options_requested.emit())
+        root.addWidget(self._fps_options)
 
     def _refresh_detail(self) -> None:
         reading = self._snapshot.metric(self.selected_metric)
+        self._fps_options.setVisible(self.selected_metric is PerformanceMetric.FPS)
         self._large_value.setText(reading.display_value)
         self._secondary_value.setText(reading.secondary_text)
         self._secondary_value.setVisible(bool(reading.secondary_text))

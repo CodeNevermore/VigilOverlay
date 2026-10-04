@@ -349,6 +349,12 @@ class OverlayNavigationCoordinator(QObject):
         self._navigation.restore_focus()
 
     def _prepare_activation(self, source: ModalInputSource) -> None:
+        if (
+            self._navigation.selected_widget_id == "performance"
+            and self._navigation.selected_item_id == "fps"
+            and self._dialogs.fps_options_dialog is None
+        ):
+            self._dialogs.set_next_fps_input_source(source)
         display_view = self._navigation.display_view
         if display_view is not None:
             display_view.set_next_input_source(source)

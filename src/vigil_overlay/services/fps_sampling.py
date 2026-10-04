@@ -7,7 +7,7 @@ import math
 import time
 from collections import Counter, deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final
 
 from vigil_overlay.services.fps import FpsTarget, PresentMonFrame
@@ -40,6 +40,8 @@ class PresentMonCaptureDiagnostics:
     def no_frame_status(self) -> str:
         if self.permission_required:
             return "FPS PERMISSION REQUIRED"
+        if self.exit_code not in {None, 0}:
+            return "FPS COLLECTOR FAILED"
         rejection_counts = dict(self.rejection_counts)
         if not self.lines_seen:
             return "NO FPS DATA RECEIVED"
@@ -109,7 +111,7 @@ class PresentMonCsvParser:
         row = dict(zip(self._header, fields, strict=True))
         try:
             process_id = int(row["ProcessID"])
-        except (KeyError, ValueError):
+        except KeyError, ValueError:
             self._rejections["process_id"] += 1
             return None
         if process_id != self._target_pid:
@@ -164,7 +166,7 @@ class FpsWindowAccumulator:
     """Calculate displayed FPS from frame display durations with bounded history."""
 
     def __init__(self) -> None:
-        self._frames: deque[tuple[float, float]] = deque()
+        self._frames: deque[tuple[float, float, float]] = deque()
         self._display_clock_ms = 0.0
         self._session_frame_count = 0
         self._session_displayed_time_ms = 0.0
@@ -174,6 +176,20 @@ class FpsWindowAccumulator:
     @property
     def history(self) -> tuple[float | None, ...]:
         return tuple(self._history)
+
+    @property
+    def session_totals(self) -> tuple[int, float]:
+        return self._session_frame_count, self._session_displayed_time_ms
+
+    @property
+    def last_observed_at(self) -> float | None:
+        return self._last_event_wall
+
+    def totals_after(self, observed_at: float) -> tuple[int, float]:
+        """Count buffered frames after another selected stream's last observation."""
+
+        durations = [duration for _end, duration, wall in self._frames if wall > observed_at]
+        return len(durations), sum(durations)
 
     def reset(self) -> None:
         self._frames.clear()
@@ -188,7 +204,7 @@ class FpsWindowAccumulator:
         self._display_clock_ms += frame.displayed_time_ms
         self._session_frame_count += 1
         self._session_displayed_time_ms += frame.displayed_time_ms
-        self._frames.append((self._display_clock_ms, frame.displayed_time_ms))
+        self._frames.append((self._display_clock_ms, frame.displayed_time_ms, wall))
         self._last_event_wall = wall
         cutoff = self._display_clock_ms - _AVERAGE_WINDOW_MS
         while self._frames and self._frames[0][0] < cutoff:
@@ -245,13 +261,13 @@ class FpsWindowAccumulator:
         if not self._frames:
             return 0
         cutoff = self._display_clock_ms - window_ms
-        return sum(1 for end_time, _duration in self._frames if end_time > cutoff)
+        return sum(1 for end_time, _duration, _wall in self._frames if end_time > cutoff)
 
     def _calculate_window(self, window_ms: float) -> float | None:
         if not self._frames:
             return None
         cutoff = self._display_clock_ms - window_ms
-        durations = [duration for end_time, duration in self._frames if end_time > cutoff]
+        durations = [duration for end_time, duration, _wall in self._frames if end_time > cutoff]
         total = sum(durations)
         if not durations or total <= 0:
             return None
@@ -264,11 +280,17 @@ class FpsWindowAccumulator:
 
 
 class FpsStreamSelector:
-    """Keep independent swap-chain histories and select the dominant stream."""
+    """Select one render stream while retaining the game's average and history."""
 
     def __init__(self) -> None:
         self._streams: dict[str, FpsWindowAccumulator] = {}
         self._selected_stream: str | None = None
+        self._accounted_stream: str | None = None
+        self._accounted_totals: tuple[int, float] = (0, 0.0)
+        self._accounted_last_at: float | None = None
+        self._session_frame_count = 0
+        self._session_displayed_time_ms = 0.0
+        self._history: deque[float | None] = deque(maxlen=_FPS_HISTORY_LIMIT)
 
     def ingest(self, frame: PresentMonFrame, *, observed_at: float | None = None) -> None:
         accumulator = self._streams.setdefault(frame.swap_chain, FpsWindowAccumulator())
@@ -276,7 +298,9 @@ class FpsStreamSelector:
         if self._selected_stream is None:
             self._selected_stream = frame.swap_chain
 
-    def metric(self, *, now: float | None = None) -> TelemetryMetricSnapshot:
+    def metric(
+        self, *, now: float | None = None, force_stale: bool = False
+    ) -> TelemetryMetricSnapshot:
         wall = time.monotonic() if now is None else now
         active_streams = [
             (stream_id, stream)
@@ -289,17 +313,65 @@ class FpsStreamSelector:
             selected = self._streams.get(self._selected_stream)
             if selected is None:
                 return unavailable_fps_metric(())
-            return selected.metric(
-                now=wall,
-                append_history=False,
-                allow_stale=True,
+            selected_id = self._selected_stream
+        else:
+            selected_id, selected = max(
+                active_streams,
+                key=lambda item: item[1].recent_frame_count(1000.0),
             )
-        selected_id, selected = max(
-            active_streams,
-            key=lambda item: item[1].recent_frame_count(1000.0),
+            self._selected_stream = selected_id
+        self._account_selected_frames(selected_id, selected)
+        metric = selected.metric(now=wall, append_history=False, allow_stale=True)
+        if metric.numeric_value is None:
+            return unavailable_fps_metric(tuple(self._history))
+        stale = force_stale or not selected.is_fresh(now=wall)
+        if not stale:
+            self._history.append(metric.numeric_value)
+        history = tuple(self._history)
+        average = 1000.0 * self._session_frame_count / self._session_displayed_time_ms
+        average_text = f"AVG FPS {round(average):d}"
+        return replace(
+            metric,
+            secondary_text=f"LAST FPS · {average_text}" if stale else average_text,
+            history=history,
+            scale_max=_fps_scale_max(metric.numeric_value, history),
         )
-        self._selected_stream = selected_id
-        return selected.metric(now=wall)
+
+    def _account_selected_frames(self, selected_id: str, selected: FpsWindowAccumulator) -> None:
+        """Carry the game average across sequential streams without summing overlaps."""
+
+        if self._accounted_stream is not None:
+            previous = self._streams[self._accounted_stream]
+            count, duration = previous.session_totals
+            self._session_frame_count += count - self._accounted_totals[0]
+            self._session_displayed_time_ms += duration - self._accounted_totals[1]
+            self._accounted_totals = (count, duration)
+            previous_last_at = previous.last_observed_at
+            if previous_last_at is not None:
+                self._accounted_last_at = (
+                    previous_last_at
+                    if self._accounted_last_at is None
+                    else max(self._accounted_last_at, previous_last_at)
+                )
+        if selected_id != self._accounted_stream:
+            count, duration = (
+                selected.session_totals
+                if self._accounted_last_at is None
+                else selected.totals_after(self._accounted_last_at)
+            )
+            self._session_frame_count += count
+            self._session_displayed_time_ms += duration
+            self._accounted_stream = selected_id
+            self._accounted_totals = selected.session_totals
+            # Overlapping secondary frames can become selected, but must not move
+            # the accounted game-session observation boundary backwards.
+            last_at = selected.last_observed_at
+            if last_at is not None:
+                self._accounted_last_at = (
+                    last_at
+                    if self._accounted_last_at is None
+                    else max(self._accounted_last_at, last_at)
+                )
 
 
 def presentmon_permission_required(stderr_lines: Sequence[str]) -> bool:
@@ -334,4 +406,4 @@ def unavailable_fps_metric(
 def _fps_scale_max(current: float, history: tuple[float | None, ...]) -> float:
     maximum = max((value for value in history if value is not None), default=current)
     maximum = max(maximum, current, 60.0)
-    return min(max(math.ceil(maximum / 30.0) * 30.0, 60.0), 1000.0)
+    return max(math.ceil(maximum / 30.0) * 30.0, 60.0)

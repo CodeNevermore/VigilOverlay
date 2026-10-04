@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TypeAlias
-
-VdfValue: TypeAlias = str | dict[str, "VdfValue"]
-VdfObject: TypeAlias = dict[str, VdfValue]
+type VdfValue = str | dict[str, VdfValue]
+type VdfObject = dict[str, VdfValue]
 
 
 class ValveKeyValuesParser:

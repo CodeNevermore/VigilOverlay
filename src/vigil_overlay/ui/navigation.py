@@ -1223,6 +1223,9 @@ class NavigationShell(QWidget):
         if definition.view_kind is WidgetViewKind.PERFORMANCE:
             view = PerformanceWidgetView(definition, self._telemetry_snapshot, self._stack)
             self._performance_view = view
+            view.fps_options_requested.connect(
+                lambda: self.item_activated.emit(definition.widget_id, "fps")
+            )
             performance_buttons = list(view.metric_buttons)
             for index, button in enumerate(performance_buttons):
                 button.clicked.connect(

@@ -11,6 +11,11 @@ from PySide6.QtWidgets import QDialog, QWidget
 from vigil_overlay.core.updates import AvailableUpdate
 from vigil_overlay.services.power_controls import PowerCapabilities
 from vigil_overlay.ui.dialog_surface import VigilMessageDialog
+from vigil_overlay.ui.fps_options_dialog import (
+    FpsActionCallback,
+    FpsOptionsDialog,
+    FpsSnapshotCallback,
+)
 from vigil_overlay.ui.modal_guard import ModalInputSource
 from vigil_overlay.ui.power_dialog import PowerActionCallback, PowerMenuDialog
 from vigil_overlay.ui.update_dialog import UpdateAvailableDialog
@@ -50,8 +55,10 @@ class OverlayDialogCoordinator(QObject):
         self._power_dialog: PowerMenuDialog | None = None
         self._update_dialog: UpdateAvailableDialog | None = None
         self._fps_failure_dialog: VigilMessageDialog | None = None
+        self._fps_options_dialog: FpsOptionsDialog | None = None
         self._startup_safety_dialog: VigilMessageDialog | None = None
         self._next_power_input_source = ModalInputSource.UNKNOWN
+        self._next_fps_input_source = ModalInputSource.UNKNOWN
 
     @property
     def power_dialog(self) -> PowerMenuDialog | None:
@@ -64,6 +71,10 @@ class OverlayDialogCoordinator(QObject):
     @property
     def fps_failure_dialog(self) -> VigilMessageDialog | None:
         return self._fps_failure_dialog
+
+    @property
+    def fps_options_dialog(self) -> FpsOptionsDialog | None:
+        return self._fps_options_dialog
 
     @property
     def startup_safety_dialog(self) -> VigilMessageDialog | None:
@@ -81,9 +92,13 @@ class OverlayDialogCoordinator(QObject):
             self._power_dialog,
             self._update_dialog,
             self._fps_failure_dialog,
+            self._fps_options_dialog,
         ):
             if dialog is not None:
                 dialog.notify_controller_activation_released()
+
+    def set_next_fps_input_source(self, source: ModalInputSource) -> None:
+        self._next_fps_input_source = source
 
     def handle_controller_command(self, command: object) -> bool:
         """Route a command to the active host modal, preserving existing priority."""
@@ -91,6 +106,7 @@ class OverlayDialogCoordinator(QObject):
         for dialog in (
             self._update_dialog,
             self._fps_failure_dialog,
+            self._fps_options_dialog,
             self._power_dialog,
         ):
             if dialog is not None:
@@ -165,6 +181,29 @@ class OverlayDialogCoordinator(QObject):
             dialog.exec()
         finally:
             self._fps_failure_dialog = None
+            self._restore_focus()
+
+    def show_fps_options(
+        self,
+        snapshot_callback: FpsSnapshotCallback,
+        action_callback: FpsActionCallback,
+        *,
+        dialog_factory: Callable[
+            [FpsSnapshotCallback, FpsActionCallback, QWidget], FpsOptionsDialog
+        ] = FpsOptionsDialog,
+    ) -> None:
+        if self._fps_options_dialog is not None:
+            return
+        dialog = dialog_factory(snapshot_callback, action_callback, self._host)
+        self._fps_options_dialog = dialog
+        source = self._next_fps_input_source
+        self._next_fps_input_source = ModalInputSource.UNKNOWN
+        dialog.begin_controller_ownership(source)
+        try:
+            dialog.exec()
+        finally:
+            self._fps_options_dialog = None
+            dialog.deleteLater()
             self._restore_focus()
 
     def show_startup_safety_warning(

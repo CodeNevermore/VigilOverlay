@@ -61,6 +61,7 @@ from vigil_overlay.ui.dialog_coordination import (
 )
 from vigil_overlay.ui.dialog_surface import VigilMessageDialog
 from vigil_overlay.ui.dim_backdrop import DimBackdropWindow
+from vigil_overlay.ui.fps_options_dialog import FpsActionCallback, FpsSnapshotCallback
 from vigil_overlay.ui.navigation import (
     NavigationCommand,
     NavigationResult,
@@ -118,6 +119,7 @@ class OverlayWindow(QWidget):
     mouse_navigation_preference_changed = Signal(bool)
     game_launch_requested = Signal(object)
     game_close_requested = Signal(object)
+    fps_options_requested = Signal()
     integration_action_requested = Signal(str)
     update_handoff_requested = Signal()
 
@@ -628,6 +630,9 @@ class OverlayWindow(QWidget):
             if game is not None:
                 self.game_launch_requested.emit(game)
             return
+        if widget_id == "performance" and item_id == "fps":
+            self.fps_options_requested.emit()
+            return
         if widget_id == "widgets":
             target_widget_id = self._widget_catalog_by_item_id.get(item_id)
             if target_widget_id is not None:
@@ -781,7 +786,7 @@ class OverlayWindow(QWidget):
         self._config.controller.guide_button_enabled = enabled
         try:
             self._persist_config_callback(self._config)
-        except (OSError, VigilOverlayError):
+        except OSError, VigilOverlayError:
             self._config.controller.guide_button_enabled = previous
             self._sync_guide_button_setting_label()
             _LOGGER.exception("Could not persist Xbox/Guide button setting")
@@ -801,7 +806,7 @@ class OverlayWindow(QWidget):
         self._config.controller.allow_mouse_navigation_while_controller_connected = enabled
         try:
             self._persist_config_callback(self._config)
-        except (OSError, VigilOverlayError):
+        except OSError, VigilOverlayError:
             self._config.controller.allow_mouse_navigation_while_controller_connected = previous
             self._sync_mouse_navigation_setting_label()
             _LOGGER.exception("Could not persist controller mouse-navigation setting")
@@ -891,7 +896,7 @@ class OverlayWindow(QWidget):
         self._config.navigation.selected_widget = widget_id
         try:
             self._persist_config_callback(self._config)
-        except (OSError, VigilOverlayError):
+        except OSError, VigilOverlayError:
             self._config.navigation.selected_widget = previous
             _LOGGER.exception("Could not persist selected widget")
             return
@@ -993,7 +998,7 @@ class OverlayWindow(QWidget):
         )
         try:
             self._persist_config_callback(self._config)
-        except (OSError, VigilOverlayError):
+        except OSError, VigilOverlayError:
             self._config.widgets.enabled_widget_ids = previous_enabled
             self._config.widgets.widget_order = previous_order
             self._config.navigation.selected_widget = previous_selected
@@ -1091,6 +1096,11 @@ class OverlayWindow(QWidget):
             update,
             dialog_factory=UpdateAvailableDialog,
         )
+
+    def show_fps_options(
+        self, snapshot_callback: FpsSnapshotCallback, action_callback: FpsActionCallback
+    ) -> None:
+        self._dialog_coordinator.show_fps_options(snapshot_callback, action_callback)
 
     def show_fps_runtime_failure(self, detail: str) -> None:
         self._dialog_coordinator.show_fps_runtime_failure(

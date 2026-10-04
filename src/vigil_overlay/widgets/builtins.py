@@ -41,7 +41,12 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
                 WidgetItemDefinition("gpu", "GPU", "GPU utilization.", "computer"),
                 WidgetItemDefinition("vram", "VRAM", "Video memory utilization.", "computer"),
                 WidgetItemDefinition("ram", "RAM", "System memory utilization.", "computer"),
-                WidgetItemDefinition("fps", "FPS", "Current frame rate.", "computer"),
+                WidgetItemDefinition(
+                    "fps",
+                    "FPS",
+                    "Current frame rate. Activate to choose a game or manage remembered games.",
+                    "computer",
+                ),
             ),
             view_kind=WidgetViewKind.PERFORMANCE,
             preferred_panel_width=DEFAULT_COMPACT_PANEL_WIDTH,

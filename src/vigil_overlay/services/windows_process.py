@@ -19,6 +19,8 @@ _INVALID_HANDLE_VALUE: Final[int] = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) 
 _SYNCHRONIZE: Final[int] = 0x00100000
 _WAIT_TIMEOUT: Final[int] = 0x00000102
 _WAIT_OBJECT_0: Final[int] = 0x00000000
+_ERROR_INVALID_PARAMETER: Final[int] = 87
+_ERROR_NOT_FOUND: Final[int] = 1168
 
 
 class _FileTime(ctypes.Structure):
@@ -312,10 +314,10 @@ def is_fps_target_alive(target: FpsTarget) -> bool:
         target.process_id,
     )
     if not handle:
-        # PresentMon is already configured to terminate when the target exits. A transient,
-        # protected-process, or otherwise unavailable liveness handle must not tear down a
-        # provider-owned trace session and start a replacement loop.
-        return True
+        # A nonexistent PID is an exit, not an access-denied/protected-process case.
+        # Preserve fail-open behavior only when Windows cannot establish liveness.
+        error = ctypes.get_last_error()
+        return error not in {_ERROR_INVALID_PARAMETER, _ERROR_NOT_FOUND}
     try:
         wait_result = int(wait_for_single_object(handle, 0))
         if wait_result == _WAIT_OBJECT_0:

@@ -51,7 +51,7 @@ from vigil_overlay.services.foreground_ownership import (
     ForegroundOwnershipService,
     create_platform_foreground_ownership_service,
 )
-from vigil_overlay.services.fps import FpsTarget
+from vigil_overlay.services.fps import FpsSelectionSnapshot, FpsTarget
 from vigil_overlay.services.fps_runtime import (
     PresentMonFpsService,
     UnavailableFpsService,
@@ -351,6 +351,7 @@ class VigilApplication:
         )
         self._telemetry_service.snapshot_ready.connect(self.window.set_telemetry_snapshot)
         self._fps_service.metric_ready.connect(self._telemetry_service.apply_fps_update)
+        self.window.fps_options_requested.connect(self._open_fps_options)
         fps_failure_signal = getattr(self._fps_service, "failure_ready", None)
         if fps_failure_signal is not None:
             fps_failure_signal.connect(self.window.show_fps_runtime_failure)
@@ -1092,6 +1093,27 @@ class VigilApplication:
         self._sync_tray_action()
         _LOGGER.info("Existing Vigil instance activated by a repeated launch")
 
+    def _open_fps_options(self) -> None:
+        snapshot_provider = getattr(self._fps_service, "selection_snapshot", None)
+        action_handler = getattr(self._fps_service, "apply_selection_action", None)
+        if not callable(snapshot_provider) or not callable(action_handler):
+            self.window.show_fps_runtime_failure(
+                "FPS game selection is unavailable on this platform."
+            )
+            return
+
+        def snapshot() -> FpsSelectionSnapshot:
+            result = snapshot_provider()
+            if not isinstance(result, FpsSelectionSnapshot):
+                raise TypeError("FPS selection provider returned an invalid snapshot")
+            return result
+
+        def apply(action: str, value: FpsTarget | str | None) -> tuple[bool, str]:
+            success, detail = action_handler(action, value)
+            return bool(success), str(detail)
+
+        self.window.show_fps_options(snapshot, apply)
+
     def _prepare_fps_target(self, preferred_target: FpsTarget | None = None) -> bool:
         """Request learned/provider discovery with a pre-overlay foreground hint."""
 
@@ -1272,7 +1294,7 @@ class VigilApplication:
         if not self._read_only_config:
             try:
                 self._save_config(self._config)
-            except (OSError, VigilOverlayError):
+            except OSError, VigilOverlayError:
                 _LOGGER.exception("Could not persist configuration during shutdown")
         _LOGGER.info("Vigil Overlay Qt application stopped")
 

@@ -46,15 +46,29 @@ installed-provider match and other visible provider matches. If none match, only
 eligible foreground executable can enter a provisional probe: two sustained,
 low-frequency GPU-activity samples wake it, with a 2-minute safety probe for CPU-bound
 games or unavailable GPU counters. Vigil never searches for the globally busiest GPU
-process.
+process. Provider matches use the executable path or game installation folder; a
+filename match is used only when Windows cannot provide the process path.
+
+Open **Performance → FPS** and activate the FPS row, or select **Choose FPS game /
+remembered games**, to see eligible running processes and why they match. Choose a
+process to follow it until it exits, including while minimized, or return to
+**Automatic selection**. Programs are remembered automatically once FPS verifies;
+**Remember current game** lets you retry a failed save or restore a forgotten match.
+**Forget** removes a saved match without interrupting the current capture; a later
+verified session can remember it again. **Ignore** stops tracking
+that executable and excludes it from future selection until you **Restore** it.
 
 Every new candidate remains provisional until three usable PresentMon frames verify
-its current process. Vigil then learns that executable and keeps verified ownership
-and its collector through later absent or stale frames. A provisional candidate that
+its current process. Vigil automatically remembers verified executable paths,
+including unrecognized programs, and keeps verified ownership and the collector
+through later absent or stale frames. While
+Vigil is visible, a focus-sensitive game can pause rendering; the first-frame timeout
+begins after Vigil hides so the game has an opportunity to resume. A provisional candidate that still
 produces no usable frames is stopped and parked instead of leaving PresentMon running;
 retries back off from 5 seconds to 30 seconds and then 2 minutes, while renewed
 foreground activity, sustained GPU activity, provider changes, or process relaunch can
-wake it sooner.
+wake it sooner. Failed probes show their specific failure reason while retrying, and
+bounded diagnostic records are retained in production logs.
 
 Once a target verifies, candidate scanning pauses. If its collector stays silent,
 matching foreground activity or two sustained low-frequency GPU samples starts a short
@@ -63,8 +77,15 @@ same verified process, preserving its FPS history and target ownership. A five-m
 fallback repeats while the process remains alive, so even very long pauses continue to
 receive recovery attempts. Accepted frames update current FPS and the session average.
 During a pause, Performance keeps the last current value, labels it **LAST FPS**, and
-freezes the existing average until new frames resume. The FPS session resets only when
-the verified target exits.
+freezes the existing average until new frames resume. A collector interruption retries
+the same verified game with bounded backoff, preserving its average and history. During
+retry delays, Vigil continues checking for game exit and labels retained readings
+**LAST FPS** with the collector's recovery status. A confirmed game exit releases the
+old process so its next launch can be discovered.
+Changing the game's rendering surface preserves the selected game-session average and
+history without adding simultaneous secondary streams. The graph scale adapts to valid
+readings above 1,000 FPS. The FPS session resets when the verified target exits, when
+you choose a different process, or when you ignore the current executable.
 
 Vigil no longer installs or uses HidHide for active controller handling. An
 upgrade never uninstalls a user-owned package or rewrites its application and device lists.
@@ -74,8 +95,8 @@ Vigil performs a one-time pass-through check before removing only its own legacy
 ## Requirements
 
 - 64-bit Windows 10 or Windows 11
-- Python 3.11 or newer when running from source
-- PySide6 6.7 or newer
+- Standard 64-bit CPython 3.14 when running from source
+- PySide6 6.11 or newer
 
 End users should install Vigil with the packaged Windows installer. The installer
 includes the required GameInput runtime and does not require a separate Python
@@ -94,8 +115,8 @@ still open the overlay visibly.
 ## Running from source
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+py -3.14 -m venv venv
+.\venv\Scripts\Activate.ps1
 python -m pip install -e .
 python -m vigil_overlay
 ```
@@ -114,7 +135,8 @@ the recovery.
 
 ## Building the Windows application
 
-Install the build dependencies and create a standalone Nuitka distribution:
+Use the same Python 3.14 environment for source validation and builds. Install the
+build dependencies (Nuitka 4.2 or newer) and create a standalone distribution:
 
 ```powershell
 python -m pip install -e ".[build]"
@@ -139,9 +161,12 @@ release hash pin before invoking Inno Setup.
 
 Vigil reads local launcher metadata to discover installed games. It does not write its
 own game-launch history. Hardware measurements and FPS samples are bounded in memory
-and are not persisted. After a process produces valid frames, Vigil stores its local
-executable path, including provider identity when available, to improve future FPS
-matching. Valid unique mappings do not expire or get count-evicted during normal use;
+and are not persisted. After a process produces three usable frames, Vigil
+automatically stores its local executable path, including provider identity when
+available, to improve future FPS matching. This includes unrecognized programs.
+Ignored executable paths are stored locally until restored. Manual process choices
+last only for the current process and are not saved. Valid unique mappings do not
+expire or get count-evicted during normal use;
 the file has only a defensive size guard against unreasonable local data. Process IDs,
 verification times or counts, and performance samples are not stored. PresentMon and
 GameInput are validated during packaging; Vigil does not download or replace either one

@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Last updated: August 13, 2026
+Last updated: October 3, 2026
 
 Vigil Overlay includes or redistributes the components listed below. Each component
 remains governed by its own license or terms. The Vigil Overlay MIT License applies
@@ -15,8 +15,8 @@ kept beside its staged executable under
 
 | Component | Version or release contract | License or terms | Copyright / owner | Distribution use |
 | --- | --- | --- | --- | --- |
-| CPython | Python 3.11.x build runtime | Python Software Foundation License 2.0 and notices in the supplied Python license | Python Software Foundation and contributors | Nuitka standalone runtime and standard-library modules |
-| PySide6, Shiboken6, and Qt | Compatible Qt for Python 6.x selected by `PySide6>=6.7,<7` | LGPL-3.0-only selected for Vigil distributions | The Qt Company Ltd., the Qt Project, and contributors | UI bindings and dynamically linked Qt libraries |
+| CPython | Python 3.14.x build runtime | Python Software Foundation License 2.0 and notices in the supplied Python license | Python Software Foundation and contributors | Nuitka standalone runtime and standard-library modules |
+| PySide6, Shiboken6, and Qt | Compatible Qt for Python 6.x selected by `PySide6>=6.11,<7` | LGPL-3.0-only selected for Vigil distributions | The Qt Company Ltd., the Qt Project, and contributors | UI bindings and dynamically linked Qt libraries |
 | pycaw | 20251023 | MIT | Copyright (c) 2016 AndreMiras | Windows Core Audio bindings |
 | comtypes | Compatible version selected by pycaw | MIT | Copyright (c) 2006-2013 Thomas Heller; copyright (c) 2014 Comtypes Developers | COM bindings used by the audio service |
 | psutil | `>=5.9,<8` | BSD-3-Clause | Copyright (c) 2009 Jay Loden, Dave Daeschler, Giampaolo Rodola | Process and system telemetry |

@@ -52,6 +52,26 @@ class FpsTarget:
 
 
 @dataclass(frozen=True, slots=True)
+class FpsTargetOption:
+    """One currently selectable process and its discovery explanation."""
+
+    target: FpsTarget
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class FpsSelectionSnapshot:
+    """Host-facing FPS selection and remembered-executable state."""
+
+    candidates: tuple[FpsTargetOption, ...] = ()
+    learned_paths: tuple[str, ...] = ()
+    ignored_paths: tuple[str, ...] = ()
+    active_target: FpsTarget | None = None
+    manual_target: FpsTarget | None = None
+    can_remember: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class PresentMonFrame:
     """Minimal frame record consumed from PresentMon CSV stdout."""
 

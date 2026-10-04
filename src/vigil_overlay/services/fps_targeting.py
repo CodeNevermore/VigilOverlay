@@ -95,15 +95,53 @@ class FpsCandidateSelector:
     def match(self, candidate: FpsTarget) -> FpsCandidateMatch | None:
         """Return the strongest durable learned or current provider match."""
 
+        if self.is_ignored(candidate):
+            return None
         with self._lock:
             evidence = _match_candidate(candidate, self._games, self._learned_entries)
         if evidence is None:
             return None
         return _public_match(evidence)
 
-    def record_verified(self, candidate: FpsTarget) -> FpsCandidateMatch | None:
-        """Learn an executable only after its current PID produces usable frames."""
+    @property
+    def supports_learning(self) -> bool:
+        return self._learned_cache is not None
 
+    @property
+    def learned_paths(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted({entry.executable_path for entry in self._learned_entries}))
+
+    @property
+    def ignored_paths(self) -> tuple[str, ...]:
+        cache = self._learned_cache
+        return cache.ignored_paths if cache is not None else ()
+
+    def is_ignored(self, candidate: FpsTarget) -> bool:
+        cache = self._learned_cache
+        return (
+            cache is not None
+            and candidate.executable_path is not None
+            and cache.is_ignored(candidate.executable_path)
+        )
+
+    def update_executable(self, action: str, executable_path: str) -> bool:
+        cache = self._learned_cache
+        if cache is None:
+            return False
+        changed = cache.update_executable(action, executable_path)
+        with self._lock:
+            self._learned_entries = cache.entries
+            self._last_logged_selection = None
+        return changed
+
+    def record_verified(
+        self, candidate: FpsTarget, *, remember: bool = False
+    ) -> FpsCandidateMatch | None:
+        """Automatically learn verified executables; explicit retries surface save errors."""
+
+        if self.is_ignored(candidate):
+            return None
         existing_match = self.match(candidate)
         executable_path = candidate.executable_path
         cache = self._learned_cache
@@ -114,14 +152,16 @@ class FpsCandidateSelector:
         verified_match = existing_match or FpsCandidateMatch(
             identity=None,
             title=PureWindowsPath(executable_path).stem,
-            reason="learned-local-executable",
-            learned=True,
+            reason="frame-verified-local-executable",
+            learned=False,
         )
         if cache is None:
-            return existing_match
+            return verified_match
         try:
             recorded = cache.record(identity, executable_path)
         except OSError:
+            if remember:
+                raise
             _LOGGER.exception("Could not persist learned FPS executable: %s", executable_path)
             return verified_match
         if recorded:
@@ -137,7 +177,7 @@ class FpsCandidateSelector:
                     identity.provider_game_id,
                     executable_path,
                 )
-        return verified_match
+        return self.match(candidate) or verified_match
 
     def select(
         self,
@@ -162,6 +202,8 @@ class FpsCandidateSelector:
             )
             scored: list[tuple[int, int, int, FpsTarget, _CandidateEvidence]] = []
             for index, candidate in enumerate(unique):
+                if self.is_ignored(candidate):
+                    continue
                 evidence = _match_candidate(candidate, games, learned_entries)
                 if evidence is None:
                     continue
@@ -274,7 +316,11 @@ def _match_candidate(
         ):
             rank = 2
             reason = "install-directory"
-        elif game.executable_name is not None and candidate_name == game.executable_name:
+        elif (
+            candidate_path is None
+            and game.executable_name is not None
+            and candidate_name == game.executable_name
+        ):
             rank = 3
             reason = "executable-name"
         if rank is None:
