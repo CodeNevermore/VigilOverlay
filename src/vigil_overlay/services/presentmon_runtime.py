@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import os
 import platform
+import threading
 from pathlib import Path
 from typing import Final
 
 from vigil_overlay.core.file_io import sha256_file
 from vigil_overlay.core.paths import ApplicationPaths
 from vigil_overlay.services.fps import PresentMonRuntime
+from vigil_overlay.services.presentmon_cleanup import retire_abandoned_fps_sessions
 
 PRESENTMON_VERSION: Final[str] = "2.5.1"
 PRESENTMON_FILENAME: Final[str] = f"PresentMon-{PRESENTMON_VERSION}-x64.exe"
-PRESENTMON_SHA256: Final[str] = (
-    "9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191"
-)
+PRESENTMON_SHA256: Final[str] = "9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191"
 
 
 class PresentMonRuntimeError(RuntimeError):
@@ -27,15 +27,13 @@ class PresentMonRuntimeManager:
 
     def __init__(self, paths: ApplicationPaths) -> None:
         self._paths = paths
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_attempted = False
 
     @property
     def bundled_executable(self) -> Path:
         return (
-            self._paths.resource_root
-            / "third_party"
-            / "presentmon"
-            / "bin"
-            / PRESENTMON_FILENAME
+            self._paths.resource_root / "third_party" / "presentmon" / "bin" / PRESENTMON_FILENAME
         )
 
     def ensure(self) -> PresentMonRuntime:
@@ -58,6 +56,12 @@ class PresentMonRuntimeManager:
                 "The bundled PresentMon runtime failed SHA-256 verification and will not be run"
             )
 
+        # Legacy collectors could leave ETW sessions behind when killed by an update.
+        # Run only after integrity verification, before any new collector is started.
+        with self._cleanup_lock:
+            if not self._cleanup_attempted:
+                retire_abandoned_fps_sessions()
+                self._cleanup_attempted = True
         return PresentMonRuntime(executable, PRESENTMON_VERSION, PRESENTMON_SHA256)
 
 

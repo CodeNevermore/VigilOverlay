@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QDialog, QWidget
 
 from vigil_overlay.core.updates import AvailableUpdate
 from vigil_overlay.services.power_controls import PowerCapabilities
-from vigil_overlay.ui.dialog_surface import VigilMessageDialog
+from vigil_overlay.ui.dialog_surface import ControllerVigilDialog, VigilMessageDialog
 from vigil_overlay.ui.fps_options_dialog import (
     FpsActionCallback,
     FpsOptionsDialog,
@@ -57,6 +57,7 @@ class OverlayDialogCoordinator(QObject):
         self._fps_failure_dialog: VigilMessageDialog | None = None
         self._fps_options_dialog: FpsOptionsDialog | None = None
         self._startup_safety_dialog: VigilMessageDialog | None = None
+        self._active_dialogs: list[ControllerVigilDialog] = []
         self._next_power_input_source = ModalInputSource.UNKNOWN
         self._next_fps_input_source = ModalInputSource.UNKNOWN
 
@@ -88,31 +89,30 @@ class OverlayDialogCoordinator(QObject):
     def notify_controller_activation_released(self) -> None:
         """Release-gate every host modal that participates in native routing."""
 
-        for dialog in (
-            self._power_dialog,
-            self._update_dialog,
-            self._fps_failure_dialog,
-            self._fps_options_dialog,
-        ):
-            if dialog is not None:
-                dialog.notify_controller_activation_released()
+        for dialog in tuple(self._active_dialogs):
+            dialog.notify_controller_activation_released()
 
     def set_next_fps_input_source(self, source: ModalInputSource) -> None:
         self._next_fps_input_source = source
 
     def handle_controller_command(self, command: object) -> bool:
-        """Route a command to the active host modal, preserving existing priority."""
+        """Give the most recently opened host modal exclusive command ownership."""
 
-        for dialog in (
-            self._update_dialog,
-            self._fps_failure_dialog,
-            self._fps_options_dialog,
-            self._power_dialog,
-        ):
-            if dialog is not None:
-                dialog.handle_controller_command(command)
-                return True
-        return False
+        if not self._active_dialogs:
+            return False
+        self._active_dialogs[-1].handle_controller_command(command)
+        return True
+
+    @property
+    def interaction_active(self) -> bool:
+        return bool(self._active_dialogs)
+
+    def _finish_dialog(self, dialog: ControllerVigilDialog) -> None:
+        self._active_dialogs.remove(dialog)
+        if self._active_dialogs:
+            self._active_dialogs[-1].sync_controller_focus()
+        else:
+            self._restore_focus()
 
     def open_power_menu(
         self,
@@ -131,11 +131,12 @@ class OverlayDialogCoordinator(QObject):
         source = self._next_power_input_source
         self._next_power_input_source = ModalInputSource.UNKNOWN
         dialog.begin_controller_ownership(source)
+        self._active_dialogs.append(dialog)
         try:
             dialog.exec()
         finally:
             self._power_dialog = None
-            self._restore_focus()
+            self._finish_dialog(dialog)
 
     def show_available_update(
         self,
@@ -154,12 +155,13 @@ class OverlayDialogCoordinator(QObject):
         dialog = dialog_factory(update, self._host)
         self._update_dialog = dialog
         dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
+        self._active_dialogs.append(dialog)
         release_page_opened = False
         try:
             release_page_opened = dialog.exec() == QDialog.DialogCode.Accepted
         finally:
             self._update_dialog = None
-            self._restore_focus()
+            self._finish_dialog(dialog)
         if release_page_opened:
             self._request_update_handoff()
 
@@ -177,11 +179,12 @@ class OverlayDialogCoordinator(QObject):
         dialog.setObjectName("fpsRuntimeFailureDialog")
         dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
         self._fps_failure_dialog = dialog
+        self._active_dialogs.append(dialog)
         try:
             dialog.exec()
         finally:
             self._fps_failure_dialog = None
-            self._restore_focus()
+            self._finish_dialog(dialog)
 
     def show_fps_options(
         self,
@@ -199,12 +202,13 @@ class OverlayDialogCoordinator(QObject):
         source = self._next_fps_input_source
         self._next_fps_input_source = ModalInputSource.UNKNOWN
         dialog.begin_controller_ownership(source)
+        self._active_dialogs.append(dialog)
         try:
             dialog.exec()
         finally:
             self._fps_options_dialog = None
             dialog.deleteLater()
-            self._restore_focus()
+            self._finish_dialog(dialog)
 
     def show_startup_safety_warning(
         self,
@@ -224,11 +228,12 @@ class OverlayDialogCoordinator(QObject):
         dialog.setObjectName("startupSafetyWarningDialog")
         dialog.begin_controller_ownership(ModalInputSource.UNKNOWN)
         self._startup_safety_dialog = dialog
+        self._active_dialogs.append(dialog)
         try:
             dialog.exec()
         finally:
             self._startup_safety_dialog = None
-            self._restore_focus()
+            self._finish_dialog(dialog)
 
 
 __all__ = [

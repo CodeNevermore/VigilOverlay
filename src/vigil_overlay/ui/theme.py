@@ -161,7 +161,8 @@ QPushButton#audioToggleButton[navigationFocus="true"],
 QPushButton#audioVolumeRowButton[navigationFocus="true"],
 QPushButton#audioSelectorButton[navigationFocus="true"],
 QPushButton#wifiProfileSelectorButton[navigationFocus="true"],
-QPushButton#displaySelectorButton[navigationFocus="true"] {
+QPushButton#displaySelectorButton[navigationFocus="true"],
+QPushButton#hotkeySelectorButton[navigationFocus="true"] {
     border-width: 3px;
     border-style: solid;
 }
@@ -190,7 +191,8 @@ QSlider#audioVolumeSlider::handle:horizontal {
     border-radius: 7px;
 }
 QPushButton#audioSelectorButton, QPushButton#wifiProfileSelectorButton,
-QPushButton#displaySelectorButton {
+QPushButton#displaySelectorButton,
+QPushButton#hotkeySelectorButton {
     min-height: 56px;
     max-height: 56px;
     border-width: 2px;
@@ -202,19 +204,22 @@ QPushButton#displaySelectorButton {
     font-weight: 600;
 }
 QFrame#audioDropdownPopup, QFrame#wifiDropdownPopup,
-QFrame#displayDropdownPopup {
+QFrame#displayDropdownPopup,
+QFrame#hotkeyDropdownPopup {
     border-width: 2px;
     border-style: solid;
     border-radius: 10px;
 }
 QScrollArea#audioDropdownScroll, QWidget#audioDropdownContent,
 QScrollArea#wifiDropdownScroll, QWidget#wifiDropdownContent,
-QScrollArea#displayDropdownScroll, QWidget#displayDropdownContent {
+QScrollArea#displayDropdownScroll, QWidget#displayDropdownContent,
+QScrollArea#hotkeyDropdownScroll, QWidget#hotkeyDropdownContent {
     background-color: transparent;
     border: none;
 }
 QPushButton#audioDropdownOption, QPushButton#wifiDropdownOption,
-QPushButton#displayDropdownOption {
+QPushButton#displayDropdownOption,
+QPushButton#hotkeyDropdownOption {
     min-height: 38px;
     border: 1px solid transparent;
     border-radius: 6px;
@@ -225,7 +230,8 @@ QPushButton#displayDropdownOption {
 }
 QPushButton#audioDropdownOption[navigationFocus="true"],
 QPushButton#wifiDropdownOption[navigationFocus="true"],
-QPushButton#displayDropdownOption[navigationFocus="true"] {
+QPushButton#displayDropdownOption[navigationFocus="true"],
+QPushButton#hotkeyDropdownOption[navigationFocus="true"] {
     border-width: 3px;
     border-style: solid;
 }
@@ -289,7 +295,8 @@ QFrame#displayConfirmationPopup, QFrame#integrationConfirmationPopup {
     border-style: solid;
     border-radius: 10px;
 }
-QScrollArea#displayDropdownScroll, QWidget#displayDropdownContent {
+QScrollArea#displayDropdownScroll, QWidget#displayDropdownContent,
+QScrollArea#hotkeyDropdownScroll, QWidget#hotkeyDropdownContent {
     background-color: transparent;
     border: none;
 }
@@ -361,6 +368,10 @@ QLabel#toggleRowTitle {
     font-size: 14px;
     font-weight: 700;
 }
+QScrollArea#vigilDialogScroll, QWidget#vigilDialogScrollContent {
+    background-color: transparent;
+    border: none;
+}
 QDialog[vigilDialog="true"] {
     background-color: transparent;
 }
@@ -399,6 +410,10 @@ QPushButton[vigilDialogButton="true"] {
     padding: 0 12px;
     font-size: 13px;
     font-weight: 600;
+}
+QPushButton[vigilDialogButton="true"][dialogButtonKind="toggle"] {
+    min-width: 0;
+    padding: 0 8px;
 }
 QPushButton[vigilDialogButton="true"][dialogButtonKind="row"] {
     min-width: 0;
@@ -468,6 +483,13 @@ QPushButton#widgetOptionsButton {
     padding: 4px 10px;
     font-size: 14px;
     font-weight: 600;
+}
+QPushButton#overlayHideButton[navigationFocus="true"],
+QPushButton#widgetOptionsButton[navigationFocus="true"] {
+    border: 3px solid;
+}
+QPushButton#hotkeySelectorButton:focus {
+    border-width: 3px;
 }
 QFrame#widgetOptionsPopup {
     min-width: 170px;
@@ -581,7 +603,8 @@ QPushButton#audioToggleButton {
     background-color: transparent;
 }
 QPushButton#audioSelectorButton, QPushButton#wifiProfileSelectorButton,
-QPushButton#displaySelectorButton {
+QPushButton#displaySelectorButton,
+QPushButton#hotkeySelectorButton {
     color: #f4f5f7;
     background-color: rgba(50, 57, 70, 235);
     border-color: #a8e8ff;
@@ -591,7 +614,9 @@ QPushButton#audioSelectorButton[selectedItem="true"],
 QPushButton#wifiProfileSelectorButton:hover,
 QPushButton#wifiProfileSelectorButton[selectedItem="true"],
 QPushButton#displaySelectorButton:hover,
-QPushButton#displaySelectorButton[selectedItem="true"] {
+QPushButton#hotkeySelectorButton:hover,
+QPushButton#displaySelectorButton[selectedItem="true"],
+QPushButton#hotkeySelectorButton[selectedItem="true"] {
     background-color: rgba(65, 75, 91, 245);
 }
 QPushButton#audioVolumeRowButton {
@@ -606,7 +631,8 @@ QPushButton#audioToggleButton[navigationFocus="true"],
 QPushButton#audioVolumeRowButton[navigationFocus="true"],
 QPushButton#audioSelectorButton[navigationFocus="true"],
 QPushButton#wifiProfileSelectorButton[navigationFocus="true"],
-QPushButton#displaySelectorButton[navigationFocus="true"] {
+QPushButton#displaySelectorButton[navigationFocus="true"],
+QPushButton#hotkeySelectorButton[navigationFocus="true"] {
     border-color: #ffffff;
 }
 QSlider#audioVolumeSlider::groove:horizontal,
@@ -620,18 +646,22 @@ QSlider#audioVolumeSlider::handle:horizontal {
     background-color: #a8e8ff;
 }
 QFrame#audioDropdownPopup, QFrame#wifiDropdownPopup,
-QFrame#displayDropdownPopup {
+QFrame#displayDropdownPopup,
+QFrame#hotkeyDropdownPopup {
     background-color: #343b47;
     border-color: #a8e8ff;
 }
 QPushButton#audioDropdownOption, QPushButton#wifiDropdownOption,
-QPushButton#displayDropdownOption {
+QPushButton#displayDropdownOption,
+QPushButton#hotkeyDropdownOption {
     color: #f4f5f7;
     background-color: rgba(50, 57, 70, 245);
 }
 QPushButton#audioDropdownOption:hover, QPushButton#audioDropdownOption[navigationFocus="true"],
 QPushButton#wifiDropdownOption:hover, QPushButton#wifiDropdownOption[navigationFocus="true"],
-QPushButton#displayDropdownOption:hover, QPushButton#displayDropdownOption[navigationFocus="true"] {
+QPushButton#displayDropdownOption:hover,
+QPushButton#hotkeyDropdownOption:hover, QPushButton#displayDropdownOption[navigationFocus="true"],
+QPushButton#hotkeyDropdownOption[navigationFocus="true"] {
     background-color: #505a68;
     border-color: #ffffff;
 }
@@ -772,6 +802,12 @@ QPushButton[vigilDialogButton="true"]:disabled {
     border-color: rgba(105, 115, 131, 130);
 }
 
+QPushButton[vigilDialogButton="true"][dialogButtonKind="toggle"]:checked:enabled {
+    background-color: #505866;
+}
+QPushButton#hotkeySelectorButton:focus { border-color: #ffffff; }
+QPushButton#overlayHideButton[navigationFocus="true"],
+QPushButton#widgetOptionsButton[navigationFocus="true"] { border-color: #ffffff; }
 QLabel#performanceLargeValue {
     color: #f0f1f3;
 }
@@ -786,14 +822,16 @@ QPushButton#overlayHideButton {
     color: #ffffff;
     background-color: transparent;
 }
-QPushButton#overlayHideButton:hover {
+QPushButton#overlayHideButton:hover,
+QPushButton#overlayHideButton[navigationFocus="true"] {
     background-color: rgba(72, 78, 87, 220);
 }
 QPushButton#widgetOptionsButton {
     color: #f4f5f7;
     background-color: transparent;
 }
-QPushButton#widgetOptionsButton:hover {
+QPushButton#widgetOptionsButton:hover,
+QPushButton#widgetOptionsButton[navigationFocus="true"] {
     background-color: rgba(72, 78, 87, 220);
 }
 QFrame#widgetOptionsPopup {
@@ -910,7 +948,8 @@ QPushButton#audioToggleButton {
     background-color: transparent;
 }
 QPushButton#audioSelectorButton, QPushButton#wifiProfileSelectorButton,
-QPushButton#displaySelectorButton {
+QPushButton#displaySelectorButton,
+QPushButton#hotkeySelectorButton {
     color: #20242b;
     background-color: rgba(244, 246, 249, 248);
     border-color: #5d7481;
@@ -920,7 +959,9 @@ QPushButton#audioSelectorButton[selectedItem="true"],
 QPushButton#wifiProfileSelectorButton:hover,
 QPushButton#wifiProfileSelectorButton[selectedItem="true"],
 QPushButton#displaySelectorButton:hover,
-QPushButton#displaySelectorButton[selectedItem="true"] {
+QPushButton#hotkeySelectorButton:hover,
+QPushButton#displaySelectorButton[selectedItem="true"],
+QPushButton#hotkeySelectorButton[selectedItem="true"] {
     background-color: #ffffff;
 }
 QPushButton#audioVolumeRowButton { color: #20242a; background-color: transparent; }
@@ -934,7 +975,8 @@ QPushButton#audioToggleButton[navigationFocus="true"],
 QPushButton#audioVolumeRowButton[navigationFocus="true"],
 QPushButton#audioSelectorButton[navigationFocus="true"],
 QPushButton#wifiProfileSelectorButton[navigationFocus="true"],
-QPushButton#displaySelectorButton[navigationFocus="true"] {
+QPushButton#displaySelectorButton[navigationFocus="true"],
+QPushButton#hotkeySelectorButton[navigationFocus="true"] {
     border-color: #171a1f;
 }
 QSlider#audioVolumeSlider::groove:horizontal,
@@ -942,12 +984,14 @@ QSlider#audioVolumeSlider::add-page:horizontal { background-color: #cbd2da; }
 QSlider#audioVolumeSlider::sub-page:horizontal { background-color: #277da1; }
 QSlider#audioVolumeSlider::handle:horizontal { background-color: #277da1; }
 QFrame#audioDropdownPopup, QFrame#wifiDropdownPopup,
-QFrame#displayDropdownPopup {
+QFrame#displayDropdownPopup,
+QFrame#hotkeyDropdownPopup {
     background-color: #f4f6f9;
     border-color: #5d7481;
 }
 QPushButton#audioDropdownOption, QPushButton#wifiDropdownOption,
-QPushButton#displayDropdownOption {
+QPushButton#displayDropdownOption,
+QPushButton#hotkeyDropdownOption {
     color: #20242b;
     background-color: #ffffff;
 }
@@ -956,7 +1000,9 @@ QPushButton#audioDropdownOption[navigationFocus="true"],
 QPushButton#wifiDropdownOption:hover,
 QPushButton#wifiDropdownOption[navigationFocus="true"],
 QPushButton#displayDropdownOption:hover,
-QPushButton#displayDropdownOption[navigationFocus="true"] {
+QPushButton#hotkeyDropdownOption:hover,
+QPushButton#displayDropdownOption[navigationFocus="true"],
+QPushButton#hotkeyDropdownOption[navigationFocus="true"] {
     background-color: #e5e9ee;
     border-color: #171a1f;
 }
@@ -1097,6 +1143,12 @@ QPushButton[vigilDialogButton="true"]:disabled {
     border-color: rgba(170, 176, 184, 150);
 }
 
+QPushButton[vigilDialogButton="true"][dialogButtonKind="toggle"]:checked:enabled {
+    background-color: #cbd0d7;
+}
+QPushButton#hotkeySelectorButton:focus { border-color: #171a1f; }
+QPushButton#overlayHideButton[navigationFocus="true"],
+QPushButton#widgetOptionsButton[navigationFocus="true"] { border-color: #171a1f; }
 QLabel#performanceLargeValue {
     color: #171a1f;
 }
@@ -1111,14 +1163,16 @@ QPushButton#overlayHideButton {
     color: #171a1f;
     background-color: transparent;
 }
-QPushButton#overlayHideButton:hover {
+QPushButton#overlayHideButton:hover,
+QPushButton#overlayHideButton[navigationFocus="true"] {
     background-color: rgba(203, 208, 215, 220);
 }
 QPushButton#widgetOptionsButton {
     color: #171a1f;
     background-color: transparent;
 }
-QPushButton#widgetOptionsButton:hover {
+QPushButton#widgetOptionsButton:hover,
+QPushButton#widgetOptionsButton[navigationFocus="true"] {
     background-color: rgba(203, 208, 215, 220);
 }
 QFrame#widgetOptionsPopup {

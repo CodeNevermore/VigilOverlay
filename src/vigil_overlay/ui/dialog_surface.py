@@ -4,18 +4,24 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
     QLabel,
+    QLayout,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
+from vigil_overlay.ui.controls import controller_target_available
 from vigil_overlay.ui.modal_guard import ModalActivationGuard, ModalInputSource
+from vigil_overlay.ui.scrollbars import VigilVerticalScrollBar, ensure_controller_target_visible
 
 
 class VigilDialog(QDialog):
@@ -75,6 +81,44 @@ class VigilDialog(QDialog):
         self.content_layout.addWidget(box)
         return box
 
+    def create_scroll_area(
+        self, *, minimum_height: int = 220, maximum_height: int = 300
+    ) -> QScrollArea:
+        """Use the host scrollbar and overflow rules for a bounded modal list."""
+
+        scroll = QScrollArea(self.surface)
+        scroll.setObjectName("vigilDialogScroll")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBar(VigilVerticalScrollBar(scroll))
+        scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        scroll.setMinimumHeight(minimum_height)
+        scroll.setMaximumHeight(maximum_height)
+        self.content_layout.addWidget(scroll)
+        return scroll
+
+    @staticmethod
+    def create_scroll_content(scroll: QScrollArea) -> tuple[QWidget, QVBoxLayout]:
+        content = QWidget(scroll)
+        content.setObjectName("vigilDialogScrollContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(6)
+        # Preserve each row's size hint and let the viewport scroll the overflow.
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
+        return content, layout
+
+    @staticmethod
+    def style_detail_label(label: QLabel) -> QLabel:
+        label.setObjectName("vigilDialogDetail")
+        label.setProperty("dialogTextRole", "detail")
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setWordWrap(True)
+        label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        return label
+
     @staticmethod
     def style_button(button: QPushButton, *, kind: str = "standard") -> QPushButton:
         button.setProperty("vigilDialogButton", True)
@@ -86,6 +130,7 @@ class VigilDialog(QDialog):
         label.setObjectName(object_name)
         label.setTextFormat(Qt.TextFormat.PlainText)
         label.setWordWrap(True)
+        label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.content_layout.addWidget(label)
         return label
 
@@ -111,7 +156,11 @@ class ControllerVigilDialog(VigilDialog):
         *,
         selected_index: int = 0,
     ) -> None:
+        for button in self._controller_buttons:
+            button.removeEventFilter(self)
         self._controller_buttons = list(buttons)
+        for button in self._controller_buttons:
+            button.installEventFilter(self)
         if not self._controller_buttons:
             self._controller_index = 0
             return
@@ -127,18 +176,14 @@ class ControllerVigilDialog(VigilDialog):
 
     def handle_controller_command(self, command: object) -> bool:
         value = getattr(command, "value", command)
-        if not self._controller_buttons:
-            return True
-        if value in {"move_left", "move_up"}:
-            self._controller_index = (self._controller_index - 1) % len(self._controller_buttons)
-            self.sync_controller_focus()
-            return True
-        if value in {"move_right", "move_down"}:
-            self._controller_index = (self._controller_index + 1) % len(self._controller_buttons)
-            self.sync_controller_focus()
-            return True
         if value == "back":
             self.controller_back()
+            return True
+        if value in {"move_left", "move_up"}:
+            self._move_controller_focus(-1)
+            return True
+        if value in {"move_right", "move_down"}:
+            self._move_controller_focus(1)
             return True
         if value == "activate":
             if self._guard.accepts_activation():
@@ -150,13 +195,101 @@ class ControllerVigilDialog(VigilDialog):
         self.reject()
 
     def activate_controller_selection(self) -> None:
-        if self._controller_buttons:
+        if self._normalize_controller_selection():
             self._controller_buttons[self._controller_index].click()
 
     def sync_controller_focus(self) -> None:
-        if not self._controller_buttons:
+        if not self._normalize_controller_selection():
             return
-        self._controller_buttons[self._controller_index].setFocus(Qt.FocusReason.OtherFocusReason)
+        button = self._controller_buttons[self._controller_index]
+        button.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._reveal_button(button)
+
+    def _eligible_controller_button(self, button: QPushButton) -> bool:
+        return controller_target_available(button, self)
+
+    def _normalize_controller_selection(self) -> bool:
+        count = len(self._controller_buttons)
+        for offset in range(count):
+            index = (self._controller_index + offset) % count
+            if self._eligible_controller_button(self._controller_buttons[index]):
+                self._controller_index = index
+                return True
+        return False
+
+    def _move_controller_focus(self, delta: int) -> None:
+        count = len(self._controller_buttons)
+        for offset in range(1, count + 1):
+            index = (self._controller_index + delta * offset) % count
+            if self._eligible_controller_button(self._controller_buttons[index]):
+                self._controller_index = index
+                self.sync_controller_focus()
+                return
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched in self._controller_buttons and event.type() in {
+            QEvent.Type.EnabledChange,
+            QEvent.Type.Hide,
+            QEvent.Type.Show,
+        }:
+            previous_index = self._controller_index
+            focused = self.focusWidget()
+            if (
+                self._normalize_controller_selection()
+                and self._controller_index != previous_index
+                and (focused is None or focused in self._controller_buttons)
+            ):
+                self.sync_controller_focus()
+        if event.type() == QEvent.Type.FocusIn and watched in self._controller_buttons:
+            self._controller_index = self._controller_buttons.index(watched)
+            self._reveal_button(self._controller_buttons[self._controller_index])
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and event.key()
+            in {
+                Qt.Key.Key_Up,
+                Qt.Key.Key_Down,
+                Qt.Key.Key_Left,
+                Qt.Key.Key_Right,
+                Qt.Key.Key_Return,
+                Qt.Key.Key_Enter,
+                Qt.Key.Key_Space,
+            }
+        ):
+            self.keyPressEvent(event)
+            return True
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.controller_back()
+            event.accept()
+            return
+        commands: dict[int, str] = {
+            Qt.Key.Key_Up: "move_up",
+            Qt.Key.Key_Down: "move_down",
+            Qt.Key.Key_Left: "move_left",
+            Qt.Key.Key_Right: "move_right",
+        }
+        command = commands.get(event.key())
+        if command is not None:
+            self.handle_controller_command(command)
+            event.accept()
+            return
+        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space}:
+            self.handle_controller_command("activate")
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _reveal_button(self, button: QPushButton) -> None:
+        parent = button.parentWidget()
+        while parent is not None and parent is not self:
+            if isinstance(parent, QScrollArea):
+                ensure_controller_target_visible(parent, button)
+                return
+            parent = parent.parentWidget()
 
 
 class VigilMessageDialog(ControllerVigilDialog):

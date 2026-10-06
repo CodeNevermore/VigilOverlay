@@ -20,7 +20,7 @@ from vigil_overlay.services.telemetry import (
     TelemetryMetricSnapshot,
     TelemetrySnapshot,
 )
-from vigil_overlay.widgets.registry import WidgetDefinition
+from vigil_overlay.widgets.registry import WidgetDefinition, WidgetItemDefinition
 
 
 class TelemetryHistoryGraph(QWidget):
@@ -83,7 +83,7 @@ class TelemetryHistoryGraph(QWidget):
 class PerformanceWidgetView(QWidget):
     """Metric selector and selected-metric detail panel."""
 
-    fps_options_requested = Signal()
+    items_changed = Signal(object, object)
 
     def __init__(
         self,
@@ -115,6 +115,23 @@ class PerformanceWidgetView(QWidget):
         return tuple(self._metric_buttons)
 
     @property
+    def item_buttons(self) -> tuple[QPushButton, ...]:
+        if self.selected_metric is PerformanceMetric.FPS:
+            return (*self.metric_buttons, self._fps_options)
+        return self.metric_buttons
+
+    @property
+    def item_definitions(self) -> tuple[WidgetItemDefinition, ...]:
+        if self.selected_metric is PerformanceMetric.FPS:
+            return (
+                *self._definition.items,
+                WidgetItemDefinition(
+                    "fps_options", "Choose FPS game", "Choose or manage FPS games.", "computer"
+                ),
+            )
+        return self._definition.items
+
+    @property
     def selected_metric(self) -> PerformanceMetric:
         item = self._definition.items[self._selected_index]
         return self._metric_by_item[item.item_id]
@@ -140,8 +157,11 @@ class PerformanceWidgetView(QWidget):
     def set_selected_metric(self, index: int) -> None:
         if not self._definition.items:
             return
+        previous = self.selected_metric
         self._selected_index = min(max(index, 0), len(self._definition.items) - 1)
         self._refresh_detail()
+        if (previous is PerformanceMetric.FPS) != (self.selected_metric is PerformanceMetric.FPS):
+            self.items_changed.emit(self.item_definitions, self.item_buttons)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -210,8 +230,10 @@ class PerformanceWidgetView(QWidget):
         body.addWidget(detail, 1)
         root.addLayout(body, 1)
         self._fps_options = QPushButton("Choose FPS game / remembered games", self)
+        self._fps_options.setObjectName("compactListItem")
+        self._fps_options.setProperty("itemId", "fps_options")
+        self._fps_options.setAccessibleName("Choose FPS game or manage remembered games")
         self._fps_options.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._fps_options.clicked.connect(lambda checked=False: self.fps_options_requested.emit())
         root.addWidget(self._fps_options)
 
     def _refresh_detail(self) -> None:

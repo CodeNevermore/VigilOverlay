@@ -66,9 +66,7 @@ class ControllerShortcutBinding:
 
     @classmethod
     def from_tokens(cls, values: object) -> ControllerShortcutBinding:
-        if not isinstance(values, list) or not all(
-            isinstance(value, str) for value in values
-        ):
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise ValueError("controller shortcut controls must be an array of strings")
         return cls(tuple(values))
 
@@ -88,4 +86,12 @@ def _control_label(control: str) -> str:
     return f"Extra Button {button_index + 1}"
 
 
-__all__ = ["ControllerShortcutBinding"]
+@dataclass(frozen=True, slots=True)
+class ControllerShortcutCaptureResult:
+    """A captured binding tagged with its originating editor attempt."""
+
+    attempt_id: int
+    binding: ControllerShortcutBinding
+
+
+__all__ = ["ControllerShortcutBinding", "ControllerShortcutCaptureResult"]

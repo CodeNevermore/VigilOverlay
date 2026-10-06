@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from vigil_overlay.core.controller_shortcuts import ControllerShortcutBinding
 from vigil_overlay.services.telemetry import TelemetrySnapshot
 from vigil_overlay.ui.audio_widget import AudioWidgetView
+from vigil_overlay.ui.controls import controller_target_available
 from vigil_overlay.ui.display_widget import DisplayWidgetView
 from vigil_overlay.ui.integrations_widget import IntegrationsWidgetView
 from vigil_overlay.ui.performance_widget import PerformanceWidgetView
@@ -185,6 +186,7 @@ class FocusZone(StrEnum):
 
     WIDGET_STRIP = "widget_strip"
     CONTENT = "content"
+    HOST_ACTIONS = "host_actions"
 
 
 class NavigationOutcome(StrEnum):
@@ -222,6 +224,8 @@ class CompactFocusState:
     selected_widget_id: str
     focus_zone: FocusZone = FocusZone.WIDGET_STRIP
     selected_items: dict[str, int] = field(default_factory=dict)
+    host_action_count: int = 0
+    selected_host_action: int = 0
 
     def __post_init__(self) -> None:
         if not self.widget_ids:
@@ -253,6 +257,8 @@ class CompactFocusState:
 
     @property
     def selected_item_index(self) -> int | None:
+        if self.focus_zone is FocusZone.HOST_ACTIONS:
+            return None
         if self.current_item_count == 0:
             return None
         return self.selected_items[self.selected_widget_id]
@@ -301,6 +307,20 @@ class CompactFocusState:
             self.focus_zone = FocusZone.WIDGET_STRIP
 
     def dispatch(self, command: NavigationCommand) -> NavigationOutcome:
+        if self.focus_zone is FocusZone.HOST_ACTIONS and command in {
+            NavigationCommand.MOVE_LEFT,
+            NavigationCommand.MOVE_RIGHT,
+        }:
+            previous = self.selected_host_action
+            delta = -1 if command is NavigationCommand.MOVE_LEFT else 1
+            self.selected_host_action = min(
+                max(previous + delta, 0), max(self.host_action_count - 1, 0)
+            )
+            return (
+                NavigationOutcome.FOCUS_CHANGED
+                if previous != self.selected_host_action
+                else (NavigationOutcome.NO_CHANGE)
+            )
         if command is NavigationCommand.MOVE_LEFT:
             return self._move_widget(-1)
         if command is NavigationCommand.MOVE_RIGHT:
@@ -330,6 +350,15 @@ class CompactFocusState:
         return NavigationOutcome.WIDGET_CHANGED if changed else NavigationOutcome.FOCUS_CHANGED
 
     def _move_vertical(self, delta: int) -> NavigationOutcome:
+        if self.focus_zone is FocusZone.HOST_ACTIONS:
+            if delta > 0:
+                self.focus_zone = FocusZone.WIDGET_STRIP
+                return NavigationOutcome.FOCUS_CHANGED
+            return NavigationOutcome.NO_CHANGE
+        if self.focus_zone is FocusZone.WIDGET_STRIP and delta < 0 and self.host_action_count:
+            self.focus_zone = FocusZone.HOST_ACTIONS
+            self.selected_host_action = 0
+            return NavigationOutcome.FOCUS_CHANGED
         if self.current_item_count == 0:
             self.focus_zone = FocusZone.WIDGET_STRIP
             return NavigationOutcome.NO_CHANGE
@@ -352,6 +381,12 @@ class CompactFocusState:
         return NavigationOutcome.ITEM_CHANGED
 
     def _activate(self) -> NavigationOutcome:
+        if self.focus_zone is FocusZone.HOST_ACTIONS:
+            return (
+                NavigationOutcome.ITEM_ACTIVATED
+                if self.host_action_count
+                else (NavigationOutcome.NO_CHANGE)
+            )
         if self.focus_zone is FocusZone.WIDGET_STRIP:
             if self.current_item_count == 0:
                 return NavigationOutcome.NO_CHANGE
@@ -362,7 +397,7 @@ class CompactFocusState:
         return NavigationOutcome.ITEM_ACTIVATED
 
     def _back(self) -> NavigationOutcome:
-        if self.focus_zone is FocusZone.CONTENT:
+        if self.focus_zone in {FocusZone.CONTENT, FocusZone.HOST_ACTIONS}:
             self.focus_zone = FocusZone.WIDGET_STRIP
             return NavigationOutcome.FOCUS_CHANGED
         return NavigationOutcome.HIDE_REQUESTED
@@ -488,6 +523,9 @@ class NavigationShell(QWidget):
         self._item_buttons: dict[str, list[QPushButton]] = {}
         self._secondary_action_buttons: dict[str, dict[int, QPushButton]] = {}
         self._secondary_action_focus: tuple[str, int] | None = None
+        self._host_action_buttons: tuple[QPushButton, ...] = ()
+        self._visible_host_actions: tuple[QPushButton, ...] = ()
+        self._host_actions_suspended = False
         self._page_indexes: dict[str, int] = {}
         self._page_scrollers: dict[str, QScrollArea] = {}
         self._panel_size_hint_refresh_pending = False
@@ -538,11 +576,13 @@ class NavigationShell(QWidget):
 
     @property
     def selected_item_index(self) -> int | None:
+        if self.focus_zone is FocusZone.HOST_ACTIONS:
+            return None
         return self._state.selected_item_index
 
     @property
     def selected_item_id(self) -> str | None:
-        index = self._state.selected_item_index
+        index = self.selected_item_index
         if index is None:
             return None
         return self._definitions[self.selected_widget_id].items[index].item_id
@@ -655,6 +695,12 @@ class NavigationShell(QWidget):
         """
 
         if isinstance(watched, QWidget):
+            if watched in self._host_action_buttons and event.type() in {
+                QEvent.Type.Show,
+                QEvent.Type.Hide,
+                QEvent.Type.EnabledChange,
+            }:
+                self._refresh_host_actions()
             widget_id = watched.property("hostAdaptiveWidgetId")
             if (
                 isinstance(widget_id, str)
@@ -732,6 +778,8 @@ class NavigationShell(QWidget):
             selected_widget_id=target,
             focus_zone=focus_zone,
             selected_items=dict(previous.selected_items),
+            host_action_count=len(self._visible_host_actions),
+            selected_host_action=previous.selected_host_action,
         )
         self._set_button_visibility(widget_ids)
         self._sync_strip_viewport_width(widget_ids)
@@ -800,8 +848,9 @@ class NavigationShell(QWidget):
         self._item_buttons[widget_id] = list(buttons)
         self._state.set_item_count(widget_id, len(items))
         for index, button in enumerate(buttons):
-            if button in previous_buttons:
+            if button in previous_buttons or button.property("navigationItemOwner") == widget_id:
                 continue
+            button.setProperty("navigationItemOwner", widget_id)
             button.clicked.connect(
                 lambda checked=False, target_widget=widget_id, item_index=index: self._item_clicked(
                     target_widget, item_index
@@ -816,6 +865,37 @@ class NavigationShell(QWidget):
 
         self._apply_state(persist_widget=False)
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+    def register_host_actions(self, buttons: tuple[QPushButton, ...]) -> None:
+        for button in self._host_action_buttons:
+            button.removeEventFilter(self)
+        self._host_action_buttons = buttons
+        for button in buttons:
+            button.installEventFilter(self)
+        self._refresh_host_actions()
+
+    def suspend_host_action_focus(self, suspended: bool) -> None:
+        self._host_actions_suspended = suspended
+        self._apply_state(persist_widget=False)
+
+    def _refresh_host_actions(self) -> None:
+        previous = None
+        if self._visible_host_actions:
+            previous = self._visible_host_actions[self._state.selected_host_action]
+        self._visible_host_actions = tuple(
+            button
+            for button in self._host_action_buttons
+            if controller_target_available(button, button.window())
+        )
+        self._state.host_action_count = len(self._visible_host_actions)
+        self._state.selected_host_action = (
+            self._visible_host_actions.index(previous)
+            if previous in self._visible_host_actions
+            else 0
+        )
+        if not self._visible_host_actions and self.focus_zone is FocusZone.HOST_ACTIONS:
+            self._state.focus_zone = FocusZone.WIDGET_STRIP
+        self._apply_state(persist_widget=False)
 
     def _selected_secondary_action_button(self) -> QPushButton | None:
         if self._state.focus_zone is not FocusZone.CONTENT:
@@ -835,6 +915,22 @@ class NavigationShell(QWidget):
         )
 
     def handle_command(self, command: NavigationCommand) -> NavigationResult:
+        if command is NavigationCommand.MOVE_UP and self.focus_zone is FocusZone.WIDGET_STRIP:
+            self._refresh_host_actions()
+        if self.focus_zone is FocusZone.HOST_ACTIONS and command in {
+            NavigationCommand.MOVE_LEFT,
+            NavigationCommand.MOVE_RIGHT,
+            NavigationCommand.ACTIVATE,
+        }:
+            self._refresh_host_actions()
+            if self._visible_host_actions:
+                if command is NavigationCommand.ACTIVATE:
+                    self._visible_host_actions[self._state.selected_host_action].click()
+                    return self._result_for_outcome(NavigationOutcome.ITEM_ACTIVATED)
+                outcome = self._state.dispatch(command)
+                self._apply_state(persist_widget=False)
+                return self._result_for_outcome(outcome)
+            return self._result_for_outcome(NavigationOutcome.NO_CHANGE)
         if command in {
             NavigationCommand.PREVIOUS_WIDGET,
             NavigationCommand.NEXT_WIDGET,
@@ -1223,8 +1319,10 @@ class NavigationShell(QWidget):
         if definition.view_kind is WidgetViewKind.PERFORMANCE:
             view = PerformanceWidgetView(definition, self._telemetry_snapshot, self._stack)
             self._performance_view = view
-            view.fps_options_requested.connect(
-                lambda: self.item_activated.emit(definition.widget_id, "fps")
+            view.items_changed.connect(
+                lambda items, buttons, widget_id=definition.widget_id: (
+                    self._replace_custom_view_items(widget_id, items, buttons)
+                )
             )
             performance_buttons = list(view.metric_buttons)
             for index, button in enumerate(performance_buttons):
@@ -1472,6 +1570,22 @@ class NavigationShell(QWidget):
             self._secondary_action_focus = None
         self._stack.setCurrentIndex(self._page_indexes[widget_id])
 
+        selected_host = (
+            self._visible_host_actions[self._state.selected_host_action]
+            if self._visible_host_actions
+            else None
+        )
+        for button in self._host_action_buttons:
+            self._set_dynamic_property(
+                button,
+                "navigationFocus",
+                (
+                    self.focus_zone is FocusZone.HOST_ACTIONS
+                    and button is selected_host
+                    and not self._host_actions_suspended
+                ),
+            )
+
         for current_widget_id, button in self._buttons.items():
             active = current_widget_id == widget_id
             strip_focus = active and self._state.focus_zone is FocusZone.WIDGET_STRIP
@@ -1494,8 +1608,13 @@ class NavigationShell(QWidget):
                 )
                 self._set_dynamic_property(action_button, "navigationFocus", action_focus)
 
-        if self._performance_view is not None and widget_id == "performance":
-            self._performance_view.set_selected_metric(selected_index or 0)
+        if (
+            self._performance_view is not None
+            and widget_id == "performance"
+            and selected_index is not None
+            and selected_index < len(self._performance_view.metric_buttons)
+        ):
+            self._performance_view.set_selected_metric(selected_index)
 
         self._ensure_selected_widget_visible()
         self._ensure_selected_item_visible(widget_id)

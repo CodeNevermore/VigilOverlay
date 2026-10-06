@@ -209,6 +209,14 @@ class OverlayNavigationCoordinator(QObject):
     def handle_command(self, command: NavigationCommand) -> NavigationResult:
         """Route one device-neutral command to the active interaction layer."""
 
+        if self._dialogs.handle_controller_command(command):
+            return self.current_result()
+
+        settings_view = self._navigation.settings_view
+        if settings_view is not None and settings_view.interaction_active:
+            settings_view.handle_controller_command(command)
+            return self.current_result()
+
         if command in {
             NavigationCommand.PREVIOUS_WIDGET,
             NavigationCommand.NEXT_WIDGET,
@@ -221,14 +229,6 @@ class OverlayNavigationCoordinator(QObject):
                 self._close_selected_widget()
             elif command in {NavigationCommand.BACK, NavigationCommand.OPEN_OPTIONS}:
                 self._hide_options()
-            return self.current_result()
-
-        if self._dialogs.handle_controller_command(command):
-            return self.current_result()
-
-        settings_view = self._navigation.settings_view
-        if settings_view is not None and settings_view.interaction_active:
-            settings_view.handle_controller_command(command)
             return self.current_result()
 
         integrations_view = self._navigation.integrations_view
@@ -349,9 +349,16 @@ class OverlayNavigationCoordinator(QObject):
         self._navigation.restore_focus()
 
     def _prepare_activation(self, source: ModalInputSource) -> None:
+        settings_view = self._navigation.settings_view
+        if (
+            self._dialogs.interaction_active
+            or (settings_view is not None and settings_view.interaction_active)
+            or self._navigation.focus_zone is FocusZone.HOST_ACTIONS
+        ):
+            return
         if (
             self._navigation.selected_widget_id == "performance"
-            and self._navigation.selected_item_id == "fps"
+            and self._navigation.selected_item_id in {"fps", "fps_options"}
             and self._dialogs.fps_options_dialog is None
         ):
             self._dialogs.set_next_fps_input_source(source)

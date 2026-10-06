@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import PureWindowsPath
 
-from PySide6.QtWidgets import QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QPushButton, QWidget
 
 from vigil_overlay.services.fps import FpsSelectionSnapshot, FpsTarget
 from vigil_overlay.ui.dialog_surface import ControllerVigilDialog
@@ -37,11 +37,7 @@ class FpsOptionsDialog(ControllerVigilDialog):
         self._status = self.add_detail("")
         self._error = self.add_error()
         self._error.hide()
-        self._scroll = QScrollArea(self.surface)
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setMinimumHeight(220)
-        self._scroll.setMaximumHeight(300)
-        self.content_layout.addWidget(self._scroll)
+        self._scroll = self.create_scroll_area()
         self._refresh_button = QPushButton("Refresh running games", self.surface)
         self.style_button(self._refresh_button)
         self._refresh_button.clicked.connect(self.refresh)
@@ -65,10 +61,7 @@ class FpsOptionsDialog(ControllerVigilDialog):
         old = self._scroll.takeWidget()
         if old is not None:
             old.deleteLater()
-        content = QWidget(self._scroll)
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(6)
+        content, layout = self.create_scroll_content(self._scroll)
         buttons: list[QPushButton] = []
         mode = "Manual" if snapshot.manual_target is not None else "Automatic"
         active = snapshot.active_target
@@ -77,7 +70,12 @@ class FpsOptionsDialog(ControllerVigilDialog):
         )
 
         def add_action(
-            label: str, action: str, value: FpsTarget | str | None = None, *, enabled: bool = True
+            label: str,
+            action: str,
+            value: FpsTarget | str | None = None,
+            *,
+            enabled: bool = True,
+            detail: str = "",
         ) -> None:
             button = QPushButton(label, content)
             button.setProperty("fpsAction", action)
@@ -95,6 +93,8 @@ class FpsOptionsDialog(ControllerVigilDialog):
                 )
             )
             layout.addWidget(button)
+            if detail:
+                layout.addWidget(self.style_detail_label(QLabel(detail, content)))
             if enabled:
                 buttons.append(button)
 
@@ -103,17 +103,21 @@ class FpsOptionsDialog(ControllerVigilDialog):
         for option in snapshot.candidates:
             target = option.target
             add_action(
-                f"{target.executable_name} (PID {target.process_id})\n{option.reason}",
+                f"{target.executable_name} (PID {target.process_id})",
                 "select",
                 target,
+                detail=option.reason,
             )
             if target.executable_path is not None:
-                path_label = QLabel(target.executable_path, content)
-                path_label.setWordWrap(True)
+                path_label = self.style_detail_label(QLabel(target.executable_path, content))
                 layout.addWidget(path_label)
                 add_action(f"Ignore {target.executable_name}", "ignore", target.executable_path)
         if not snapshot.candidates:
-            layout.addWidget(QLabel("No eligible running game or app was found.", content))
+            layout.addWidget(
+                self.style_detail_label(
+                    QLabel("No eligible running game or app was found.", content)
+                )
+            )
         page_size = 8
         page_count = max(
             1, (max(len(snapshot.learned_paths), len(snapshot.ignored_paths)) + 7) // 8
@@ -125,10 +129,9 @@ class FpsOptionsDialog(ControllerVigilDialog):
             ("Ignored apps", snapshot.ignored_paths, ("restore",)),
         ):
             if paths:
-                layout.addWidget(QLabel(heading, content))
+                layout.addWidget(self.style_detail_label(QLabel(heading, content)))
             for path in paths[page_start : page_start + page_size]:
-                label = QLabel(path, content)
-                label.setWordWrap(True)
+                label = self.style_detail_label(QLabel(path, content))
                 layout.addWidget(label)
                 for action in actions:
                     add_action(f"{action.title()} {PureWindowsPath(path).name}", action, path)
@@ -164,14 +167,6 @@ class FpsOptionsDialog(ControllerVigilDialog):
         else:
             self._error.setText(detail)
             self._error.show()
-
-    def sync_controller_focus(self) -> None:
-        super().sync_controller_focus()
-        if self._controller_buttons:
-            button = self._controller_buttons[self._controller_index]
-            content = self._scroll.widget()
-            if content is not None and content.isAncestorOf(button):
-                self._scroll.ensureWidgetVisible(button)
 
 
 __all__ = ["FpsActionCallback", "FpsOptionsDialog", "FpsSnapshotCallback"]

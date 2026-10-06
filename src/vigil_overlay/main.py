@@ -67,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--reset-fps-sessions", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -77,7 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     instance_guard = None
     if not args.diagnose:
         instance_guard = create_platform_single_instance_guard()
-        wait_milliseconds = 10_000 if args.wait_for_instance_exit else 0
+        wait_milliseconds = 30_000 if args.wait_for_instance_exit else 0
         if not instance_guard.acquire(timeout_milliseconds=wait_milliseconds):
             if not args.wait_for_instance_exit:
                 instance_guard.request_activation()
@@ -131,6 +132,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_diagnostics(paths, config_path, config.schema_version)
             return 0
 
+        fps_reset_failure = None
+        if args.safe_mode or args.reset_fps_sessions:
+            from vigil_overlay.services.presentmon_cleanup import reset_vigil_fps_sessions
+
+            fps_reset_failure = reset_vigil_fps_sessions()
+
         try:
             from vigil_overlay.application import run_gui
         except ImportError as exc:
@@ -143,6 +150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             safe_mode=args.safe_mode,
             read_only_config=args.safe_mode,
             single_instance_guard=instance_guard,
+            fps_reset_failure=fps_reset_failure,
         )
     except (VigilOverlayError, OSError, ValueError) as exc:
         logging.getLogger("vigil_overlay").exception("Application startup failed: %s", exc)
@@ -160,7 +168,7 @@ def _console_stream_available() -> bool:
         return False
     try:
         return bool(stream.isatty())
-    except (AttributeError, OSError, ValueError):
+    except AttributeError, OSError, ValueError:
         return False
 
 

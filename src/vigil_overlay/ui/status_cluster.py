@@ -67,6 +67,7 @@ class OverlayStatusClusterController(QObject):
         hide_button.setAccessibleName("Hide Vigil Overlay")
         hide_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         hide_button.clicked.connect(hide_callback)
+        self.hide_button = hide_button
 
         layout.addWidget(self.microphone_label)
         layout.addWidget(self.power_label)

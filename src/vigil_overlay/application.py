@@ -98,6 +98,7 @@ from vigil_overlay.services.raw_controller import (
 from vigil_overlay.services.recovery import (
     RecoveryProcessLauncher,
     launch_recovery_process,
+    normal_mode_restart_command,
     safe_mode_restart_command,
 )
 from vigil_overlay.services.startup import (
@@ -162,6 +163,7 @@ class VigilApplication:
         safe_mode_restart_launcher: RecoveryProcessLauncher | None = None,
         single_instance_guard: SingleInstanceGuard | None = None,
         startup_safety_warning: str | None = None,
+        fps_reset_failure: str | None = None,
     ) -> None:
         if foreground_claim_timeout_seconds <= 0:
             raise ValueError("foreground_claim_timeout_seconds must be positive")
@@ -209,6 +211,7 @@ class VigilApplication:
         self._hotkey_capture_active = False
         self._startup_hotkey_failure: HotkeyRegistration | None = None
         self._startup_safety_warning = startup_safety_warning
+        self._fps_reset_failure = fps_reset_failure
         self._quitting = False
         self._telemetry_service = telemetry_service or create_platform_telemetry_service()
         self._fps_service = fps_service or create_platform_fps_service()
@@ -297,6 +300,7 @@ class VigilApplication:
             hotkey_probe_callback=self._probe_global_hotkey,
             controller_shortcut_change_callback=self._change_controller_shortcut,
             controller_shortcut_capture_callback=(self._set_controller_shortcut_capture_active),
+            controller_shortcut_editing_callback=self._set_controller_shortcut_editing,
             power_capabilities_callback=self._power_control_service.capabilities,
             power_action_callback=self._power_control_service.execute,
             startup_change_callback=self._change_start_with_windows,
@@ -581,11 +585,16 @@ class VigilApplication:
         finally:
             self._hotkey_probe_service.stop()
 
-    def _set_controller_shortcut_capture_active(self, active: bool) -> None:
+    def _set_controller_shortcut_editing(self, active: bool) -> None:
+        self._controller_shortcut_service.set_editing(active)
+        if not active:
+            self._controller_service.require_neutral_before_commands()
+
+    def _set_controller_shortcut_capture_active(self, active: bool) -> int | None:
         if active:
-            self._controller_shortcut_service.begin_capture()
+            attempt_id = self._controller_shortcut_service.begin_capture()
             self._guide_button_service.start()
-            return
+            return attempt_id
         self._controller_shortcut_service.cancel_capture()
         self._controller_service.require_neutral_before_commands()
         if not (
@@ -593,6 +602,7 @@ class VigilApplication:
             or "gameinput:guide" in self._config.controller.shortcut_controls
         ):
             self._guide_button_service.deactivate()
+        return None
 
     def _change_controller_shortcut(self, binding: ControllerShortcutBinding) -> tuple[bool, str]:
         if self._read_only_config:
@@ -1056,6 +1066,8 @@ class VigilApplication:
         self.toggle_overlay(source="global-hotkey")
 
     def _toggle_overlay_from_controller_shortcut(self) -> None:
+        if self._controller_shortcut_service.editing:
+            return
         self.toggle_overlay(source="controller-shortcut")
 
     def toggle_overlay(self, *, source: str = "direct") -> None:
@@ -1139,21 +1151,21 @@ class VigilApplication:
         return False
 
     def _restart_in_safe_mode(self) -> tuple[bool, str]:
-        if self._safe_mode:
-            return False, "Vigil is already running in Safe Mode."
+        """Restart all host services in the other mode, retaining saved settings."""
 
-        command = safe_mode_restart_command()
+        mode = "normal mode" if self._safe_mode else "Safe Mode"
+        command = normal_mode_restart_command() if self._safe_mode else safe_mode_restart_command()
         self._teardown_hotkey()
         try:
             self._safe_mode_restart_launcher(command)
         except OSError as exc:
             hotkey_active = self._setup_hotkey()
             self._sync_background_availability(hotkey_active=hotkey_active)
-            _LOGGER.exception("Could not restart Vigil in Safe Mode")
-            return False, f"Could not restart Vigil in Safe Mode: {exc}"
+            _LOGGER.exception("Could not restart Vigil in %s", mode)
+            return False, f"Could not restart Vigil in {mode}: {exc}"
 
         self.quit()
-        return True, "Restarting Vigil in Safe Mode."
+        return True, f"Restarting Vigil in {mode}."
 
     def _reset_window_position_from_settings(self) -> tuple[bool, str]:
         self.reset_window_position()
@@ -1235,6 +1247,7 @@ class VigilApplication:
             self._guide_button_service.start()
 
     def _shutdown(self, reason: str, *, close_window: bool) -> None:
+        self.window.cancel_active_editor()
         self._service_lifecycle.stop(reason)
         if close_window:
             self.window.allow_close()
@@ -1255,6 +1268,8 @@ class VigilApplication:
             QTimer.singleShot(0, self._show_startup_hotkey_failure)
         if self._startup_safety_warning is not None:
             QTimer.singleShot(0, self._show_startup_safety_warning)
+        if self._fps_reset_failure is not None:
+            QTimer.singleShot(0, self._show_fps_reset_failure)
         QTimer.singleShot(1_500, self._update_check_service.check)
         return self.qt_app.exec()
 
@@ -1265,6 +1280,7 @@ class VigilApplication:
             and not self._safe_mode
             and self._startup_hotkey_failure is None
             and self._startup_safety_warning is None
+            and self._fps_reset_failure is None
         )
         if should_start_minimized:
             _LOGGER.info("Vigil started minimized and is available through background controls")
@@ -1289,6 +1305,10 @@ class VigilApplication:
         if detail is not None:
             self.window.show_startup_safety_warning(detail)
 
+    def _show_fps_reset_failure(self) -> None:
+        if self._fps_reset_failure is not None:
+            self.window.show_fps_runtime_failure(self._fps_reset_failure)
+
     def _before_quit(self) -> None:
         self._shutdown("Qt application shutdown", close_window=not self._quitting)
         if not self._read_only_config:
@@ -1306,6 +1326,7 @@ def run_gui(
     safe_mode: bool = False,
     read_only_config: bool = False,
     single_instance_guard: SingleInstanceGuard | None = None,
+    fps_reset_failure: str | None = None,
 ) -> int:
     """Assemble platform services and run the Qt application."""
 
@@ -1326,7 +1347,11 @@ def run_gui(
         game_provider_registry=game_provider_registry,
         integration_manager=integration_manager,
         single_instance_guard=single_instance_guard,
+        fps_service=(
+            UnavailableFpsService(detail=fps_reset_failure) if fps_reset_failure else None
+        ),
         startup_safety_warning=(retirement.detail if retirement.warning_required else None),
+        fps_reset_failure=fps_reset_failure,
     )
     _LOGGER.info(
         "Starting PySide6 shell, theme=%s, safe_mode=%s",

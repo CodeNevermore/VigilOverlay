@@ -32,6 +32,9 @@ PrivilegesRequired=admin
 WizardStyle=modern
 LicenseFile={#AppSourceDir}\licenses\third_party\Microsoft.GameInput\LICENSE.txt
 UninstallDisplayIcon={app}\{#MyAppExeName}
+CloseApplications=force
+CloseApplicationsFilter=VigilOverlay.exe,PresentMon-*-x64.exe
+RestartApplications=no
 
 [Files]
 Source: "{#AppSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -49,6 +52,40 @@ Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\VigilOverlay"" /F"; 
 [Code]
 var
   PrerequisiteRestartRequired: Boolean;
+
+procedure RegisterExtraCloseApplicationsResources;
+var
+  CollectorDir: String;
+  CollectorPath: String;
+  FindRec: TFindRec;
+begin
+  RegisterExtraCloseApplicationsResource(
+#if VER < EncodeVer(7, 0, 0)
+    True,
+#endif
+    ExpandConstant('{app}\{#MyAppExeName}')
+  );
+  CollectorDir := ExpandConstant('{app}\vigil_overlay\resources\third_party\presentmon\bin');
+  if FindFirst(CollectorDir + '\PresentMon-*-x64.exe', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+        begin
+          CollectorPath := CollectorDir + '\' + FindRec.Name;
+          RegisterExtraCloseApplicationsResource(
+#if VER < EncodeVer(7, 0, 0)
+            True,
+#endif
+            CollectorPath
+          );
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
 
 function InstallGameInput(var NeedsRestart: Boolean): String;
 var

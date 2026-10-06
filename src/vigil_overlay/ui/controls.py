@@ -39,6 +39,25 @@ def repolish_widget(widget: QWidget) -> None:
     widget.update()
 
 
+def controller_target_available(widget: QWidget, boundary: QWidget) -> bool:
+    """Exclude disabled or explicitly hidden targets, including their ancestors.
+
+    Newly constructed child controls can await their first layout/show event.
+    They remain eligible when their owner registers focus before showing itself.
+    """
+
+    if not widget.isEnabled():
+        return False
+    ancestor: QWidget | None = widget
+    while ancestor is not None and ancestor is not boundary:
+        if ancestor.isHidden() and ancestor.testAttribute(
+            Qt.WidgetAttribute.WA_WState_ExplicitShowHide
+        ):
+            return False
+        ancestor = ancestor.parentWidget()
+    return ancestor is boundary
+
+
 class VigilToggleSwitch(QCheckBox):
     """Non-focusable, host-owned toggle indicator with one canonical geometry."""
 
@@ -54,14 +73,8 @@ class VigilToggleSwitch(QCheckBox):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         palette = self.palette()
-        group = (
-            QPalette.ColorGroup.Active
-            if self.isEnabled()
-            else QPalette.ColorGroup.Disabled
-        )
-        track_role = (
-            QPalette.ColorRole.Highlight if self.isChecked() else QPalette.ColorRole.Mid
-        )
+        group = QPalette.ColorGroup.Active if self.isEnabled() else QPalette.ColorGroup.Disabled
+        track_role = QPalette.ColorRole.Highlight if self.isChecked() else QPalette.ColorRole.Mid
         thumb_role = (
             QPalette.ColorRole.HighlightedText
             if self.isChecked()
@@ -99,9 +112,7 @@ class VigilSelectorButton(QPushButton):
             return
         self.setProperty("selectorOpen", opened)
         self.setAccessibleDescription(
-            "Dropdown open. Activate to close."
-            if opened
-            else "Dropdown closed. Activate to open."
+            "Dropdown open. Activate to close." if opened else "Dropdown closed. Activate to open."
         )
         repolish_widget(self)
 
@@ -135,6 +146,7 @@ __all__ = [
     "SelectorToggleAction",
     "VigilSelectorButton",
     "VigilToggleSwitch",
+    "controller_target_available",
     "repolish_widget",
     "selector_toggle_action",
 ]

@@ -258,7 +258,7 @@ def built_in_widget_definitions() -> tuple[WidgetDefinition, ...]:
                 WidgetItemDefinition(
                     "safe_mode",
                     "Safe Mode",
-                    "Restart with temporary defaults; saved settings stay unchanged.",
+                    "Restart Vigil and reset FPS. Turn off Safe Mode to restore saved settings.",
                     "controls",
                 ),
                 WidgetItemDefinition(

@@ -91,7 +91,8 @@ HotkeyChangeCallback = Callable[[str], tuple[bool, str]]
 HotkeyCaptureCallback = Callable[[bool], None]
 HotkeyProbeCallback = Callable[[str], tuple[bool, str]]
 ControllerShortcutChangeCallback = Callable[[ControllerShortcutBinding], tuple[bool, str]]
-ControllerShortcutCaptureCallback = Callable[[bool], None]
+ControllerShortcutCaptureCallback = Callable[[bool], int | None]
+ControllerShortcutEditingCallback = Callable[[bool], None]
 StartupChangeCallback = Callable[[bool], tuple[bool, str]]
 BackgroundChangeCallback = Callable[[bool], tuple[bool, str]]
 RecoveryActionCallback = Callable[[], tuple[bool, str]]
@@ -136,6 +137,7 @@ class OverlayWindow(QWidget):
         hotkey_probe_callback: HotkeyProbeCallback | None = None,
         controller_shortcut_change_callback: (ControllerShortcutChangeCallback | None) = None,
         controller_shortcut_capture_callback: (ControllerShortcutCaptureCallback | None) = None,
+        controller_shortcut_editing_callback: (ControllerShortcutEditingCallback | None) = None,
         power_capabilities_callback: PowerCapabilitiesCallback | None = None,
         power_action_callback: PowerActionCallback | None = None,
         startup_change_callback: StartupChangeCallback | None = None,
@@ -159,6 +161,7 @@ class OverlayWindow(QWidget):
         self._hotkey_probe_callback = hotkey_probe_callback
         self._controller_shortcut_change_callback = controller_shortcut_change_callback
         self._controller_shortcut_capture_callback = controller_shortcut_capture_callback
+        self._controller_shortcut_editing_callback = controller_shortcut_editing_callback
         self._startup_change_callback = startup_change_callback
         self._startup_available = startup_available
         self._start_minimized_available = start_minimized_available
@@ -398,6 +401,12 @@ class OverlayWindow(QWidget):
         self._options_popup.hide()
         self._sync_widget_options()
 
+        self._options_button.setProperty("hostActionId", "options")
+        self._status_cluster_controller.hide_button.setProperty("hostActionId", "hide")
+        self._navigation.register_host_actions(
+            (self._options_button, self._status_cluster_controller.hide_button)
+        )
+
         # Retain diagnostics without adding desktop-style status text to the compact panel.
         self._hotkey_label = QLabel(self)
         self._hotkey_label.setObjectName("compactHotkeyStatus")
@@ -439,10 +448,15 @@ class OverlayWindow(QWidget):
     def set_hotkey_combination(self, combination: str) -> None:
         self._navigation.set_hotkey_combination(combination)
 
-    def deliver_controller_shortcut(self, binding: ControllerShortcutBinding) -> None:
+    def deliver_controller_shortcut(self, result: object) -> None:
         settings_view = self._navigation.settings_view
         if settings_view is not None:
-            settings_view.deliver_controller_shortcut(binding)
+            settings_view.deliver_controller_shortcut(result)
+
+    def cancel_active_editor(self) -> None:
+        settings_view = self._navigation.settings_view
+        if settings_view is not None:
+            settings_view.cancel_active_dialog()
 
     def set_telemetry_snapshot(self, snapshot: TelemetrySnapshot) -> None:
         self._navigation.set_telemetry_snapshot(snapshot)
@@ -630,7 +644,7 @@ class OverlayWindow(QWidget):
             if game is not None:
                 self.game_launch_requested.emit(game)
             return
-        if widget_id == "performance" and item_id == "fps":
+        if widget_id == "performance" and item_id in {"fps", "fps_options"}:
             self.fps_options_requested.emit()
             return
         if widget_id == "widgets":
@@ -654,6 +668,7 @@ class OverlayWindow(QWidget):
                 settings_view.open_controller_shortcut_editor(
                     self._controller_shortcut_change_callback,
                     self._controller_shortcut_capture_callback,
+                    self._controller_shortcut_editing_callback,
                 )
                 self._restore_navigation_focus()
             return
@@ -1030,6 +1045,7 @@ class OverlayWindow(QWidget):
         self._position_widget_options_popup()
         self._options_popup.show()
         self._options_popup.raise_()
+        self._navigation.suspend_host_action_focus(True)
         self._set_navigation_focus(self._close_widget_button, True)
 
     def _position_widget_options_popup(self) -> None:
@@ -1052,6 +1068,7 @@ class OverlayWindow(QWidget):
     def _hide_widget_options(self) -> None:
         self._set_navigation_focus(self._close_widget_button, False)
         self._options_popup.hide()
+        self._navigation.suspend_host_action_focus(False)
 
     def _sync_widget_options(self) -> None:
         definition = self._navigation.widget_definition(self._navigation.selected_widget_id)
@@ -1149,6 +1166,7 @@ class OverlayWindow(QWidget):
         self._sync_controller_mouse_cursor()
 
     def request_hide(self) -> None:
+        self.cancel_active_editor()
         self._announce_input_release()
         self._navigation_coordinator.cancel_pending_keyboard_back()
         integrations_view = self._navigation.integrations_view
@@ -1194,6 +1212,7 @@ class OverlayWindow(QWidget):
         self.input_release_requested.emit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.cancel_active_editor()
         self._announce_input_release()
         integrations_view = self._navigation.integrations_view
         if integrations_view is not None and integrations_view.interaction_active:
@@ -1233,6 +1252,7 @@ class OverlayWindow(QWidget):
         QTimer.singleShot(0, self._apply_panel_geometry)
 
     def hideEvent(self, event: QHideEvent) -> None:
+        self.cancel_active_editor()
         self._announce_input_release()
         self._status_cluster_controller.stop()
         self._backdrop.hide()

@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 from typing import Final, Protocol, TextIO
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, Signal
 
@@ -1085,7 +1086,11 @@ class PresentMonFpsService(QObject):
         while not stop_event.is_set():
             if self._target_liveness_probe is not None and not self._target_is_alive(target):
                 return _CaptureOutcome.TARGET_EXITED
-            command = build_presentmon_command(executable, target)
+            command = build_presentmon_command(
+                executable,
+                target,
+                terminate_on_proc_exit=self._target_liveness_probe is None,
+            )
             try:
                 process = _start_hidden_process(command)
             except OSError as exc:
@@ -1805,13 +1810,20 @@ class PresentMonFpsService(QObject):
 
 
 class UnavailableFpsService(QObject):
-    """No-op FPS service for unsupported platforms."""
+    """No-op FPS service for unsupported platforms or incomplete recovery."""
 
     metric_ready = Signal(object)
     failure_ready = Signal(str)
 
+    def __init__(self, *, detail: str | None = None) -> None:
+        super().__init__()
+        self._detail = detail
+
     def start(self) -> None:
-        return
+        if self._detail:
+            self.metric_ready.emit(
+                FpsMetricUpdate(_unavailable_fps_metric((), "FPS RESET REQUIRED"), None)
+            )
 
     def stop(self) -> None:
         return
@@ -1868,10 +1880,12 @@ def create_platform_fps_service(
     )
 
 
-def build_presentmon_command(executable: Path, target: FpsTarget) -> list[str]:
+def build_presentmon_command(
+    executable: Path, target: FpsTarget, *, terminate_on_proc_exit: bool = True
+) -> list[str]:
     """Build the bounded no-shell PresentMon console invocation."""
 
-    return [
+    command = [
         str(executable),
         "--process_id",
         str(target.process_id),
@@ -1880,10 +1894,11 @@ def build_presentmon_command(executable: Path, target: FpsTarget) -> list[str]:
         "--v2_metrics",
         "--exclude_dropped",
         "--session_name",
-        f"VigilOverlayFPS-{target.process_id}",
-        "--stop_existing_session",
-        "--terminate_on_proc_exit",
+        f"VigilOverlayFPS-{os.getpid()}-{uuid4().hex}",
     ]
+    if terminate_on_proc_exit:
+        command.append("--terminate_on_proc_exit")
+    return command
 
 
 def _eligible_local_fallback(target: FpsTarget) -> bool:
@@ -1944,13 +1959,59 @@ def _read_stderr_lines(
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
     try:
-        process.terminate()
-        process.wait(timeout=1.0)
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=1.0)
     except OSError, subprocess.TimeoutExpired:
         try:
             process.kill()
-        except OSError:
-            return
+            process.wait(timeout=1.0)
+        except OSError, subprocess.TimeoutExpired:
+            _LOGGER.warning("PresentMon collector did not stop within its shutdown deadline")
+    finally:
+        _stop_owned_trace_session(process)
+
+
+def _stop_owned_trace_session(process: subprocess.Popen[str]) -> None:
+    """Release this invocation's ETW session even after Windows force-termination."""
+
+    args = getattr(process, "args", ())
+    if os.name != "nt" or not isinstance(args, (list, tuple)):
+        return
+    if "--session_name" not in args:
+        return
+    index = args.index("--session_name") + 1
+    if index >= len(args):
+        return
+    session_name = args[index]
+    prefix = f"VigilOverlayFPS-{os.getpid()}-"
+    if not isinstance(session_name, str) or not session_name.startswith(prefix):
+        return
+    suffix = session_name.removeprefix(prefix)
+    if len(suffix) != 32 or any(character not in "0123456789abcdef" for character in suffix):
+        return
+    if getattr(process, "_vigil_trace_cleanup_done", False):
+        return
+    process._vigil_trace_cleanup_done = True  # type: ignore[attr-defined]
+    try:
+        result = subprocess.run(
+            [args[0], "--session_name", session_name, "--terminate_existing_session"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2.0,
+            shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        if result.returncode != 0 and "no existing sessions found" not in result.stderr.casefold():
+            _LOGGER.warning(
+                "PresentMon trace cleanup failed for %s: %s",
+                session_name,
+                result.stderr.strip()[:_STDERR_LINE_LIMIT],
+            )
+    except OSError, subprocess.TimeoutExpired:
+        _LOGGER.warning("PresentMon trace cleanup did not complete for %s", session_name)

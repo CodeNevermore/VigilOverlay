@@ -40,6 +40,24 @@ navigation controller without briefly reporting that all controllers disconnecte
 Input already held when a controller connects is ignored for handoff, reducing
 accidental takeovers from held buttons or stick drift.
 
+From the widget strip, press Up to select Options (when available) or the header X
+button. Left/Right selects a header action, A activates it, and Down or B returns
+to the widget strip. Header navigation preserves the selected Performance metric.
+The existing Back and Menu shortcuts remain available. Open
+dialogs keep controller navigation, including LB/RB, until they are dismissed.
+
+The global hotkey editor supports controller selection of Ctrl, Alt, Shift, Win,
+and the primary key, alongside keyboard chord entry. Hotkey validation preserves
+keyboard-entry focus while checking whether Apply is available. Controller shortcut editing
+starts with Start capture and Cancel. Start capture temporarily owns controller
+input for up to 10 seconds while you release all controls, then press and release
+the desired shortcut. A detected shortcut opens Apply/Retry/Cancel; a timeout
+returns to navigation without saving a change. B, Menu, Guide, combinations, and
+supported extra buttons remain bindable. Saved controller shortcuts are suspended
+while this editor is open and resume after controls return to neutral.
+Guide-only input can resume after editing without waiting for another controller
+state poll. Known held controls must release or disconnect before shortcuts resume.
+
 FPS discovery captures the foreground game before Vigil opens. Exact executables
 learned from earlier frame-verified sessions rank first, followed by the foreground
 installed-provider match and other visible provider matches. If none match, only the
@@ -50,8 +68,11 @@ process. Provider matches use the executable path or game installation folder; a
 filename match is used only when Windows cannot provide the process path.
 
 Open **Performance → FPS** and activate the FPS row, or select **Choose FPS game /
-remembered games**, to see eligible running processes and why they match. Choose a
-process to follow it until it exits, including while minimized, or return to
+remembered games**, to see eligible running processes and why they match.
+The selector button participates in the page's normal directional navigation. Its
+dialog uses Vigil's shared scrolling, focus, and activation-release handling, with
+wrapped matching explanations and executable paths.
+Choose a process to follow it until it exits, including while minimized, or return to
 **Automatic selection**. Programs are remembered automatically once FPS verifies;
 **Remember current game** lets you retry a failed save or restore a forgotten match.
 **Forget** removes a saved match without interrupting the current capture; a later
@@ -69,6 +90,26 @@ retries back off from 5 seconds to 30 seconds and then 2 minutes, while renewed
 foreground activity, sustained GPU activity, provider changes, or process relaunch can
 wake it sooner. Failed probes show their specific failure reason while retrying, and
 bounded diagnostic records are retained in production logs.
+
+Each collector uses its own trace-session name. Vigil attempts to release that
+specific trace when the collector stops, including after a forced stop, so retries
+do not replace another running collector's trace. Where Windows process-liveness
+checks are available, Vigil uses those checks to determine when the game has exited.
+
+During an upgrade, the installer closes the installed Vigil and its bundled FPS
+collectors before replacing files, and disables automatic restart of those old
+processes. Before starting its first FPS collector, the new Vigil also attempts to
+retire abandoned Vigil trace sessions left by earlier runs. Traces with active
+PresentMon collectors are preserved; unavailable access is logged and capture
+continues. This cleanup is limited to Vigil's trace names.
+
+Turning Safe Mode on or off restarts Vigil and explicitly resets FPS state for the
+current Windows session. That reset closes matching collectors and clears traces
+attributable to the current session, including traces identified before an old
+collector exits. Other sessions' active captures are preserved, and traces without
+readable session ownership are skipped by the reset. If the reset cannot finish,
+Vigil shows a warning and leaves FPS paused for that run. Normal startup's abandoned
+trace cleanup remains available separately.
 
 Once a target verifies, candidate scanning pauses. If its collector stays silent,
 matching foreground activity or two sustained low-frequency GPU samples starts a short
